@@ -229,7 +229,20 @@ class FullAutoWorker:
                         read_delay = random.uniform(self.base_delay * 0.8, self.base_delay * 1.25)
                         await asyncio.sleep(read_delay)
 
-                        # 2.C. Kirim Post-View Royalti Telemetri
+                        # 2.C. Kirim Progres Membaca Member (KUNCI UTAMA Pembaca Unik & % Penyelesaian di Studio Space)
+                        try:
+                            prog_payload = {
+                                "novel_id": self.novel_id,
+                                "chapter_id": ch_id,
+                                "scroll_percent": 1.0,
+                                "reading_progress": 1.0,
+                                "read_mode": "scroll",
+                            }
+                            await client.post("/api/reading/progress", json=prog_payload)
+                        except Exception as prog_err:
+                            logger.debug("[%s] Gagal update reading progress bab %d: %s", self.worker_id, ch_num, prog_err)
+
+                        # 2.D. Kirim Post-View Royalti Telemetri
                         now_iso = datetime.now(timezone.utc).isoformat()
                         year_month = datetime.now().strftime("%Y-%m")
                         post_view_payload = {

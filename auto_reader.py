@@ -359,7 +359,20 @@ class MemberReaderSession(BaseReaderSession):
         # 2. Simulasi jeda baca natural
         await asyncio.sleep(reading_delay_sec)
 
-        # 3. Kirim Post-View Royalti Telemetri
+        # 3. Kirim Progres Membaca Member (PENTING untuk Pembaca Unik & Rasio Penyelesaian Studio Space)
+        try:
+            prog_payload = {
+                "novel_id": novel_id,
+                "chapter_id": ch_id,
+                "scroll_percent": 1.0,
+                "reading_progress": 1.0,
+                "read_mode": "scroll",
+            }
+            await client.post("/api/reading/progress", json=prog_payload)
+        except Exception as prog_exc:
+            logger.debug("[%s] Gagal update reading progress bab: %s", self.worker_id, prog_exc)
+
+        # 4. Kirim Post-View Royalti Telemetri
         now_iso = datetime.now(timezone.utc).isoformat()
         year_month = datetime.now().strftime("%Y-%m")
 
@@ -391,7 +404,7 @@ class MemberReaderSession(BaseReaderSession):
         try:
             post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
             post_resp.raise_for_status()
-            return True, "200 OK (Royalti Post-View)"
+            return True, "200 OK (Progres & Post-View)"
         except Exception as exc:
             return False, f"Post-View Log Gagal: {exc}"
 
