@@ -466,7 +466,7 @@ class ReadingSimulationOrchestrator:
         self,
         worker_idx: int,
         progress: Progress,
-        task_id: TaskID,
+        overall_task: TaskID,
     ) -> None:
         """Menjalankan satu sesi pembaca Tamu melalui seluruh bab."""
         worker_id = f"Guest-{worker_idx:02d}"
@@ -474,42 +474,44 @@ class ReadingSimulationOrchestrator:
         session = GuestReaderSession(worker_id=worker_id, proxy=proxy)
 
         async with self.semaphore:
-            progress.update(task_id, description=f"[cyan]{worker_id}[/] [dim]Inisialisasi sesi tamu...[/]")
-            ok = await session.init_guest_session()
-            if not ok:
-                progress.update(task_id, description=f"[red]{worker_id}[/] [red]Gagal buat sesi tamu![/]")
+            task_id = progress.add_task(
+                f"[cyan]{worker_id}[/] [dim]Inisialisasi...[/]",
+                total=len(self.chapters),
+            )
+            try:
+                ok = await session.init_guest_session()
+                if not ok:
+                    await session.close()
+                    return
+
+                ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
+                for ch in self.chapters:
+                    ch_num = ch.get("chapter_num", 1)
+                    ch_title = ch.get("title", f"Bab {ch_num}")[:18]
+                    progress.update(
+                        task_id,
+                        description=f"[cyan]{worker_id}[/] ({ident}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                    )
+
+                    read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
+                    success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
+
+                    if success:
+                        progress.advance(task_id, 1)
+                    else:
+                        logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
+
                 await session.close()
-                return
-
-            ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
-            progress.update(task_id, description=f"[cyan]{worker_id}[/] ({ident}) [green]Aktif[/]")
-
-            for ch in self.chapters:
-                ch_num = ch.get("chapter_num", 1)
-                ch_title = ch.get("title", f"Bab {ch_num}")[:18]
-                progress.update(
-                    task_id,
-                    description=f"[cyan]{worker_id}[/] ({ident}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
-                )
-
-                # Delay baca acak proporsional (misal: 6 - 12 detik per bab)
-                read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
-                success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
-
-                if success:
-                    progress.advance(task_id, 1)
-                else:
-                    logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
-
-            progress.update(task_id, description=f"[green][OK] {worker_id}[/] ({ident}) [green]Selesai Membaca![/]")
-            await session.close()
+            finally:
+                progress.remove_task(task_id)
+                progress.advance(overall_task, 1)
 
     async def _run_member_worker(
         self,
         worker_idx: int,
         account: Dict[str, Any],
         progress: Progress,
-        task_id: TaskID,
+        overall_task: TaskID,
     ) -> None:
         """Menjalankan satu sesi pembaca Member melalui seluruh bab."""
         worker_id = f"Member-{worker_idx:02d}"
@@ -525,29 +527,34 @@ class ReadingSimulationOrchestrator:
         )
 
         async with self.semaphore:
-            progress.update(task_id, description=f"[magenta]{worker_id}[/] ({short_email}) [green]Siap Membaca[/]")
+            task_id = progress.add_task(
+                f"[magenta]{worker_id}[/] ({short_email}) [dim]Inisialisasi...[/]",
+                total=len(self.chapters),
+            )
+            try:
+                for ch in self.chapters:
+                    ch_num = ch.get("chapter_num", 1)
+                    ch_title = ch.get("title", f"Bab {ch_num}")[:18]
+                    progress.update(
+                        task_id,
+                        description=f"[magenta]{worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                    )
 
-            for ch in self.chapters:
-                ch_num = ch.get("chapter_num", 1)
-                ch_title = ch.get("title", f"Bab {ch_num}")[:18]
-                progress.update(
-                    task_id,
-                    description=f"[magenta]{worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
-                )
+                    read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
+                    success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
 
-                read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
-                success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
+                    if success:
+                        progress.advance(task_id, 1)
+                    else:
+                        logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
 
-                if success:
-                    progress.advance(task_id, 1)
-                else:
-                    logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
-
-            progress.update(task_id, description=f"[green][OK] {worker_id}[/] ({short_email}) [green]Selesai Membaca![/]")
-            await session.close()
+                await session.close()
+            finally:
+                progress.remove_task(task_id)
+                progress.advance(overall_task, 1)
 
     async def run(self) -> None:
-        """Mengeksekusi seluruh antrean reader dengan monitor visual Progress Rich."""
+        """Mengeksekusi seluruh antrean reader dengan monitor visual Progress Rich dinamis."""
         total_chapters = len(self.chapters)
         if total_chapters == 0:
             console.print("[red]Tidak ada bab gratis yang dapat dibaca pada novel ini.[/]")
@@ -563,23 +570,20 @@ class ReadingSimulationOrchestrator:
             console=console,
             refresh_per_second=4,
         ) as progress:
+            total_tasks = len(self.member_accounts) + self.guest_count
+            overall_task = progress.add_task(
+                "[bold yellow]★ TOTAL READER SELESAI ★[/]",
+                total=total_tasks,
+            )
             tasks = []
 
             # 1. Spawn Member Tasks
             for idx, acc in enumerate(self.member_accounts, start=1):
-                tid = progress.add_task(
-                    f"[magenta]Member-{idx:02d}[/] [dim]Antre...[/]",
-                    total=total_chapters,
-                )
-                tasks.append(self._run_member_worker(idx, acc, progress, tid))
+                tasks.append(self._run_member_worker(idx, acc, progress, overall_task))
 
             # 2. Spawn Guest Tasks
             for idx in range(1, self.guest_count + 1):
-                tid = progress.add_task(
-                    f"[cyan]Guest-{idx:02d}[/] [dim]Antre...[/]",
-                    total=total_chapters,
-                )
-                tasks.append(self._run_guest_worker(idx, progress, tid))
+                tasks.append(self._run_guest_worker(idx, progress, overall_task))
 
             # Jalankan semua worker secara konkuren
             await asyncio.gather(*tasks)

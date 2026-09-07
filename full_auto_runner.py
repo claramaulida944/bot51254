@@ -358,11 +358,16 @@ class FullAutoOrchestrator:
         worker_idx: int,
         account: Dict[str, Any],
         progress: Progress,
-        task_id: TaskID,
+        overall_task: TaskID,
+        total_steps: int,
     ) -> Dict[str, Any]:
         async with self.semaphore:
             acc_country = account.get("country", "ID")
             proxy = self.proxy_manager.get_proxy(country_code=acc_country)
+            tid = progress.add_task(
+                f"[cyan]Akun-{worker_idx:02d}[/] [dim]Menyiapkan sesi...[/]",
+                total=total_steps,
+            )
             worker = FullAutoWorker(
                 worker_id=f"Akun-{worker_idx:02d}",
                 account=account,
@@ -376,7 +381,11 @@ class FullAutoOrchestrator:
                 do_bookmark=self.do_bookmark,
                 do_follow=self.do_follow,
             )
-            return await worker.execute(progress, task_id)
+            try:
+                return await worker.execute(progress, tid)
+            finally:
+                progress.remove_task(tid)
+                progress.advance(overall_task, 1)
 
     async def run(self) -> List[Dict[str, Any]]:
         total_accounts = len(self.accounts)
@@ -408,13 +417,13 @@ class FullAutoOrchestrator:
             console=console,
             refresh_per_second=4,
         ) as progress:
+            overall_task = progress.add_task(
+                "[bold yellow]★ TOTAL AKUN SELESAI ★[/]",
+                total=total_accounts,
+            )
             tasks = []
             for idx, acc in enumerate(self.accounts, start=1):
-                tid = progress.add_task(
-                    f"[cyan]Akun-{idx:02d}[/] [dim]Menunggu antrean...[/]",
-                    total=total_steps,
-                )
-                tasks.append(self._worker_wrapper(idx, acc, progress, tid))
+                tasks.append(self._worker_wrapper(idx, acc, progress, overall_task, total_steps))
 
             results = await asyncio.gather(*tasks)
 
