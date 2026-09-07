@@ -271,34 +271,48 @@ class GuestReaderSession(BaseReaderSession):
         except Exception as exc:
             return False, f"GET Chapter Gagal: {exc}"
 
-        # 2. Simulasi jeda baca natural
-        await asyncio.sleep(reading_delay_sec)
+        # 2. Simulasi jeda baca natural & heartbeat berkala (tiap ~3 detik)
+        read_delay = max(4.0, reading_delay_sec)
+        step_interval = random.uniform(2.5, 3.5)
+        num_steps = max(3, int(read_delay / step_interval))
+        step_time = read_delay / num_steps
 
-        # 3. Kirim heartbeat progres membaca
-        progress_payload = {
-            "chapter_hash_id": ch_id,
-            "progress": 0.98,
-            "active_reading_seconds": int(reading_delay_sec),
-            "completed": True,
-            "reading_session_id": IdentifierGenerator.generate_session_id("grs"),
-            "session_active_reading_seconds": int(reading_delay_sec),
-            "session_ended": True,
-            "session_end_reason": "chapter_change",
-            "platform": "android",
-            "entry_source": "chapter_route",
-            "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
-            "chapter_number": ch_num,
-            "content_type": "novel",
-            "content_character_count": char_count,
-            "read_mode": "scroll",
-        }
+        grs_session_id = IdentifierGenerator.generate_session_id("grs")
+        attr_session_id = IdentifierGenerator.generate_session_id("attr", random_len=8)
 
-        try:
-            put_resp = await client.put("/api/guest-reading/progress", json=progress_payload)
-            put_resp.raise_for_status()
-            return True, "200 OK (Heartbeat Tercatat)"
-        except Exception as exc:
-            return False, f"PUT Progress Gagal: {exc}"
+        accumulated_seconds = 0.0
+        for step in range(1, num_steps + 1):
+            await asyncio.sleep(step_time)
+            accumulated_seconds += step_time
+            is_last = (step == num_steps)
+            current_progress = 0.98 if is_last else min(0.95, round(step / num_steps, 2))
+
+            progress_payload = {
+                "chapter_hash_id": ch_id,
+                "progress": current_progress,
+                "active_reading_seconds": round(accumulated_seconds, 2),
+                "completed": is_last,
+                "reading_session_id": grs_session_id,
+                "session_active_reading_seconds": round(accumulated_seconds, 2),
+                "session_ended": is_last,
+                "session_end_reason": "chapter_change" if is_last else None,
+                "platform": "android",
+                "entry_source": "chapter_route",
+                "attribution_session_id": attr_session_id,
+                "chapter_number": ch_num,
+                "content_type": "novel",
+                "content_character_count": char_count,
+                "read_mode": "scroll",
+            }
+            try:
+                put_resp = await client.put("/api/guest-reading/progress", json=progress_payload)
+                if is_last:
+                    put_resp.raise_for_status()
+            except Exception as exc:
+                if is_last:
+                    return False, f"PUT Progress Gagal: {exc}"
+
+        return True, "200 OK (Heartbeat Berkala Selesai)"
 
 
 class MemberReaderSession(BaseReaderSession):
@@ -342,8 +356,8 @@ class MemberReaderSession(BaseReaderSession):
         """
         Membaca satu bab novel sebagai Member:
         1. GET /api/v1/novels/{novel_id}/chapters/{chapter_id}
-        2. Tunggu jeda baca natural
-        3. POST /api/reading/v2/logs/post-view
+        2. Kirim progress scrolling bertahap tiap ~3 detik (layaknya user scroll membaca)
+        3. POST /api/reading/v2/logs/post-view saat tuntas 100%
         """
         client = await self.get_client()
         ch_id = chapter.get("hash_id", "")
@@ -356,21 +370,26 @@ class MemberReaderSession(BaseReaderSession):
         except Exception as exc:
             return False, f"GET Chapter Gagal: {exc}"
 
-        # 2. Simulasi jeda baca natural
-        await asyncio.sleep(reading_delay_sec)
+        # 2. Simulasi jeda baca natural & heartbeat progress scrolling berkala (tiap ~3 detik)
+        read_delay = max(4.0, reading_delay_sec)
+        step_interval = random.uniform(2.5, 3.5)
+        num_steps = max(3, int(read_delay / step_interval))
+        step_time = read_delay / num_steps
 
-        # 3. Kirim Progres Membaca Member (PENTING untuk Pembaca Unik & Rasio Penyelesaian Studio Space)
-        try:
-            prog_payload = {
-                "novel_id": novel_id,
-                "chapter_id": ch_id,
-                "scroll_percent": 1.0,
-                "reading_progress": 1.0,
-                "read_mode": "scroll",
-            }
-            await client.post("/api/reading/progress", json=prog_payload)
-        except Exception as prog_exc:
-            logger.debug("[%s] Gagal update reading progress bab: %s", self.worker_id, prog_exc)
+        for step in range(1, num_steps + 1):
+            await asyncio.sleep(step_time)
+            current_pct = min(1.0, round(step / num_steps, 2))
+            try:
+                prog_payload = {
+                    "novel_id": novel_id,
+                    "chapter_id": ch_id,
+                    "scroll_percent": current_pct,
+                    "reading_progress": current_pct,
+                    "read_mode": "scroll",
+                }
+                await client.post("/api/reading/progress", json=prog_payload)
+            except Exception as prog_exc:
+                logger.debug("[%s] Gagal update reading progress bab: %s", self.worker_id, prog_exc)
 
         # 4. Kirim Post-View Royalti Telemetri
         now_iso = datetime.now(timezone.utc).isoformat()

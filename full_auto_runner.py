@@ -225,24 +225,36 @@ class FullAutoWorker:
                         except Exception as get_err:
                             logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
 
-                        # 2.B. Jeda baca natural acak
-                        read_delay = random.uniform(self.base_delay * 0.8, self.base_delay * 1.25)
-                        await asyncio.sleep(read_delay)
+                        # 2.B. Simulasi scrolling membaca bertahap / heartbeat (per ~3 detik & per persen progres)
+                        read_delay = max(4.0, random.uniform(self.base_delay * 0.8, self.base_delay * 1.25))
+                        step_interval = random.uniform(2.5, 3.5)
+                        num_steps = max(3, int(read_delay / step_interval))
+                        step_time = read_delay / num_steps
 
-                        # 2.C. Kirim Progres Membaca Member (KUNCI UTAMA Pembaca Unik & % Penyelesaian di Studio Space)
-                        try:
-                            prog_payload = {
-                                "novel_id": self.novel_id,
-                                "chapter_id": ch_id,
-                                "scroll_percent": 1.0,
-                                "reading_progress": 1.0,
-                                "read_mode": "scroll",
-                            }
-                            await client.post("/api/reading/progress", json=prog_payload)
-                        except Exception as prog_err:
-                            logger.debug("[%s] Gagal update reading progress bab %d: %s", self.worker_id, ch_num, prog_err)
+                        for step in range(1, num_steps + 1):
+                            await asyncio.sleep(step_time)
+                            current_pct = min(1.0, round(step / num_steps, 2))
+                            current_pct_display = int(current_pct * 100)
 
-                        # 2.D. Kirim Post-View Royalti Telemetri
+                            progress.update(
+                                task_id,
+                                description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})[/] [bold green]{current_pct_display}%[/]",
+                            )
+
+                            # Kirim progres membaca berkala layaknya user scrolling (tiap ~3 detik / per progress)
+                            try:
+                                prog_payload = {
+                                    "novel_id": self.novel_id,
+                                    "chapter_id": ch_id,
+                                    "scroll_percent": current_pct,
+                                    "reading_progress": current_pct,
+                                    "read_mode": "scroll",
+                                }
+                                await client.post("/api/reading/progress", json=prog_payload)
+                            except Exception as prog_err:
+                                logger.debug("[%s] Gagal update progress bab %d (%d%%): %s", self.worker_id, ch_num, current_pct_display, prog_err)
+
+                        # 2.C. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
                         now_iso = datetime.now(timezone.utc).isoformat()
                         year_month = datetime.now().strftime("%Y-%m")
                         post_view_payload = {
