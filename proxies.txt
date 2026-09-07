@@ -1,0 +1,17 @@
+# =============================================================================
+# DAFTAR PROXY BOT TOODAT / QUARTERFULL
+# =============================================================================
+# Format didukung:
+# 1. Bright Data ISP / SuperProxy:
+#    http://brd-customer-<customer>-zone-<zone>-country-<cc>:password@brd.superproxy.io:44445
+#    (Bot secara otomatis akan memodifikasi parameter -country-<cc> sesuai negara profil / target!)
+#
+# 2. Standar HTTP / HTTPS Proxy:
+#    http://username:password@ip:port
+#    http://ip:port
+#
+# 3. SOCKS5:
+#    socks5://username:password@ip:port
+# =============================================================================
+
+http://brd-customer-hl_1fd5f466-zone-isp_proxy1-country-us:n0qesnfsc1j8@brd.superproxy.io:44445

@@ -1,0 +1,598 @@
+"""
+Modul Full Auto Runner (All-in-One Automation)
+Mengintegrasikan:
+1. Auto Like Novel (dengan deteksi & auto-skip jika sudah di-like)
+2. Auto Bookmark / Simpan Novel ke Rak (dengan deteksi & auto-skip jika sudah disimpan)
+3. Auto Follow Author Profil (dengan deteksi & auto-skip jika sudah di-follow)
+4. Auto Reading Simulator (membaca bab per bab secara natural dengan kirim telemetri royalti post-view)
+
+Semua berjalan secara paralel (asynchronous) dengan kontrol konkurensi Semaphore,
+rotasi proxy cerdas multi-negara, dan tampilan terminal visual interaktif menggunakan library Rich.
+"""
+
+import asyncio
+import logging
+import random
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
+
+import httpx
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.table import Table
+
+from auto_reader import (
+    IdentifierGenerator,
+    NovelTargetResolver,
+    load_accounts_from_file,
+)
+from interaction_manager import TargetResolver, default_proxy_manager
+from proxy_manager import ProxyManager
+
+logger = logging.getLogger("FullAutoRunner")
+console = Console()
+
+
+class FullAutoWorker:
+    """Eksekutor satu akun untuk alur Full Auto (Social Interactions + Reading)."""
+
+    BASE_URL = "https://api.quarterfull.io"
+
+    def __init__(
+        self,
+        worker_id: str,
+        account: Dict[str, Any],
+        novel_id: str,
+        novel_title: str,
+        author_hash_id: Optional[str],
+        chapters: List[Dict[str, Any]],
+        proxy: Optional[str] = None,
+        base_delay_per_chapter: float = 6.0,
+        do_like: bool = True,
+        do_bookmark: bool = True,
+        do_follow: bool = True,
+    ):
+        self.worker_id = worker_id
+        self.account = account
+        self.email = account.get("email", "-")
+        self.user_id = account.get("user_id", 0)
+        self.access_token = account.get("access_token", "")
+        self.device_id = account.get("device_id") or IdentifierGenerator.generate_device_id()
+        self.user_agent = account.get("user_agent", "okhttp/4.12.0")
+        self.country = account.get("country", "ID")
+        self.novel_id = novel_id
+        self.novel_title = novel_title
+        self.author_hash_id = author_hash_id
+        self.chapters = chapters
+        self.proxy = proxy
+        self.base_delay = base_delay_per_chapter
+        self.do_like = do_like
+        self.do_bookmark = do_bookmark
+        self.do_follow = do_follow
+
+        self.like_result = "-"
+        self.bookmark_result = "-"
+        self.follow_result = "-"
+        self.chapters_read = 0
+        self.status = "Inisialisasi"
+
+    def _get_current_local_date(self) -> str:
+        try:
+            if ZoneInfo is not None:
+                now = datetime.now(ZoneInfo("Asia/Jakarta"))
+            else:
+                now = datetime.now()
+            return now.strftime("%Y-%m-%d")
+        except Exception:
+            return datetime.now().strftime("%Y-%m-%d")
+
+    def build_headers(self) -> Dict[str, str]:
+        return {
+            "host": "api.quarterfull.io",
+            "user-agent": self.user_agent,
+            "accept-encoding": "gzip",
+            "x-platform": "android",
+            "x-app-variant": "prod",
+            "x-app-version": "3.0.52",
+            "x-timezone": "Asia/Jakarta",
+            "x-local-date": self._get_current_local_date(),
+            "x-user-country": self.country,
+            "x-user-raw-country": self.country,
+            "accept-language": "id" if self.country == "ID" else "en-US,en;q=0.9",
+            "x-device-id": self.device_id,
+            "authorization": f"Bearer {self.access_token}",
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
+
+    async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
+        short_email = self.email.split("@")[0][:12]
+        headers = self.build_headers()
+
+        client_kwargs: Dict[str, Any] = {
+            "base_url": self.BASE_URL,
+            "http2": False if self.proxy else True,
+            "headers": headers,
+            "timeout": httpx.Timeout(25.0),
+        }
+        if self.proxy:
+            client_kwargs["proxy"] = self.proxy
+
+        try:
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                # -------------------------------------------------------------
+                # TAHAP 1: DETEKSI & INTERAKSI SOSIAL (Like, Bookmark, Follow)
+                # -------------------------------------------------------------
+                progress.update(
+                    task_id,
+                    description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Deteksi status Like/Simpan...[/]",
+                )
+
+                novel_status_data: Optional[Dict[str, Any]] = None
+                try:
+                    resp = await client.get(f"/api/v1/novels/{self.novel_id}")
+                    if resp.status_code == 200:
+                        novel_status_data = resp.json()
+                    elif resp.status_code == 401:
+                        self.status = "Token Expired (401)"
+                        progress.update(task_id, description=f"[red]{self.worker_id}[/] ({short_email}) [red]Token Expired![/]")
+                        return self._build_summary()
+                except Exception as exc:
+                    logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
+
+                # 1.A. Auto Like (dengan deteksi & skip)
+                if self.do_like:
+                    is_liked = novel_status_data.get("is_liked", False) if novel_status_data else False
+                    if is_liked:
+                        self.like_result = "[yellow]SKIP (Sudah)[/]"
+                    else:
+                        try:
+                            like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like")
+                            if like_resp.status_code == 200:
+                                self.like_result = "[green]OK (Baru)[/]"
+                            else:
+                                self.like_result = f"[red]Gagal ({like_resp.status_code})[/]"
+                        except Exception:
+                            self.like_result = "[red]Error[/]"
+
+                # 1.B. Auto Bookmark / Simpan (dengan deteksi & skip)
+                if self.do_bookmark:
+                    is_saved = novel_status_data.get("is_saved", False) if novel_status_data else False
+                    if is_saved:
+                        self.bookmark_result = "[yellow]SKIP (Sudah)[/]"
+                    else:
+                        try:
+                            bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
+                            if bm_resp.status_code == 200:
+                                self.bookmark_result = "[green]OK (Baru)[/]"
+                            else:
+                                self.bookmark_result = f"[red]Gagal ({bm_resp.status_code})[/]"
+                        except Exception:
+                            self.bookmark_result = "[red]Error[/]"
+
+                # 1.C. Auto Follow Author (dengan deteksi & skip)
+                if self.do_follow and self.author_hash_id:
+                    try:
+                        rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship")
+                        if rel_resp.status_code == 200:
+                            is_following = rel_resp.json().get("is_following", False)
+                            if is_following:
+                                self.follow_result = "[yellow]SKIP (Sudah)[/]"
+                            else:
+                                f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow")
+                                if f_resp.status_code == 200:
+                                    self.follow_result = "[green]OK (Baru)[/]"
+                                else:
+                                    self.follow_result = f"[red]Gagal ({f_resp.status_code})[/]"
+                    except Exception:
+                        self.follow_result = "[red]Error[/]"
+
+                # -------------------------------------------------------------
+                # TAHAP 2: SIMULASI MEMBACA (Chapters & Royalty Post-View)
+                # -------------------------------------------------------------
+                if self.chapters:
+                    for ch in self.chapters:
+                        ch_num = ch.get("chapter_num", 1)
+                        ch_id = ch.get("hash_id", "")
+                        ch_title = ch.get("title", f"Bab {ch_num}")[:15]
+
+                        progress.update(
+                            task_id,
+                            description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                        )
+
+                        # 2.A. Fetch isi bab
+                        try:
+                            await client.get(f"/api/v1/novels/{self.novel_id}/chapters/{ch_id}")
+                        except Exception as get_err:
+                            logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
+
+                        # 2.B. Jeda baca natural acak
+                        read_delay = random.uniform(self.base_delay * 0.8, self.base_delay * 1.25)
+                        await asyncio.sleep(read_delay)
+
+                        # 2.C. Kirim Post-View Royalti Telemetri
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        year_month = datetime.now().strftime("%Y-%m")
+                        post_view_payload = {
+                            "novel_hash_id": self.novel_id,
+                            "post_hash_id": ch_id,
+                            "post_title": ch_title,
+                            "novel_title": self.novel_title,
+                            "attribution": {
+                                "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
+                                "work_id": self.novel_id,
+                                "first_touch": {
+                                    "discovery_method": "direct",
+                                    "source_screen": "chapter_route",
+                                    "touched_at": now_iso,
+                                    "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
+                                },
+                                "last_touch": {
+                                    "discovery_method": "direct",
+                                    "source_screen": "chapter_route",
+                                    "touched_at": now_iso,
+                                    "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
+                                },
+                            },
+                            "callback_contract": "telemetry_v2",
+                            "source_event_id": f"member:{self.user_id}:{ch_id}:{year_month}",
+                        }
+
+                        try:
+                            post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
+                            if post_resp.status_code in (200, 201):
+                                self.chapters_read += 1
+                                progress.advance(task_id, 1)
+                        except Exception as log_err:
+                            logger.debug("[%s] Gagal post-view bab %d: %s", self.worker_id, ch_num, log_err)
+
+                self.status = "[green]Sukses Selesai[/]"
+                progress.update(
+                    task_id,
+                    description=f"[bold green][OK] {self.worker_id}[/] ({short_email}) [green]Selesai Semua Aksi![/]",
+                )
+
+        except Exception as main_exc:
+            self.status = f"[red]Error: {str(main_exc)[:30]}[/]"
+            progress.update(
+                task_id,
+                description=f"[red][GAGAL] {self.worker_id}[/] ({short_email}) [red]{str(main_exc)[:25]}[/]",
+            )
+
+        return self._build_summary()
+
+    def _build_summary(self) -> Dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "email": self.email,
+            "country": self.country,
+            "like": self.like_result,
+            "bookmark": self.bookmark_result,
+            "follow": self.follow_result,
+            "chapters_read": self.chapters_read,
+            "status": self.status,
+        }
+
+
+class FullAutoOrchestrator:
+    """Orkestrator utama untuk mengeksekusi fitur Full Auto secara masif & simultan."""
+
+    def __init__(
+        self,
+        novel_id: str,
+        novel_title: str,
+        author_hash_id: Optional[str],
+        chapters: List[Dict[str, Any]],
+        accounts: List[Dict[str, Any]],
+        concurrency: int = 3,
+        base_delay_per_chapter: float = 6.0,
+        do_like: bool = True,
+        do_bookmark: bool = True,
+        do_follow: bool = True,
+        proxies: Optional[List[str]] = None,
+    ):
+        self.novel_id = novel_id
+        self.novel_title = novel_title
+        self.author_hash_id = author_hash_id
+        self.chapters = chapters
+        self.accounts = accounts
+        self.concurrency = max(1, concurrency)
+        self.semaphore = asyncio.Semaphore(self.concurrency)
+        self.base_delay = base_delay_per_chapter
+        self.do_like = do_like
+        self.do_bookmark = do_bookmark
+        self.do_follow = do_follow
+
+        if proxies is not None:
+            self.proxy_manager = ProxyManager()
+            self.proxy_manager.load_proxies()
+        else:
+            self.proxy_manager = default_proxy_manager
+
+    async def _worker_wrapper(
+        self,
+        worker_idx: int,
+        account: Dict[str, Any],
+        progress: Progress,
+        task_id: TaskID,
+    ) -> Dict[str, Any]:
+        async with self.semaphore:
+            acc_country = account.get("country", "ID")
+            proxy = self.proxy_manager.get_proxy(country_code=acc_country)
+            worker = FullAutoWorker(
+                worker_id=f"Akun-{worker_idx:02d}",
+                account=account,
+                novel_id=self.novel_id,
+                novel_title=self.novel_title,
+                author_hash_id=self.author_hash_id,
+                chapters=self.chapters,
+                proxy=proxy,
+                base_delay_per_chapter=self.base_delay,
+                do_like=self.do_like,
+                do_bookmark=self.do_bookmark,
+                do_follow=self.do_follow,
+            )
+            return await worker.execute(progress, task_id)
+
+    async def run(self) -> List[Dict[str, Any]]:
+        total_accounts = len(self.accounts)
+        total_steps = len(self.chapters) if self.chapters else 1
+
+        console.print(
+            Panel(
+                f"[bold cyan]Target Novel:[/] [bold yellow]{self.novel_title}[/] (ID: [cyan]{self.novel_id}[/])\n"
+                f"[bold cyan]Total Akun:[/] [bold white]{total_accounts}[/] Akun  |  "
+                f"[bold cyan]Bab Tersedia:[/] [bold white]{len(self.chapters)}[/] Bab\n"
+                f"[bold cyan]Konkurensi:[/] [bold green]{self.concurrency}[/] Akun Paralel  |  "
+                f"[bold cyan]Jeda Baca:[/] [bold green]{self.base_delay:.1f}s[/] per Bab\n"
+                f"[bold cyan]Fitur Aktif:[/] "
+                f"Like [{'green' if self.do_like else 'red'}]{'[✓]' if self.do_like else '[✗]'}[/]  •  "
+                f"Simpan/Rak [{'green' if self.do_bookmark else 'red'}]{'[✓]' if self.do_bookmark else '[✗]'}[/]  •  "
+                f"Follow Author [{'green' if self.do_follow else 'red'}]{'[✓]' if self.do_follow else '[✗]'}[/]",
+                title="[bold green]Memulai Full Auto Bot Suite[/]",
+                border_style="cyan",
+            )
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=25),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=4,
+        ) as progress:
+            tasks = []
+            for idx, acc in enumerate(self.accounts, start=1):
+                tid = progress.add_task(
+                    f"[cyan]Akun-{idx:02d}[/] [dim]Menunggu antrean...[/]",
+                    total=total_steps,
+                )
+                tasks.append(self._worker_wrapper(idx, acc, progress, tid))
+
+            results = await asyncio.gather(*tasks)
+
+        # -----------------------------------------------------------------
+        # TABEL LAPORAN HASIL AKHIR
+        # -----------------------------------------------------------------
+        report_table = Table(
+            title=f"[bold green]Laporan Eksekusi Full Auto ({self.novel_title})[/]",
+            border_style="cyan",
+        )
+        report_table.add_column("No", style="dim", width=4)
+        report_table.add_column("Akun / Email", style="bold white")
+        report_table.add_column("Negara", style="cyan", width=8)
+        report_table.add_column("♥ Like", justify="center", width=14)
+        report_table.add_column("★ Simpan", justify="center", width=14)
+        report_table.add_column("+ Follow", justify="center", width=14)
+        report_table.add_column("Bab Dibaca", justify="right", width=12)
+        report_table.add_column("Status", style="bold")
+
+        like_new = 0
+        like_skipped = 0
+        bm_new = 0
+        bm_skipped = 0
+        fol_new = 0
+        fol_skipped = 0
+        total_reads = 0
+
+        for i, r in enumerate(results, start=1):
+            if "OK" in r["like"]:
+                like_new += 1
+            elif "SKIP" in r["like"]:
+                like_skipped += 1
+
+            if "OK" in r["bookmark"]:
+                bm_new += 1
+            elif "SKIP" in r["bookmark"]:
+                bm_skipped += 1
+
+            if "OK" in r["follow"]:
+                fol_new += 1
+            elif "SKIP" in r["follow"]:
+                fol_skipped += 1
+
+            total_reads += r["chapters_read"]
+
+            report_table.add_row(
+                str(i),
+                r["email"],
+                r["country"],
+                r["like"],
+                r["bookmark"],
+                r["follow"],
+                str(r["chapters_read"]),
+                r["status"],
+            )
+
+        console.print()
+        console.print(report_table)
+        console.print()
+
+        console.print(
+            Panel(
+                f"[bold green]Full Auto Berhasil Selesai Sepenuhnya![/]\n"
+                f"• Total Akun Diproses: [bold cyan]{len(results)}[/] Akun\n"
+                f"• [bold red]♥ Like[/]: [green]{like_new}[/] baru, [yellow]{like_skipped}[/] dilewati (sudah like)\n"
+                f"• [bold yellow]★ Simpan/Rak[/]: [green]{bm_new}[/] baru, [yellow]{bm_skipped}[/] dilewati (sudah simpan)\n"
+                f"• [bold green]+ Follow Author[/]: [green]{fol_new}[/] baru, [yellow]{fol_skipped}[/] dilewati (sudah follow)\n"
+                f"• [bold cyan]Total Bab Dibaca[/]: [bold white]{total_reads}[/] kali pembacaan",
+                title="[bold cyan]Ringkasan Statistik Full Auto[/]",
+                border_style="green",
+            )
+        )
+
+        return results
+
+
+async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
+    """Antarmuka interaktif CLI untuk fitur Full Auto."""
+    console.print(
+        Panel(
+            "[bold white]Modul Full Auto: All-in-One Novel Automation[/]\n"
+            "[dim]Membaca novel, otomatis Like, otomatis Simpan ke rak, dan otomatis Follow author\n"
+            "dengan deteksi pintar (akun yang sudah like/simpan/follow otomatis di-skip).[/]",
+            title="[bold cyan]★ FULL AUTO BOT ★[/]",
+            border_style="cyan",
+        )
+    )
+
+    accounts = load_accounts_from_file("akun.txt")
+    if not accounts:
+        console.print("[bold red][ERROR] Belum ada akun terdaftar di 'akun.txt'![/]")
+        console.print("[yellow]Silakan buat akun terlebih dahulu menggunakan Menu [2] Auto Signup Generator.[/]")
+        return
+
+    # 1. Input Target URL / Novel ID
+    raw_target = preset_target
+    if not raw_target:
+        raw_target = Prompt.ask(
+            "[bold green]?[/] Masukkan URL atau ID Novel target",
+            default="https://quarterfull.io/works/Py7LDdwpEQ8e1YKX",
+        )
+
+    target_type, novel_id = TargetResolver.clean_target(raw_target)
+    if not novel_id:
+        console.print("[bold red][ERROR] Novel ID tidak valid.[/]")
+        return
+
+    with console.status(f"[bold cyan]Mengambil metadata novel {novel_id}...[/]"):
+        try:
+            novel_info = await NovelTargetResolver.fetch_novel_details(novel_id)
+            chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id)
+        except Exception as exc:
+            console.print(f"[bold red][ERROR] Gagal menghubungi API server:[/] {exc}")
+            return
+
+    novel_title = novel_info.get("title", f"Novel-{novel_id}")
+    author_info = novel_info.get("author", {})
+    author_pen_name = author_info.get("pen_name", "Author")
+    author_hash_id = author_info.get("hash_id")
+
+    console.print(
+        Panel(
+            f"[bold cyan]Judul Novel:[/] [bold yellow]{novel_title}[/]\n"
+            f"[bold cyan]Penulis / Author:[/] [bold magenta]{author_pen_name}[/] (ID: [dim]{author_hash_id}[/])\n"
+            f"[bold cyan]Bab Gratis Tersedia:[/] [bold green]{len(chapters)}[/] Bab\n"
+            f"[bold cyan]Akun Tersedia:[/] [bold white]{len(accounts)}[/] Akun di 'akun.txt'",
+            title="[bold green]Informasi Target Novel[/]",
+            border_style="green",
+        )
+    )
+
+    # 2. Pemilihan Opsi Interaksi
+    account_count = IntPrompt.ask(
+        f"[bold green]?[/] Berapa akun yang ingin dijalankan? [1-{len(accounts)}]",
+        default=len(accounts),
+    )
+    account_count = max(1, min(account_count, len(accounts)))
+    selected_accounts = accounts[:account_count]
+
+    do_like = Confirm.ask(
+        "[bold green]?[/] Aktifkan [bold red]Auto Like[/] novel? (Auto-skip jika sudah like)",
+        default=True,
+    )
+    do_bookmark = Confirm.ask(
+        "[bold green]?[/] Aktifkan [bold yellow]Auto Simpan / Bookmark[/] ke rak? (Auto-skip jika sudah simpan)",
+        default=True,
+    )
+    do_follow = Confirm.ask(
+        f"[bold green]?[/] Aktifkan [bold magenta]Auto Follow[/] penulis '{author_pen_name}'? (Auto-skip jika sudah follow)",
+        default=True,
+    )
+
+    # 3. Opsi Membaca
+    console.print("\n[bold cyan]Mode Membaca Bab:[/]")
+    console.print("  [bold green][1][/] Baca Seluruh Bab (Semua bab gratis yang tersedia - [bold yellow]Wajib Seluruh Bab[/]) [bold green][Default][/]")
+    console.print("  [bold green][2][/] Tentukan Sendiri Jumlah Bab (User input manual berapa bab)")
+    console.print("  [bold green][3][/] Lewati Membaca (Hanya jalankan Like, Bookmark/Simpan, & Follow)")
+    read_choice = Prompt.ask(
+        "[bold green]?[/] Pilih mode membaca bab novel",
+        choices=["1", "2", "3"],
+        default="1",
+    )
+
+    target_chapters = list(chapters)
+    if read_choice == "2":
+        num_ch = IntPrompt.ask(
+            f"[bold green]?[/] Berapa bab pertama yang ingin dibaca per akun? [1-{len(chapters)}]",
+            default=min(3, len(chapters)),
+        )
+        target_chapters = chapters[:num_ch]
+    elif read_choice == "3":
+        target_chapters = []
+
+    base_delay = 6.0
+    if target_chapters:
+        base_delay = float(
+            Prompt.ask(
+                "[bold green]?[/] Jeda simulasi membaca per bab dalam detik (rekomendasi: 5-10)",
+                default="6.0",
+            )
+        )
+
+    concurrency = IntPrompt.ask(
+        "[bold green]?[/] Jumlah akun berjalan paralel / konkurensi (rekomendasi: 3-5)",
+        default=3,
+    )
+
+    # 4. Eksekusi Orkestrasi
+    orchestrator = FullAutoOrchestrator(
+        novel_id=novel_id,
+        novel_title=novel_title,
+        author_hash_id=author_hash_id,
+        chapters=target_chapters,
+        accounts=selected_accounts,
+        concurrency=concurrency,
+        base_delay_per_chapter=base_delay,
+        do_like=do_like,
+        do_bookmark=do_bookmark,
+        do_follow=do_follow,
+    )
+
+    await orchestrator.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_full_auto_cli())
