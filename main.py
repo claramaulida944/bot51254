@@ -58,17 +58,17 @@ from full_auto_runner import run_full_auto_cli
 
 # Konfigurasi console & logging
 console = Console(highlight=False)
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
+for _lib in ("httpx", "httpcore", "AutoReader", "FullAutoRunner"):
+    logging.getLogger(_lib).setLevel(logging.ERROR)
 
 
 def render_header() -> None:
     """Menampilkan banner header master control bot."""
     banner = Text()
-    banner.append("===============================================================================\n", style="bright_blue")
-    banner.append("                  * TOODAT / QUARTERFULL BOT SUITE *                           \n", style="bold cyan")
-    banner.append("            Master Control Center & Multi-Feature Framework                   \n", style="bold yellow")
-    banner.append("          Engine: HTTP/2 Native • Target API: https://api.quarterfull.io      \n", style="dim")
-    banner.append("===============================================================================", style="bright_blue")
+    banner.append("            * TOODAT / QUARTERFULL BOT SUITE *            \n", style="bold cyan")
+    banner.append("      Master Control Center & Multi-Feature Framework     \n", style="bold yellow")
+    banner.append("   Engine: HTTP/2 Native • Target API: api.quarterfull.io", style="dim")
 
     console.print(Panel(banner, border_style="cyan", padding=(0, 1)))
 

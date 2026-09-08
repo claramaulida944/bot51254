@@ -73,13 +73,12 @@ from proxy_manager import (
     SUPPORTED_QUARTERFULL_COUNTRIES,
 )
 
-# Konfigurasi logger dasar
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress di konsol)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger("AutoReader")
+logger.setLevel(logging.ERROR)
+for _lib in ("httpx", "httpcore"):
+    logging.getLogger(_lib).setLevel(logging.ERROR)
 console = Console(highlight=False)
 
 
@@ -733,7 +732,8 @@ class ReadingSimulationOrchestrator:
         self.chapters: List[Dict[str, Any]] = chapters
         self.member_accounts: List[Dict[str, Any]] = member_accounts
         self.guest_count: int = guest_count
-        self.semaphore: asyncio.Semaphore = asyncio.Semaphore(max_concurrency)
+        self.max_concurrency: int = max(1, max_concurrency)
+        self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.max_concurrency)
         self.origin_country: str = origin_country or "ID"
         if proxies is not None:
             self.proxy_manager = ProxyManager()
@@ -744,6 +744,7 @@ class ReadingSimulationOrchestrator:
         self.base_delay: float = base_delay_per_chapter
         self.total_readers: int = len(member_accounts) + guest_count
         self.background_tasks: set = set()
+        self.results: List[Dict[str, Any]] = []
 
     def _get_proxy_for_worker(self, country_code: str = "ID", session_id: Optional[str] = None) -> Optional[str]:
         if not self.proxy_manager.has_proxies:
@@ -871,7 +872,6 @@ class ReadingSimulationOrchestrator:
         self,
         session: BaseReaderSession,
         worker_id: str,
-        ident: str,
         task_id: TaskID,
         progress: Progress,
         chapter: Dict[str, Any],
@@ -888,11 +888,9 @@ class ReadingSimulationOrchestrator:
         start_t = time.time()
         client = await session.get_client()
 
-        # Interval heartbeat tiap ~20 - 30 detik
         pulse_interval = random.uniform(20.0, 30.0)
         last_pulse_t = start_t
 
-        role_color = "cyan" if is_guest else "magenta"
         while True:
             elapsed = time.time() - start_t
             remaining = pause_seconds - elapsed
@@ -901,14 +899,12 @@ class ReadingSimulationOrchestrator:
 
             progress.update(
                 task_id,
-                description=f"[{role_color}]{worker_id}[/] ({ident}) [dim]Jeda bab {ch_num} ➔ {next_chapter_num} & Heartbeat ({int(remaining)}s)...[/]",
+                description=f"[cyan]Jeda {ch_num}->{next_chapter_num}[/] [dim]HB({int(remaining)}s)[/]",
             )
 
-            # Tidur singkat per 1 detik agar countdown tampilan responsif
             sleep_chunk = min(1.0, remaining)
             await asyncio.sleep(sleep_chunk)
 
-            # Cek apakah sudah waktunya kirim pulse heartbeat berkala
             if (time.time() - last_pulse_t) >= pulse_interval:
                 last_pulse_t = time.time()
                 current_active = random.uniform(180.0, 420.0) + (time.time() - start_t)
@@ -956,54 +952,64 @@ class ReadingSimulationOrchestrator:
         worker_idx: int,
         progress: Progress,
         overall_task: TaskID,
+        slot_queue: asyncio.Queue,
     ) -> None:
         worker_id = f"Guest-{worker_idx:02d}"
-        # Rotasi negara acak dari pool 23 negara resmi Quarterfull yang terverifikasi di API & Proxy
         pool_countries = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
         proxy_cc = random.choice(pool_countries)
         
-        # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
         sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
         proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
         session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy)
 
         async with self.semaphore:
-            task_id = progress.add_task(
-                f"[cyan]{worker_id}[/] [dim]Inisialisasi...[/]",
-                total=len(self.chapters),
-            )
+            slot_idx, task_id = await slot_queue.get()
             try:
+                progress.reset(task_id, total=len(self.chapters))
+                progress.update(
+                    task_id,
+                    role=f"[cyan]{worker_id}[/]",
+                    description="[dim]Inisialisasi...[/]",
+                )
                 ok = await session.init_guest_session()
                 if not ok:
+                    progress.update(task_id, description="[red]Gagal Inisialisasi[/]")
+                    self.results.append({
+                        "worker_id": worker_id,
+                        "type": "Guest",
+                        "ident": "Guest",
+                        "country": proxy_cc,
+                        "chapters_read": 0,
+                        "status": "[red]Gagal[/]",
+                    })
                     await session.close()
                     return
 
                 ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
                 total_chs = len(self.chapters)
+                ch_read_count = 0
                 for ch_idx, ch in enumerate(self.chapters, start=1):
                     ch_num = ch.get("chapter_num", 1)
-                    ch_title = ch.get("title", f"Bab {ch_num}")[:18]
                     progress.update(
                         task_id,
-                        description=f"[cyan]{worker_id}[/] ({ident}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                        description=f"[yellow]Bab {ch_num}/{total_chs}[/]",
                     )
 
                     read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
                     success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
 
                     if success:
+                        ch_read_count += 1
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
 
-                    # Jika masih ada bab berikutnya, tahan 1-2 menit sambil kirim heartbeat sebelum lanjut
                     if ch_idx < total_chs and success:
-                        pause_sec = random.uniform(60.0, 120.0)  # Jeda 1 - 2 menit antar bab
+                        pause_sec = random.uniform(60.0, 120.0)
                         next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
                         await self._inter_chapter_pause(
                             session=session,
                             worker_id=worker_id,
-                            ident=ident,
                             task_id=task_id,
                             progress=progress,
                             chapter=ch,
@@ -1012,7 +1018,16 @@ class ReadingSimulationOrchestrator:
                             is_guest=True,
                         )
 
-                # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
+                progress.update(task_id, description="[bold green]Selesai [OK][/]")
+                self.results.append({
+                    "worker_id": worker_id,
+                    "type": "Guest",
+                    "ident": ident,
+                    "country": proxy_cc,
+                    "chapters_read": ch_read_count,
+                    "status": "[green]Sukses[/]",
+                })
+
                 detached_client = session.detach_client()
                 if detached_client:
                     bg_task = asyncio.create_task(
@@ -1033,8 +1048,8 @@ class ReadingSimulationOrchestrator:
 
                 await session.close()
             finally:
-                progress.remove_task(task_id)
                 progress.advance(overall_task, 1)
+                slot_queue.put_nowait((slot_idx, task_id))
 
     async def _run_member_worker(
         self,
@@ -1042,6 +1057,7 @@ class ReadingSimulationOrchestrator:
         account: Dict[str, Any],
         progress: Progress,
         overall_task: TaskID,
+        slot_queue: asyncio.Queue,
     ) -> None:
         """Menjalankan satu sesi pembaca Member melalui seluruh bab."""
         worker_id = f"Member-{worker_idx:02d}"
@@ -1050,7 +1066,6 @@ class ReadingSimulationOrchestrator:
         raw_cc = str(account.get("country", "ID")).upper().strip()
         acc_country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
 
-        # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
         sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
         proxy = self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
         session = MemberReaderSession(
@@ -1061,47 +1076,56 @@ class ReadingSimulationOrchestrator:
         )
 
         async with self.semaphore:
-            task_id = progress.add_task(
-                f"[magenta]{worker_id}[/] ({short_email}) [dim]Cek status sesi...[/]",
-                total=len(self.chapters),
-            )
+            slot_idx, task_id = await slot_queue.get()
             try:
-                # Verifikasi sesi & auto-refresh token jika kadaluarsa
+                progress.reset(task_id, total=len(self.chapters))
+                progress.update(
+                    task_id,
+                    role=f"[magenta]{worker_id}[/]",
+                    description="[dim]Cek sesi token...[/]",
+                )
                 is_valid = await session.ensure_valid_session()
                 if not is_valid:
                     progress.update(
                         task_id,
-                        description=f"[magenta]{worker_id}[/] ({short_email}) [bold red]Sesi Kadaluarsa (Dilewati)[/]",
+                        description="[bold red]Sesi Expired (Skip)[/]",
                     )
-                    await asyncio.sleep(1.2)
+                    self.results.append({
+                        "worker_id": worker_id,
+                        "type": "Member",
+                        "ident": short_email,
+                        "country": acc_country,
+                        "chapters_read": 0,
+                        "status": "[red]Expired[/]",
+                    })
+                    await asyncio.sleep(1.0)
                     await session.close()
                     return
 
                 total_chs = len(self.chapters)
+                ch_read_count = 0
                 for ch_idx, ch in enumerate(self.chapters, start=1):
                     ch_num = ch.get("chapter_num", 1)
-                    ch_title = ch.get("title", f"Bab {ch_num}")[:18]
                     progress.update(
                         task_id,
-                        description=f"[magenta]{worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                        description=f"[yellow]Bab {ch_num}/{total_chs}[/]",
                     )
 
                     read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
                     success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
 
                     if success:
+                        ch_read_count += 1
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
 
-                    # Jika masih ada bab berikutnya, tahan 1-2 menit sambil kirim heartbeat sebelum lanjut
                     if ch_idx < total_chs and success:
-                        pause_sec = random.uniform(60.0, 120.0)  # Jeda 1 - 2 menit antar bab
+                        pause_sec = random.uniform(60.0, 120.0)
                         next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
                         await self._inter_chapter_pause(
                             session=session,
                             worker_id=worker_id,
-                            ident=short_email,
                             task_id=task_id,
                             progress=progress,
                             chapter=ch,
@@ -1110,7 +1134,16 @@ class ReadingSimulationOrchestrator:
                             is_guest=False,
                         )
 
-                # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
+                progress.update(task_id, description="[bold green]Selesai [OK][/]")
+                self.results.append({
+                    "worker_id": worker_id,
+                    "type": "Member",
+                    "ident": short_email,
+                    "country": acc_country,
+                    "chapters_read": ch_read_count,
+                    "status": "[green]Sukses[/]",
+                })
+
                 detached_client = session.detach_client()
                 if detached_client:
                     bg_task = asyncio.create_task(
@@ -1131,8 +1164,8 @@ class ReadingSimulationOrchestrator:
 
                 await session.close()
             finally:
-                progress.remove_task(task_id)
                 progress.advance(overall_task, 1)
+                slot_queue.put_nowait((slot_idx, task_id))
 
     async def run(self) -> None:
         """Mengeksekusi seluruh antrean reader dengan monitor visual Progress Rich dinamis."""
@@ -1141,33 +1174,77 @@ class ReadingSimulationOrchestrator:
             console.print("[red]Tidak ada bab gratis yang dapat dibaca pada novel ini.[/]")
             return
 
+        total_tasks = len(self.member_accounts) + self.guest_count
+        num_slots = min(self.max_concurrency, total_tasks)
+        self.results = []
+
+        console.print(
+            Panel(
+                f"[bold cyan]Target Novel:[/] [bold yellow]{self.novel_title}[/] (ID: [cyan]{self.novel_id}[/])\n"
+                f"[bold cyan]Total Reader:[/] [bold white]{total_tasks}[/] Sesi ({len(self.member_accounts)} Member + {self.guest_count} Guest)\n"
+                f"[bold cyan]Bab Tersedia:[/] [bold white]{total_chapters}[/] Bab Gratis  |  "
+                f"[bold cyan]Konkurensi:[/] [bold green]{num_slots}[/] Slot Paralel",
+                title="[bold green]Memulai Auto Readers Simulator[/]",
+                border_style="cyan",
+            )
+        )
+
         with Progress(
             SpinnerColumn(),
-            TextColumn("{task.description}"),
-            BarColumn(bar_width=25),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left"),
+            TextColumn("{task.description}", justify="left", no_wrap=True),
+            BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
-            TimeRemainingColumn(),
             console=console,
             refresh_per_second=4,
         ) as progress:
-            total_tasks = len(self.member_accounts) + self.guest_count
             overall_task = progress.add_task(
-                "[bold yellow]★ TOTAL READER SELESAI ★[/]",
+                description="[dim]Memproses antrean reader...[/]",
                 total=total_tasks,
+                role="[bold yellow]★ TOTAL[/]",
             )
+            slot_queue: asyncio.Queue = asyncio.Queue()
+            for s_idx in range(1, num_slots + 1):
+                tid = progress.add_task(
+                    description="[dim]Menunggu antrean...[/]",
+                    total=total_chapters,
+                    role=f"Slot-{s_idx:02d}",
+                )
+                slot_queue.put_nowait((s_idx, tid))
+
             tasks = []
-
-            # 1. Spawn Member Tasks
             for idx, acc in enumerate(self.member_accounts, start=1):
-                tasks.append(self._run_member_worker(idx, acc, progress, overall_task))
+                tasks.append(self._run_member_worker(idx, acc, progress, overall_task, slot_queue))
 
-            # 2. Spawn Guest Tasks
             for idx in range(1, self.guest_count + 1):
-                tasks.append(self._run_guest_worker(idx, progress, overall_task))
+                tasks.append(self._run_guest_worker(idx, progress, overall_task, slot_queue))
 
-            # Jalankan semua worker secara konkuren
             await asyncio.gather(*tasks)
+
+        # Cetak Tabel Laporan Rapi di Akhir
+        report_table = Table(
+            title=f"[bold green]Laporan Sesi Auto Reader ({self.novel_title})[/]",
+            border_style="cyan",
+        )
+        report_table.add_column("No", style="dim", width=4)
+        report_table.add_column("Tipe", style="bold", width=8)
+        report_table.add_column("Identitas / Akun", style="bold white")
+        report_table.add_column("Negara", style="cyan", width=8)
+        report_table.add_column("Bab Dibaca", justify="center", width=12)
+        report_table.add_column("Status", style="bold")
+
+        for r_idx, r in enumerate(self.results, start=1):
+            report_table.add_row(
+                str(r_idx),
+                r["type"],
+                r["ident"],
+                r["country"],
+                f"{r['chapters_read']}/{total_chapters}",
+                r["status"],
+            )
+
+        console.print(report_table)
 
 
 def load_accounts_from_file(file_path: str = "akun.txt") -> List[Dict[str, Any]]:

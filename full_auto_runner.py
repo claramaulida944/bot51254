@@ -48,8 +48,13 @@ from auto_reader import (
 from interaction_manager import TargetResolver, default_proxy_manager
 from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
 
+# Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger("FullAutoRunner")
-console = Console()
+logger.setLevel(logging.ERROR)
+for _lib in ("httpx", "httpcore"):
+    logging.getLogger(_lib).setLevel(logging.ERROR)
+console = Console(highlight=False)
 
 
 class FullAutoWorker:
@@ -258,7 +263,8 @@ class FullAutoWorker:
                 # -------------------------------------------------------------
                 progress.update(
                     task_id,
-                    description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Deteksi status Like/Simpan...[/]",
+                    role=f"[cyan]{self.worker_id}[/]",
+                    description="[dim]Cek profil & status...[/]",
                 )
 
                 novel_status_data: Optional[Dict[str, Any]] = None
@@ -275,7 +281,7 @@ class FullAutoWorker:
                                 novel_status_data = retry_resp.json()
                         if not novel_status_data:
                             self.status = "Token Expired (401)"
-                            progress.update(task_id, description=f"[red]{self.worker_id}[/] ({short_email}) [red]Sesi Habis (Skip)[/]")
+                            progress.update(task_id, description="[bold red]Sesi Expired (Skip)[/]")
                             return self._build_summary()
                 except Exception as exc:
                     logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
@@ -338,7 +344,7 @@ class FullAutoWorker:
 
                         progress.update(
                             task_id,
-                            description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
+                            description=f"[yellow]Bab {ch_num}/{len(self.chapters)}[/]",
                         )
 
                         # 2.A. Fetch isi bab secara dinamis dengan smart fallback unauthenticated jika region isolasi
@@ -376,7 +382,7 @@ class FullAutoWorker:
 
                             progress.update(
                                 task_id,
-                                description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})[/] [bold green]{current_pct_display}%[/]",
+                                description=f"[yellow]Bab {ch_num}/{len(self.chapters)} ({current_pct_display}%)[/]",
                             )
 
                             # Kirim progres membaca berkala layaknya user scrolling (tiap ~3 detik / per progress)
@@ -466,7 +472,7 @@ class FullAutoWorker:
 
                                 progress.update(
                                     task_id,
-                                    description=f"[cyan]{self.worker_id}[/] ({short_email}) [dim]Jeda bab {ch_num} ➔ {next_ch_num} & Heartbeat ({int(remaining)}s)...[/]",
+                                    description=f"[cyan]Jeda Bab {ch_num}->{next_ch_num}[/] [dim]HB({int(remaining)}s)[/]",
                                 )
                                 await asyncio.sleep(min(1.0, remaining))
 
@@ -495,14 +501,14 @@ class FullAutoWorker:
                 self.status = "[green]Sukses Selesai[/]"
                 progress.update(
                     task_id,
-                    description=f"[bold green][OK] {self.worker_id}[/] ({short_email}) [green]Selesai Semua Aksi![/]",
+                    description="[bold green]Selesai Semua Aksi [OK][/]",
                 )
 
         except Exception as main_exc:
             self.status = f"[red]Error: {str(main_exc)[:30]}[/]"
             progress.update(
                 task_id,
-                description=f"[red][GAGAL] {self.worker_id}[/] ({short_email}) [red]{str(main_exc)[:25]}[/]",
+                description=f"[bold red]Error: {str(main_exc)[:15]}[/]",
             )
 
         return self._build_summary()
@@ -562,44 +568,49 @@ class FullAutoOrchestrator:
         progress: Progress,
         overall_task: TaskID,
         total_steps: int,
+        slot_queue: asyncio.Queue,
     ) -> Dict[str, Any]:
         async with self.semaphore:
-            acc_country = account.get("country", "ID")
-            sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
-            proxy = self.proxy_manager.get_proxy(country_code=acc_country, session_id=sess_id)
-            tid = progress.add_task(
-                f"[cyan]Akun-{worker_idx:02d}[/] [dim]Menyiapkan sesi...[/]",
-                total=total_steps,
-            )
-            worker = FullAutoWorker(
-                worker_id=f"Akun-{worker_idx:02d}",
-                account=account,
-                novel_id=self.novel_id,
-                novel_title=self.novel_title,
-                author_hash_id=self.author_hash_id,
-                chapters=self.chapters,
-                proxy=proxy,
-                base_delay_per_chapter=self.base_delay,
-                do_like=self.do_like,
-                do_bookmark=self.do_bookmark,
-                do_follow=self.do_follow,
-            )
+            slot_idx, tid = await slot_queue.get()
             try:
+                acc_country = account.get("country", "ID")
+                sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
+                proxy = self.proxy_manager.get_proxy(country_code=acc_country, session_id=sess_id)
+                progress.reset(tid, total=total_steps)
+                progress.update(
+                    tid,
+                    role=f"[cyan]Akun-{worker_idx:02d}[/]",
+                    description="[dim]Menyiapkan sesi...[/]",
+                )
+                worker = FullAutoWorker(
+                    worker_id=f"Akun-{worker_idx:02d}",
+                    account=account,
+                    novel_id=self.novel_id,
+                    novel_title=self.novel_title,
+                    author_hash_id=self.author_hash_id,
+                    chapters=self.chapters,
+                    proxy=proxy,
+                    base_delay_per_chapter=self.base_delay,
+                    do_like=self.do_like,
+                    do_bookmark=self.do_bookmark,
+                    do_follow=self.do_follow,
+                )
                 return await worker.execute(progress, tid)
             finally:
-                progress.remove_task(tid)
                 progress.advance(overall_task, 1)
+                slot_queue.put_nowait((slot_idx, tid))
 
     async def run(self) -> List[Dict[str, Any]]:
         total_accounts = len(self.accounts)
         total_steps = len(self.chapters) if self.chapters else 1
+        num_slots = min(self.concurrency, total_accounts)
 
         console.print(
             Panel(
                 f"[bold cyan]Target Novel:[/] [bold yellow]{self.novel_title}[/] (ID: [cyan]{self.novel_id}[/])\n"
                 f"[bold cyan]Total Akun:[/] [bold white]{total_accounts}[/] Akun  |  "
                 f"[bold cyan]Bab Tersedia:[/] [bold white]{len(self.chapters)}[/] Bab\n"
-                f"[bold cyan]Konkurensi:[/] [bold green]{self.concurrency}[/] Akun Paralel  |  "
+                f"[bold cyan]Konkurensi:[/] [bold green]{num_slots}[/] Slot Paralel  |  "
                 f"[bold cyan]Jeda Baca:[/] [bold green]{self.base_delay:.1f}s[/] per Bab\n"
                 f"[bold cyan]Fitur Aktif:[/] "
                 f"Like [{'green' if self.do_like else 'red'}]{'[✓]' if self.do_like else '[✗]'}[/]  •  "
@@ -612,21 +623,31 @@ class FullAutoOrchestrator:
 
         with Progress(
             SpinnerColumn(),
-            TextColumn("{task.description}"),
-            BarColumn(bar_width=25),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left"),
+            TextColumn("{task.description}", justify="left", no_wrap=True),
+            BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
-            TimeRemainingColumn(),
             console=console,
             refresh_per_second=4,
         ) as progress:
             overall_task = progress.add_task(
-                "[bold yellow]★ TOTAL AKUN SELESAI ★[/]",
+                description="[dim]Memproses antrean akun...[/]",
                 total=total_accounts,
+                role="[bold yellow]★ TOTAL[/]",
             )
+            slot_queue: asyncio.Queue = asyncio.Queue()
+            for s_idx in range(1, num_slots + 1):
+                tid = progress.add_task(
+                    description="[dim]Menunggu antrean...[/]",
+                    total=total_steps,
+                    role=f"Slot-{s_idx:02d}",
+                )
+                slot_queue.put_nowait((s_idx, tid))
+
             tasks = []
             for idx, acc in enumerate(self.accounts, start=1):
-                tasks.append(self._worker_wrapper(idx, acc, progress, overall_task, total_steps))
+                tasks.append(self._worker_wrapper(idx, acc, progress, overall_task, total_steps, slot_queue))
 
             results = await asyncio.gather(*tasks)
 
