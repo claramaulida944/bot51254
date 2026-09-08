@@ -111,7 +111,9 @@ class NovelTargetResolver:
         # dengan bab terbatas (misal cuma 6 bab vs 10 bab aslinya).
         origin = str(data.get("origin_country", "ID")).upper()
         if (origin == "EN" or data.get("is_translated")) and not proxy and default_proxy_manager and default_proxy_manager.has_proxies:
-            origin_proxy = default_proxy_manager.get_proxy(country_code="US" if origin == "EN" else origin)
+            en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
+            target_cc = random.choice(en_countries) if origin == "EN" else origin
+            origin_proxy = default_proxy_manager.get_proxy(country_code=target_cc)
             if origin_proxy:
                 try:
                     async with httpx.AsyncClient(proxy=origin_proxy, http2=False, timeout=20.0, headers={"user-agent": "okhttp/4.12.0"}) as p_client:
@@ -137,12 +139,13 @@ class NovelTargetResolver:
         """
         Mengambil daftar bab novel secara dinamis dengan dukungan paginasi kursor (cursor),
         memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
-        Mendukung rotasi proxy negara asal (seperti US untuk novel EN) agar semua bab asli terdeteksi.
+        Mendukung rotasi proxy negara asal (acak GB, AU, CA, US, NZ, IE untuk novel EN) agar semua bab asli terdeteksi.
         """
         target_proxy = proxy
         if not target_proxy and default_proxy_manager and default_proxy_manager.has_proxies:
             if origin_country and origin_country.upper() == "EN":
-                target_proxy = default_proxy_manager.get_proxy(country_code="US")
+                en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
+                target_proxy = default_proxy_manager.get_proxy(country_code=random.choice(en_countries))
             elif origin_country and origin_country.upper() != "ID":
                 target_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
 

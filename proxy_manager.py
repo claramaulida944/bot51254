@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,16 +106,15 @@ class ProxyInfo:
 
         new_username = self.username
 
-        if not country_code:
-            # Default ke rotasi acak multi-negara agar tidak terkunci ke US
-            pool = ["ID", "US", "GB", "DE", "JP", "AU", "CA", "FR", "SG", "NL", "BR", "IN", "KR", "ES", "IT"]
-            country_code = random.choice(pool)
+        if not country_code or str(country_code).upper() in ("RANDOM", "ALL", "AUTO"):
+            # Rotasi acak dinamis dari seluruh pool 43+ negara aktif Bright Data
+            country_code = random.choice(list(BRIGHTDATA_SUPPORTED_COUNTRIES))
 
-        target_cc = country_code.upper().strip()
+        target_cc = str(country_code).upper().strip()
         # Auto-fallback jika negara tidak didukung oleh paket ISP
         if target_cc not in BRIGHTDATA_SUPPORTED_COUNTRIES:
             logger.debug("Negara %s tidak tersedia di pool ISP, fallback ke acak", target_cc)
-            target_cc = random.choice(["US", "ID", "GB", "DE", "JP", "AU", "FR", "SG"])
+            target_cc = random.choice(list(BRIGHTDATA_SUPPORTED_COUNTRIES))
         target_cc = target_cc.lower()
 
         if "-country-" in new_username:
@@ -125,13 +125,15 @@ class ProxyInfo:
             else:
                 new_username += f"-country-{target_cc}"
 
-        # Tambahkan session jika diminta
-        if session_id:
-            clean_session = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id))
-            if "-session-" in new_username:
-                new_username = re.sub(r"-session-[a-zA-Z0-9_-]+", f"-session-{clean_session}", new_username)
-            else:
-                new_username += f"-session-{clean_session}"
+        # Selalu pastikan ada session_id unik per pemanggilan agar IP Bright Data selalu berganti dan terisolasi
+        if not session_id:
+            session_id = f"sess_{secrets.token_hex(4)}"
+
+        clean_session = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id))
+        if "-session-" in new_username:
+            new_username = re.sub(r"-session-[a-zA-Z0-9_-]+", f"-session-{clean_session}", new_username)
+        else:
+            new_username += f"-session-{clean_session}"
 
         auth_part = f"{new_username}:{self.password}@" if self.password else f"{new_username}@"
         return f"{self.scheme}://{auth_part}{self.host}:{self.port}"
@@ -216,13 +218,14 @@ class ProxyManager:
         return self.parsed_proxies[0].get_base_url()
 
     def get_alternate_proxy(self, failed_country: Optional[str] = None) -> Optional[str]:
-        """Mengambil proxy dari negara lain yang terbukti memiliki pool IP aktif."""
-        candidates = ["US", "ID", "GB", "DE", "JP", "FR"]
+        """Mengambil proxy dari negara lain secara dinamis dan acak."""
+        candidates = ["ID", "GB", "DE", "JP", "FR", "AU", "CA", "SG", "NL", "ES", "IT", "KR", "US"]
+        random.shuffle(candidates)
         for cc in candidates:
             if failed_country and cc.upper() == failed_country.upper():
                 continue
-            return self.get_proxy(country_code=cc)
-        return self.get_proxy(country_code="US")
+            return self.get_proxy(country_code=cc, session_id=f"alt_{secrets.token_hex(4)}")
+        return self.get_proxy(country_code=random.choice(candidates), session_id=f"alt_{secrets.token_hex(4)}")
 
     @staticmethod
     def get_client_kwargs(
