@@ -592,7 +592,8 @@ class MemberReaderSession(BaseReaderSession):
         """
         client = await self.get_client()
         ch_id = chapter.get("hash_id", "")
-        ch_title = chapter.get("title", f"Bab {chapter.get('chapter_num', 1)}")
+        ch_num = chapter.get("chapter_num", 1)
+        ch_title = chapter.get("title", f"Bab {ch_num}")
 
         # 1. Mengambil konten bab secara dinamis dengan smart fallback unauthenticated
         ch_url = f"/api/v1/novels/{novel_id}/chapters/{ch_id}"
