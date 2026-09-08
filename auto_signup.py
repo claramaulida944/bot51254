@@ -528,10 +528,11 @@ class RegistrationRunner:
         self.retry_delay_429: float = retry_delay_429
 
     def _get_next_proxy(self, country_code: Optional[str] = None) -> Optional[str]:
-        """Mengambil proxy berikutnya. Jika Bright Data, disesuaikan ke country_code."""
+        """Mengambil proxy berikutnya. Jika Bright Data, disesuaikan ke country_code dengan IP unik per sesi."""
         if not self.proxy_manager.has_proxies:
             return None
-        return self.proxy_manager.get_proxy(country_code=country_code)
+        sess_id = f"signup_{secrets.token_hex(4)}"
+        return self.proxy_manager.get_proxy(country_code=country_code, session_id=sess_id)
 
     def register_account(
         self,

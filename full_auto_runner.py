@@ -13,6 +13,7 @@ rotasi proxy cerdas multi-negara, dan tampilan terminal visual interaktif menggu
 import asyncio
 import logging
 import random
+import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -491,7 +492,8 @@ class FullAutoOrchestrator:
     ) -> Dict[str, Any]:
         async with self.semaphore:
             acc_country = account.get("country", "ID")
-            proxy = self.proxy_manager.get_proxy(country_code=acc_country)
+            sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
+            proxy = self.proxy_manager.get_proxy(country_code=acc_country, session_id=sess_id)
             tid = progress.add_task(
                 f"[cyan]Akun-{worker_idx:02d}[/] [dim]Menyiapkan sesi...[/]",
                 total=total_steps,

@@ -702,6 +702,7 @@ class ReadingSimulationOrchestrator:
         progress: Progress,
         overall_task: TaskID,
     ) -> None:
+        worker_id = f"Guest-{worker_idx:02d}"
         # Rotasi negara acak alami multi-negara (ID, US, GB, JP, DE, AU, SG, CA, dll.)
         pool_countries = [
             "ID", "US", "GB", "AU", "CA", "DE", "JP", "FR", "IN", "SG",
