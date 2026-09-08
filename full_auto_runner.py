@@ -662,7 +662,8 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
     with console.status(f"[bold cyan]Mengambil metadata novel {novel_id}...[/]"):
         try:
             novel_info = await NovelTargetResolver.fetch_novel_details(novel_id)
-            chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id)
+            origin_country = novel_info.get("origin_country", "ID")
+            chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_country)
         except Exception as exc:
             console.print(f"[bold red][ERROR] Gagal menghubungi API server:[/] {exc}")
             return

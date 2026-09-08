@@ -91,28 +91,76 @@ class NovelTargetResolver:
         return match.group(1) if match else None
 
     @classmethod
-    async def fetch_novel_details(cls, novel_id: str) -> Dict[str, Any]:
-        """Mengambil metadata novel (judul, deskripsi, penulis)."""
+    async def fetch_novel_details(cls, novel_id: str, proxy: Optional[str] = None) -> Dict[str, Any]:
+        """Mengambil metadata novel (judul, deskripsi, penulis) dengan dukungan origin detection."""
         url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}"
-        async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0"})
+        client_kwargs: Dict[str, Any] = {"headers": {"user-agent": "okhttp/4.12.0"}, "timeout": 20.0}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+            client_kwargs["http2"] = False
+        else:
+            client_kwargs["http2"] = True
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.get(url)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+
+        # Deteksi jika novel aslinya berasal dari luar negeri (misal EN) atau berstatus terjemahan (is_translated=True),
+        # di mana server Quarterfull saat diakses dari IP lokal Indonesia hanya menyajikan edisi terjemahan
+        # dengan bab terbatas (misal cuma 6 bab vs 10 bab aslinya).
+        origin = str(data.get("origin_country", "ID")).upper()
+        if (origin == "EN" or data.get("is_translated")) and not proxy and default_proxy_manager and default_proxy_manager.has_proxies:
+            origin_proxy = default_proxy_manager.get_proxy(country_code="US" if origin == "EN" else origin)
+            if origin_proxy:
+                try:
+                    async with httpx.AsyncClient(proxy=origin_proxy, http2=False, timeout=20.0, headers={"user-agent": "okhttp/4.12.0"}) as p_client:
+                        p_resp = await p_client.get(url)
+                        if p_resp.status_code == 200:
+                            p_data = p_resp.json()
+                            orig_count = p_data.get("stats", {}).get("chapter_count", 0)
+                            curr_count = data.get("stats", {}).get("chapter_count", 0)
+                            if orig_count >= curr_count:
+                                data = p_data
+                except Exception as e:
+                    logger.debug("Gagal fetch novel details via origin proxy: %s", e)
+
+        return data
 
     @classmethod
-    async def fetch_readable_chapters(cls, novel_id: str) -> List[Dict[str, Any]]:
+    async def fetch_readable_chapters(
+        cls,
+        novel_id: str,
+        origin_country: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Mengambil daftar bab novel secara dinamis dengan dukungan paginasi kursor (cursor),
         memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
+        Mendukung rotasi proxy negara asal (seperti US untuk novel EN) agar semua bab asli terdeteksi.
         """
+        target_proxy = proxy
+        if not target_proxy and default_proxy_manager and default_proxy_manager.has_proxies:
+            if origin_country and origin_country.upper() == "EN":
+                target_proxy = default_proxy_manager.get_proxy(country_code="US")
+            elif origin_country and origin_country.upper() != "ID":
+                target_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
+
+        client_kwargs: Dict[str, Any] = {"headers": {"user-agent": "okhttp/4.12.0"}, "timeout": 25.0}
+        if target_proxy:
+            client_kwargs["proxy"] = target_proxy
+            client_kwargs["http2"] = False
+        else:
+            client_kwargs["http2"] = True
+
         readable = []
         cursor = None
-        async with httpx.AsyncClient(http2=True, timeout=25.0) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:
             while True:
                 url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
                 if cursor:
                     url += f"&cursor={cursor}"
-                resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0"})
+                resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -909,12 +957,13 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         try:
             novel_info = await NovelTargetResolver.fetch_novel_details(novel_id)
             novel_title = novel_info.get("title", f"Novel {novel_id}")
-            chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id)
+            origin_country = novel_info.get("origin_country", "ID")
+            chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_country)
         except Exception as exc:
             console.print(f"[bold red]Gagal mengambil informasi novel:[/] {exc}")
             return
 
-    console.print(f"[bold green][OK][/] Novel Ditemukan: [bold yellow]{novel_title}[/] (Total Bab Gratis: [bold cyan]{len(chapters)}[/])")
+    console.print(f"[bold green][OK][/] Novel Ditemukan: [bold yellow]{novel_title}[/] (Total Bab: [bold cyan]{len(chapters)}[/] | Origin: [bold magenta]{origin_country}[/])")
 
     if len(chapters) == 0:
         console.print("[red]Novel ini tidak memiliki bab gratis untuk dibaca.[/]")
