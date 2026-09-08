@@ -867,6 +867,90 @@ class ReadingSimulationOrchestrator:
                 except Exception:
                     pass
 
+    async def _inter_chapter_pause(
+        self,
+        session: BaseReaderSession,
+        worker_id: str,
+        ident: str,
+        task_id: TaskID,
+        progress: Progress,
+        chapter: Dict[str, Any],
+        next_chapter_num: int,
+        pause_seconds: float,
+        is_guest: bool,
+    ) -> None:
+        """
+        Jeda 1-2 menit sebelum lanjut ke bab berikutnya, sambil terus mengirim denyut heartbeat
+        ke server Quarterfull agar dwell antar-bab alami dan tidak terputus.
+        """
+        ch_num = chapter.get("chapter_num", 1)
+        ch_id = chapter.get("hash_id", "")
+        start_t = time.time()
+        client = await session.get_client()
+
+        # Interval heartbeat tiap ~20 - 30 detik
+        pulse_interval = random.uniform(20.0, 30.0)
+        last_pulse_t = start_t
+
+        role_color = "cyan" if is_guest else "magenta"
+        while True:
+            elapsed = time.time() - start_t
+            remaining = pause_seconds - elapsed
+            if remaining <= 0:
+                break
+
+            progress.update(
+                task_id,
+                description=f"[{role_color}]{worker_id}[/] ({ident}) [dim]Jeda bab {ch_num} ➔ {next_chapter_num} & Heartbeat ({int(remaining)}s)...[/]",
+            )
+
+            # Tidur singkat per 1 detik agar countdown tampilan responsif
+            sleep_chunk = min(1.0, remaining)
+            await asyncio.sleep(sleep_chunk)
+
+            # Cek apakah sudah waktunya kirim pulse heartbeat berkala
+            if (time.time() - last_pulse_t) >= pulse_interval:
+                last_pulse_t = time.time()
+                current_active = random.uniform(180.0, 420.0) + (time.time() - start_t)
+                try:
+                    if is_guest:
+                        payload = {
+                            "chapter_hash_id": ch_id,
+                            "progress": 1.0,
+                            "active_reading_seconds": round(current_active, 2),
+                            "completed": True,
+                            "reading_session_id": IdentifierGenerator.generate_session_id("grs"),
+                            "session_active_reading_seconds": round(current_active, 2),
+                            "session_ended": False,
+                            "session_end_reason": None,
+                            "platform": "android",
+                            "entry_source": "chapter_route",
+                            "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
+                            "chapter_number": ch_num,
+                            "content_type": "novel",
+                            "content_character_count": chapter.get("char_count", 1500),
+                            "read_mode": "scroll",
+                        }
+                        await client.put("/api/guest-reading/progress", json=payload)
+                    else:
+                        hb_payload = {
+                            "session_id": f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}",
+                            "novel_id": self.novel_id,
+                            "chapter_id": ch_id,
+                            "active_seconds": int(current_active),
+                            "scroll_percent": 1.0,
+                            "reading_progress": 1.0,
+                            "chapter_num": ch_num,
+                            "novel_title": self.novel_title,
+                            "chapter_title": chapter.get("title", f"Bab {ch_num}"),
+                            "source": "chapter_route",
+                            "ended": False,
+                            "completed": True,
+                        }
+                        await client.post("/api/reading/sessions/heartbeat", json=hb_payload)
+                except Exception as p_exc:
+                    logger.debug("[%s] Heartbeat jeda bab %d: %s", worker_id, ch_num, p_exc)
+
     async def _run_guest_worker(
         self,
         worker_idx: int,
@@ -895,7 +979,8 @@ class ReadingSimulationOrchestrator:
                     return
 
                 ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
-                for ch in self.chapters:
+                total_chs = len(self.chapters)
+                for ch_idx, ch in enumerate(self.chapters, start=1):
                     ch_num = ch.get("chapter_num", 1)
                     ch_title = ch.get("title", f"Bab {ch_num}")[:18]
                     progress.update(
@@ -910,6 +995,22 @@ class ReadingSimulationOrchestrator:
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
+
+                    # Jika masih ada bab berikutnya, tahan 1-2 menit sambil kirim heartbeat sebelum lanjut
+                    if ch_idx < total_chs and success:
+                        pause_sec = random.uniform(60.0, 120.0)  # Jeda 1 - 2 menit antar bab
+                        next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
+                        await self._inter_chapter_pause(
+                            session=session,
+                            worker_id=worker_id,
+                            ident=ident,
+                            task_id=task_id,
+                            progress=progress,
+                            chapter=ch,
+                            next_chapter_num=next_ch_num,
+                            pause_seconds=pause_sec,
+                            is_guest=True,
+                        )
 
                 # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
                 detached_client = session.detach_client()
@@ -976,7 +1077,8 @@ class ReadingSimulationOrchestrator:
                     await session.close()
                     return
 
-                for ch in self.chapters:
+                total_chs = len(self.chapters)
+                for ch_idx, ch in enumerate(self.chapters, start=1):
                     ch_num = ch.get("chapter_num", 1)
                     ch_title = ch.get("title", f"Bab {ch_num}")[:18]
                     progress.update(
@@ -991,6 +1093,22 @@ class ReadingSimulationOrchestrator:
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
+
+                    # Jika masih ada bab berikutnya, tahan 1-2 menit sambil kirim heartbeat sebelum lanjut
+                    if ch_idx < total_chs and success:
+                        pause_sec = random.uniform(60.0, 120.0)  # Jeda 1 - 2 menit antar bab
+                        next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
+                        await self._inter_chapter_pause(
+                            session=session,
+                            worker_id=worker_id,
+                            ident=short_email,
+                            task_id=task_id,
+                            progress=progress,
+                            chapter=ch,
+                            next_chapter_num=next_ch_num,
+                            pause_seconds=pause_sec,
+                            is_guest=False,
+                        )
 
                 # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
                 detached_client = session.detach_client()

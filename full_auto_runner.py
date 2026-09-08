@@ -331,7 +331,7 @@ class FullAutoWorker:
                 # TAHAP 2: SIMULASI MEMBACA (Chapters & Royalty Post-View)
                 # -------------------------------------------------------------
                 if self.chapters:
-                    for ch in self.chapters:
+                    for ch_idx, ch in enumerate(self.chapters, start=1):
                         ch_num = ch.get("chapter_num", 1)
                         ch_id = ch.get("hash_id", "")
                         ch_title = ch.get("title", f"Bab {ch_num}")[:15]
@@ -449,6 +449,48 @@ class FullAutoWorker:
                                 progress.advance(task_id, 1)
                         except Exception as log_err:
                             logger.debug("[%s] Gagal post-view bab %d: %s", self.worker_id, ch_num, log_err)
+
+                        # 2.D. Jeda 1 - 2 menit antar-bab dengan denyut heartbeat sebelum lanjut ke bab berikutnya
+                        if ch_idx < len(self.chapters):
+                            pause_sec = random.uniform(60.0, 120.0)
+                            next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
+                            start_pause_t = time.time()
+                            pulse_interval = random.uniform(20.0, 30.0)
+                            last_pulse_t = start_pause_t
+
+                            while True:
+                                elapsed = time.time() - start_pause_t
+                                remaining = pause_sec - elapsed
+                                if remaining <= 0:
+                                    break
+
+                                progress.update(
+                                    task_id,
+                                    description=f"[cyan]{self.worker_id}[/] ({short_email}) [dim]Jeda bab {ch_num} ➔ {next_ch_num} & Heartbeat ({int(remaining)}s)...[/]",
+                                )
+                                await asyncio.sleep(min(1.0, remaining))
+
+                                if (time.time() - last_pulse_t) >= pulse_interval:
+                                    last_pulse_t = time.time()
+                                    curr_active = random.uniform(180.0, 420.0) + (time.time() - start_pause_t)
+                                    inter_hb_payload = {
+                                        "session_id": f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}",
+                                        "novel_id": self.novel_id,
+                                        "chapter_id": ch_id,
+                                        "active_seconds": int(curr_active),
+                                        "scroll_percent": 1.0,
+                                        "reading_progress": 1.0,
+                                        "chapter_num": ch_num,
+                                        "novel_title": self.novel_title,
+                                        "chapter_title": ch.get("title", f"Bab {ch_num}"),
+                                        "source": "chapter_route",
+                                        "ended": False,
+                                        "completed": True,
+                                    }
+                                    try:
+                                        await client.post("/api/reading/sessions/heartbeat", json=inter_hb_payload)
+                                    except Exception as p_err:
+                                        logger.debug("[%s] Heartbeat jeda bab %d: %s", self.worker_id, ch_num, p_err)
 
                 self.status = "[green]Sukses Selesai[/]"
                 progress.update(
