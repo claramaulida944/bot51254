@@ -252,10 +252,17 @@ class BaseReaderSession:
             self._client = httpx.AsyncClient(**kwargs)
         return self._client
 
+    def detach_client(self) -> Optional[httpx.AsyncClient]:
+        """Melepas kepemilikan HTTP client agar dapat dilanjutkan oleh background task tanpa tertutup."""
+        client = self._client
+        self._client = None
+        return client
+
     async def close(self) -> None:
-        """Menutup koneksi client HTTP."""
+        """Menutup koneksi client HTTP jika belum dilepas."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+            self._client = None
 
 
 class GuestReaderSession(BaseReaderSession):
@@ -354,20 +361,24 @@ class GuestReaderSession(BaseReaderSession):
         grs_session_id = IdentifierGenerator.generate_session_id("grs")
         attr_session_id = IdentifierGenerator.generate_session_id("attr", random_len=8)
 
-        accumulated_seconds = 0.0
+        # Hitung target dwell manusiawi (3 hingga 7 menit per bab / 180s - 420s)
+        target_dwell = random.uniform(180.0, 420.0)
+        chapter["char_count"] = char_count
+
         for step in range(1, num_steps + 1):
             await asyncio.sleep(step_time)
-            accumulated_seconds += step_time
             is_last = (step == num_steps)
             current_progress = 0.98 if is_last else min(0.95, round(step / num_steps, 2))
+            # Skalakan active reading seconds secara proporsional menuju 3-7 menit
+            step_active_sec = (step / num_steps) * target_dwell
 
             progress_payload = {
                 "chapter_hash_id": ch_id,
                 "progress": current_progress,
-                "active_reading_seconds": round(accumulated_seconds, 2),
+                "active_reading_seconds": round(step_active_sec, 2),
                 "completed": is_last,
                 "reading_session_id": grs_session_id,
-                "session_active_reading_seconds": round(accumulated_seconds, 2),
+                "session_active_reading_seconds": round(step_active_sec, 2),
                 "session_ended": is_last,
                 "session_end_reason": "chapter_change" if is_last else None,
                 "platform": "android",
@@ -627,7 +638,33 @@ class MemberReaderSession(BaseReaderSession):
             except Exception as prog_exc:
                 logger.debug("[%s] Gagal update reading progress bab: %s", self.worker_id, prog_exc)
 
-        # 3. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
+        # 3. Kirim Heartbeat Sesi Membaca Member dengan Dwell Realistis (3-7 menit = 180s - 420s)
+        target_dwell = random.uniform(180.0, 420.0)
+        reading_session_id = f"reading:{novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}"
+        heartbeat_payload = {
+            "session_id": reading_session_id,
+            "novel_id": novel_id,
+            "chapter_id": ch_id,
+            "active_seconds": int(target_dwell),
+            "scroll_percent": 1.0,
+            "reading_progress": 1.0,
+            "chapter_num": ch_num,
+            "novel_title": self.novel_title,
+            "chapter_title": ch_title,
+            "source": "chapter_route",
+            "ended": True,
+            "completed": True,
+        }
+        try:
+            hb_resp = await client.post("/api/reading/sessions/heartbeat", json=heartbeat_payload)
+            if hb_resp.status_code == 401:
+                refreshed = await self.refresh_access_token() or await self.login_with_password()
+                if refreshed:
+                    await client.post("/api/reading/sessions/heartbeat", json=heartbeat_payload)
+        except Exception as hb_exc:
+            logger.debug("[%s] Heartbeat member bab %d: %s", self.worker_id, ch_num, hb_exc)
+
+        # 4. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
         now_iso = datetime.now(timezone.utc).isoformat()
         year_month = datetime.now().strftime("%Y-%m")
 
@@ -663,7 +700,7 @@ class MemberReaderSession(BaseReaderSession):
                 if refreshed:
                     post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
             post_resp.raise_for_status()
-            return True, "200 OK (Progres & Post-View)"
+            return True, "200 OK (Heartbeat Dwell & Post-View)"
         except Exception as exc:
             return False, f"Post-View Log Gagal: {exc}"
 
@@ -698,11 +735,129 @@ class ReadingSimulationOrchestrator:
         self.proxies: List[str] = [p.raw_url for p in self.proxy_manager.parsed_proxies]
         self.base_delay: float = base_delay_per_chapter
         self.total_readers: int = len(member_accounts) + guest_count
+        self.background_tasks: set = set()
 
     def _get_proxy_for_worker(self, country_code: str = "ID", session_id: Optional[str] = None) -> Optional[str]:
         if not self.proxy_manager.has_proxies:
             return None
         return self.proxy_manager.get_proxy(country_code=country_code, session_id=session_id)
+
+    async def _background_dwell_pulser(
+        self,
+        client: Optional[httpx.AsyncClient],
+        worker_id: str,
+        is_guest: bool,
+        novel_id: str,
+        chapters: List[Dict[str, Any]],
+        session_info: Dict[str, Any],
+    ) -> None:
+        """
+        Background task yang terus mengirim pulse event dan telemetry membaca selama 3-7 menit di latar belakang,
+        sehingga sesi pembaca berikutnya dapat langsung dieksekusi tanpa tertahan di foreground CLI.
+        """
+        if not client or client.is_closed:
+            return
+
+        total_duration = random.uniform(180.0, 420.0)  # 3 - 7 menit (180s - 420s)
+        start_time = time.time()
+        logger.info(
+            "[%s BG] Memulai background dwell telemetry selama %.1f detik (%.1f menit)",
+            worker_id,
+            total_duration,
+            total_duration / 60,
+        )
+
+        try:
+            pulse_count = 0
+            while (time.time() - start_time) < total_duration:
+                # Interval antar pulse ~35 - 50 detik
+                sleep_sec = random.uniform(35.0, 50.0)
+                remaining = total_duration - (time.time() - start_time)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(sleep_sec, remaining))
+
+                pulse_count += 1
+                elapsed = time.time() - start_time
+                is_final_pulse = (elapsed >= total_duration - 10.0)
+
+                for ch in chapters:
+                    ch_id = ch.get("hash_id", "")
+                    ch_num = ch.get("chapter_num", 1)
+                    ch_title = ch.get("title", f"Bab {ch_num}")
+
+                    current_dwell = min(total_duration, random.uniform(180.0, 420.0) + elapsed)
+
+                    if is_guest:
+                        payload = {
+                            "chapter_hash_id": ch_id,
+                            "progress": 1.0,
+                            "active_reading_seconds": round(current_dwell, 2),
+                            "completed": True,
+                            "reading_session_id": IdentifierGenerator.generate_session_id("grs"),
+                            "session_active_reading_seconds": round(current_dwell, 2),
+                            "session_ended": is_final_pulse,
+                            "session_end_reason": "completed" if is_final_pulse else None,
+                            "platform": "android",
+                            "entry_source": "chapter_route",
+                            "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
+                            "chapter_number": ch_num,
+                            "content_type": "novel",
+                            "content_character_count": ch.get("char_count", 1500),
+                            "read_mode": "scroll",
+                        }
+                        try:
+                            await client.put("/api/guest-reading/progress", json=payload)
+                        except Exception as p_err:
+                            logger.debug("[%s BG] Gagal pulse guest progress: %s", worker_id, p_err)
+                    else:
+                        hb_payload = {
+                            "session_id": f"reading:{novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}",
+                            "novel_id": novel_id,
+                            "chapter_id": ch_id,
+                            "active_seconds": int(current_dwell),
+                            "scroll_percent": 1.0,
+                            "reading_progress": 1.0,
+                            "chapter_num": ch_num,
+                            "novel_title": self.novel_title,
+                            "chapter_title": ch_title,
+                            "source": "chapter_route",
+                            "ended": is_final_pulse,
+                            "completed": True,
+                        }
+                        try:
+                            await client.post("/api/reading/sessions/heartbeat", json=hb_payload)
+                        except Exception as hb_err:
+                            logger.debug("[%s BG] Gagal pulse member heartbeat: %s", worker_id, hb_err)
+
+                        try:
+                            await client.post(
+                                "/api/reading/progress",
+                                json={
+                                    "novel_id": novel_id,
+                                    "chapter_id": ch_id,
+                                    "scroll_percent": 1.0,
+                                    "reading_progress": 1.0,
+                                    "read_mode": "scroll",
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                logger.debug("[%s BG] Pulse ke-%d sukses (elapsed: %.1fs)", worker_id, pulse_count, elapsed)
+
+            logger.info("[%s BG] Selesai siklus background dwell (total %.1fs)", worker_id, time.time() - start_time)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as main_err:
+            logger.debug("[%s BG] Error background dwell pulser: %s", worker_id, main_err)
+        finally:
+            if client and not client.is_closed:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
 
     async def _run_guest_worker(
         self,
@@ -751,6 +906,25 @@ class ReadingSimulationOrchestrator:
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
+
+                # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
+                detached_client = session.detach_client()
+                if detached_client:
+                    bg_task = asyncio.create_task(
+                        self._background_dwell_pulser(
+                            client=detached_client,
+                            worker_id=worker_id,
+                            is_guest=True,
+                            novel_id=self.novel_id,
+                            chapters=self.chapters,
+                            session_info={
+                                "guest_id": session.guest_id,
+                                "guest_token": session.guest_token,
+                            },
+                        )
+                    )
+                    self.background_tasks.add(bg_task)
+                    bg_task.add_done_callback(self.background_tasks.discard)
 
                 await session.close()
             finally:
@@ -812,6 +986,25 @@ class ReadingSimulationOrchestrator:
                         progress.advance(task_id, 1)
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
+
+                # Lepas HTTP client ke background dwell pulser (3-7 menit di background)
+                detached_client = session.detach_client()
+                if detached_client:
+                    bg_task = asyncio.create_task(
+                        self._background_dwell_pulser(
+                            client=detached_client,
+                            worker_id=worker_id,
+                            is_guest=False,
+                            novel_id=self.novel_id,
+                            chapters=self.chapters,
+                            session_info={
+                                "user_id": session.user_id,
+                                "email": session.email,
+                            },
+                        )
+                    )
+                    self.background_tasks.add(bg_task)
+                    bg_task.add_done_callback(self.background_tasks.discard)
 
                 await session.close()
             finally:
@@ -1069,6 +1262,26 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
             border_style="green",
         )
     )
+
+    active_bg = len(orchestrator.background_tasks)
+    if active_bg > 0:
+        console.print(
+            f"\n[bold cyan][BG TELEMETRY][/] [yellow]{active_bg} sesi background dwell pulser sedang aktif berjalan di latar belakang (3-7 menit).[/]\n"
+            f"[dim]Metrik dwell 3-7 menit per bab sudah tercatat secara langsung di Quarterfull, dan background task terus memperbarui telemetry.[/]"
+        )
+        try:
+            wait_bg = Confirm.ask(
+                "[bold green]?[/] Apakah Anda ingin menunggu seluruh background dwell pulser selesai sempurna?",
+                default=False,
+            )
+            if wait_bg:
+                with console.status("[bold cyan]Menunggu background dwell pulser (Tekan Ctrl+C jika ingin langsung keluar)...[/]"):
+                    try:
+                        await asyncio.gather(*list(orchestrator.background_tasks), return_exceptions=True)
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        console.print("[yellow]Menutup background task dan keluar...[/]")
+        except (KeyboardInterrupt, EOFError):
+            pass
 
 
 def main() -> None:

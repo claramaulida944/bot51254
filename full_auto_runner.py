@@ -383,6 +383,28 @@ class FullAutoWorker:
                             except Exception as prog_err:
                                 logger.debug("[%s] Gagal update progress bab %d (%d%%): %s", self.worker_id, ch_num, current_pct_display, prog_err)
 
+                        # Kirim heartbeat sesi membaca dengan dwell 3-7 menit (180s - 420s)
+                        target_dwell = random.uniform(180.0, 420.0)
+                        reading_session_id = f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}"
+                        hb_payload = {
+                            "session_id": reading_session_id,
+                            "novel_id": self.novel_id,
+                            "chapter_id": ch_id,
+                            "active_seconds": int(target_dwell),
+                            "scroll_percent": 1.0,
+                            "reading_progress": 1.0,
+                            "chapter_num": ch_num,
+                            "novel_title": self.novel_title,
+                            "chapter_title": ch_title,
+                            "source": "chapter_route",
+                            "ended": True,
+                            "completed": True,
+                        }
+                        try:
+                            await client.post("/api/reading/sessions/heartbeat", json=hb_payload)
+                        except Exception as hb_err:
+                            logger.debug("[%s] Gagal heartbeat member bab %d: %s", self.worker_id, ch_num, hb_err)
+
                         # 2.C. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
                         now_iso = datetime.now(timezone.utc).isoformat()
                         year_month = datetime.now().strftime("%Y-%m")
