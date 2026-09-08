@@ -176,8 +176,6 @@ class BaseReaderSession:
             "x-app-version": "3.0.52",
             "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
-            "x-user-country": self.country,
-            "x-user-raw-country": self.country,
             "accept-language": "id" if self.country == "ID" else "en-US,en;q=0.9",
             "x-device-id": self.device_id,
             "accept": "application/json",
@@ -367,6 +365,95 @@ class MemberReaderSession(BaseReaderSession):
         headers["content-type"] = "application/json"
         return headers
 
+    def _save_refreshed_account(self, file_path: str = "akun.txt") -> None:
+        """Menyimpan pembaruan access_token & refresh_token ke berkas akun.txt."""
+        try:
+            if not os.path.exists(file_path):
+                return
+            lines = []
+            updated = False
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        data = json.loads(line_str)
+                        if data.get("email") == self.email:
+                            data["access_token"] = self.access_token
+                            if self.account.get("refresh_token"):
+                                data["refresh_token"] = self.account["refresh_token"]
+                            lines.append(json.dumps(data, ensure_ascii=False))
+                            updated = True
+                            continue
+                    except Exception:
+                        pass
+                    lines.append(line_str)
+            if updated:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            logger.debug("[%s] Gagal menyimpan token baru ke %s: %s", self.worker_id, file_path, exc)
+
+    async def refresh_access_token(self) -> bool:
+        """Memperbarui access_token member via POST /api/auth/token/refresh."""
+        refresh_token = self.account.get("refresh_token")
+        if not refresh_token:
+            return False
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(self.timeout),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+
+            async with httpx.AsyncClient(**kwargs) as refresh_client:
+                resp = await refresh_client.post(
+                    "/api/auth/token/refresh",
+                    json={"refresh_token": refresh_token},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if self._client and not self._client.is_closed:
+                            self._client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        logger.info("[%s] Token member berhasil diperbarui otomatis!", self.worker_id)
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal refresh token: %s", self.worker_id, exc)
+        return False
+
+    async def ensure_valid_session(self) -> bool:
+        """Memverifikasi keaktifan sesi token member, auto-refresh bila kedaluwarsa."""
+        if not self.access_token:
+            return await self.refresh_access_token()
+
+        client = await self.get_client()
+        try:
+            resp = await client.get("/api/auth/profile")
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 401:
+                return await self.refresh_access_token()
+        except Exception:
+            pass
+        return True
+
     async def read_chapter(
         self,
         novel_id: str,
@@ -376,20 +463,35 @@ class MemberReaderSession(BaseReaderSession):
         """
         Membaca satu bab novel sebagai Member:
         1. GET /api/v1/novels/{novel_id}/chapters/{chapter_id}
-        2. Kirim progress scrolling bertahap tiap ~3 detik (layaknya user scroll membaca)
+        2. Kirim progress scrolling bertahap tiap ~3 detik via POST /api/reading/progress
         3. POST /api/reading/v2/logs/post-view saat tuntas 100%
         """
         client = await self.get_client()
         ch_id = chapter.get("hash_id", "")
         ch_title = chapter.get("title", f"Bab {chapter.get('chapter_num', 1)}")
 
-        # 1. Mengambil konten bab secara dinamis dengan smart fallback
+        # 1. Mengambil konten bab secara dinamis dengan smart fallback unauthenticated
         ch_url = f"/api/v1/novels/{novel_id}/chapters/{ch_id}"
         try:
             get_resp = await client.get(ch_url)
+            # Backend Quarterfull mengisolasi katalog antar pasar (market).
+            # Jika novel asing mengembalikan 404 terhadap token regional, ambil konten publiknya secara universal.
             if get_resp.status_code == 404:
-                clean_h = {"authorization": f"Bearer {self.access_token}", "accept": "application/json"}
-                get_resp = await client.get(ch_url, headers=clean_h)
+                clean_kwargs: Dict[str, Any] = {
+                    "base_url": self.BASE_URL,
+                    "timeout": httpx.Timeout(self.timeout),
+                    "headers": {
+                        "user-agent": self.user_agent,
+                        "x-device-id": self.device_id,
+                        "accept": "application/json",
+                    },
+                }
+                if self.proxy:
+                    clean_kwargs["proxy"] = self.proxy
+
+                async with httpx.AsyncClient(**clean_kwargs) as clean_client:
+                    get_resp = await clean_client.get(ch_url)
+
             get_resp.raise_for_status()
         except Exception as exc:
             return False, f"GET Chapter Gagal: {exc}"
@@ -411,11 +513,15 @@ class MemberReaderSession(BaseReaderSession):
                     "reading_progress": current_pct,
                     "read_mode": "scroll",
                 }
-                await client.post("/api/reading/progress", json=prog_payload)
+                prog_resp = await client.post("/api/reading/progress", json=prog_payload)
+                if prog_resp.status_code == 401:
+                    refreshed = await self.refresh_access_token()
+                    if refreshed:
+                        await client.post("/api/reading/progress", json=prog_payload)
             except Exception as prog_exc:
                 logger.debug("[%s] Gagal update reading progress bab: %s", self.worker_id, prog_exc)
 
-        # 4. Kirim Post-View Royalti Telemetri
+        # 3. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
         now_iso = datetime.now(timezone.utc).isoformat()
         year_month = datetime.now().strftime("%Y-%m")
 
@@ -446,6 +552,10 @@ class MemberReaderSession(BaseReaderSession):
 
         try:
             post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
+            if post_resp.status_code == 401:
+                refreshed = await self.refresh_access_token()
+                if refreshed:
+                    post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
             post_resp.raise_for_status()
             return True, "200 OK (Progres & Post-View)"
         except Exception as exc:
@@ -555,10 +665,21 @@ class ReadingSimulationOrchestrator:
 
         async with self.semaphore:
             task_id = progress.add_task(
-                f"[magenta]{worker_id}[/] ({short_email}) [dim]Inisialisasi...[/]",
+                f"[magenta]{worker_id}[/] ({short_email}) [dim]Cek status sesi...[/]",
                 total=len(self.chapters),
             )
             try:
+                # Verifikasi sesi & auto-refresh token jika kadaluarsa
+                is_valid = await session.ensure_valid_session()
+                if not is_valid:
+                    progress.update(
+                        task_id,
+                        description=f"[magenta]{worker_id}[/] ({short_email}) [bold red]Sesi Kadaluarsa (Dilewati)[/]",
+                    )
+                    await asyncio.sleep(1.2)
+                    await session.close()
+                    return
+
                 for ch in self.chapters:
                     ch_num = ch.get("chapter_num", 1)
                     ch_title = ch.get("title", f"Bab {ch_num}")[:18]
