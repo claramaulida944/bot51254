@@ -46,7 +46,7 @@ from auto_reader import (
     load_accounts_from_file,
 )
 from interaction_manager import TargetResolver, default_proxy_manager
-from proxy_manager import ProxyManager
+from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
 
 logger = logging.getLogger("FullAutoRunner")
 console = Console()
@@ -78,7 +78,14 @@ class FullAutoWorker:
         self.access_token = account.get("access_token", "")
         self.device_id = account.get("device_id") or IdentifierGenerator.generate_device_id()
         self.user_agent = account.get("user_agent", "okhttp/4.12.0")
-        self.country = account.get("country", "ID")
+
+        # Validasi negara resmi Quarterfull
+        raw_cc = str(account.get("country", "ID")).upper().strip()
+        self.country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
+        cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+        self.timezone = cfg["timezone"]
+        self.lang = cfg["lang"]
+
         self.novel_id = novel_id
         self.novel_title = novel_title
         self.author_hash_id = author_hash_id
@@ -98,7 +105,7 @@ class FullAutoWorker:
     def _get_current_local_date(self) -> str:
         try:
             if ZoneInfo is not None:
-                now = datetime.now(ZoneInfo("Asia/Jakarta"))
+                now = datetime.now(ZoneInfo(self.timezone))
             else:
                 now = datetime.now()
             return now.strftime("%Y-%m-%d")
@@ -113,9 +120,11 @@ class FullAutoWorker:
             "x-platform": "android",
             "x-app-variant": "prod",
             "x-app-version": "3.0.52",
-            "x-timezone": "Asia/Jakarta",
+            "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
-            "accept-language": "id" if self.country == "ID" else "en-US,en;q=0.9",
+            "accept-language": self.lang,
+            "x-user-country": self.country,
+            "x-user-raw-country": self.country,
             "x-device-id": self.device_id,
             "authorization": f"Bearer {self.access_token}",
             "content-type": "application/json",

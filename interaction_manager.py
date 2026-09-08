@@ -43,7 +43,12 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager
+from proxy_manager import (
+    ProxyManager,
+    ProxyInfo,
+    default_proxy_manager,
+    SUPPORTED_QUARTERFULL_COUNTRIES,
+)
 
 console = Console(highlight=False)
 logger = logging.getLogger("interaction_manager")
@@ -249,7 +254,10 @@ class SocialInteractionBot:
     def _build_headers(self, account: Dict[str, Any]) -> Dict[str, str]:
         """Menyusun header mobile fingerprint yang konsisten."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        country = account.get("country", "ID")
+        raw_country = str(account.get("country", "ID")).upper().strip()
+        country = raw_country if raw_country in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
+        cfg = SUPPORTED_QUARTERFULL_COUNTRIES[country]
+
         return {
             "host": "api.quarterfull.io",
             "user-agent": account.get("user_agent", "okhttp/4.12.0"),
@@ -257,11 +265,11 @@ class SocialInteractionBot:
             "x-platform": "android",
             "x-app-variant": "prod",
             "x-app-version": "3.0.52",
-            "x-timezone": "Asia/Jakarta",
+            "x-timezone": cfg["timezone"],
             "x-local-date": today,
             "x-user-country": country,
             "x-user-raw-country": country,
-            "accept-language": "id",
+            "accept-language": cfg["lang"],
             "x-device-id": account.get("device_id", "d24063e7-a5ff-4831-92b2-4e28c0123498"),
             "authorization": f"Bearer {account.get('access_token', '')}",
         }

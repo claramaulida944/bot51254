@@ -66,7 +66,12 @@ from rich.text import Text
 
 from auto_signup import UserAgentGenerator
 from session_manager import IdentifierGenerator
-from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager
+from proxy_manager import (
+    ProxyManager,
+    ProxyInfo,
+    default_proxy_manager,
+    SUPPORTED_QUARTERFULL_COUNTRIES,
+)
 
 # Konfigurasi logger dasar
 logging.basicConfig(
@@ -197,15 +202,23 @@ class BaseReaderSession:
         device_id: Optional[str] = None,
         user_agent: Optional[str] = None,
         country: str = "ID",
-        timezone_str: str = "Asia/Jakarta",
+        timezone_str: Optional[str] = None,
         proxy: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
         self.worker_id: str = worker_id
         self.device_id: str = device_id or IdentifierGenerator.generate_device_id()
         self.user_agent: str = user_agent or UserAgentGenerator.get_random_okhttp_ua()
-        self.country: str = country
-        self.timezone: str = timezone_str
+
+        # Validasi negara resmi Quarterfull (hanya yang terverifikasi dan didukung API)
+        c_upper = str(country).upper().strip()
+        if c_upper not in SUPPORTED_QUARTERFULL_COUNTRIES:
+            c_upper = random.choice(list(SUPPORTED_QUARTERFULL_COUNTRIES.keys()))
+        self.country = c_upper
+        cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+
+        self.timezone: str = timezone_str or cfg["timezone"]
+        self.lang: str = cfg["lang"]
         self.proxy: Optional[str] = proxy
         self.timeout: float = timeout
         self._client: Optional[httpx.AsyncClient] = None
@@ -222,7 +235,7 @@ class BaseReaderSession:
             return datetime.now().strftime("%Y-%m-%d")
 
     def build_base_headers(self) -> Dict[str, str]:
-        """Menyusun fingerprint header HTTP standar aplikasi Toodat Android."""
+        """Menyusun fingerprint header HTTP standar aplikasi Toodat Android dengan identitas negara resmi."""
         return {
             "host": "api.quarterfull.io",
             "user-agent": self.user_agent,
@@ -232,7 +245,9 @@ class BaseReaderSession:
             "x-app-version": "3.0.52",
             "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
-            "accept-language": "id" if self.country == "ID" else "en-US,en;q=0.9",
+            "accept-language": self.lang,
+            "x-user-country": self.country,
+            "x-user-raw-country": self.country,
             "x-device-id": self.device_id,
             "accept": "application/json",
         }
@@ -275,13 +290,11 @@ class GuestReaderSession(BaseReaderSession):
         proxy: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
-        tz = "America/New_York" if country.upper() == "EN" else "Asia/Jakarta"
         super().__init__(
             worker_id=worker_id,
             device_id=IdentifierGenerator.generate_device_id(),
             user_agent=UserAgentGenerator.get_random_okhttp_ua(),
             country=country,
-            timezone_str=tz,
             proxy=proxy,
             timeout=timeout,
         )
@@ -336,14 +349,9 @@ class GuestReaderSession(BaseReaderSession):
             # Smart fallback jika terjadi 404 (misal akibat novel asing EN vs ID)
             if get_resp.status_code == 404:
                 alt_headers = dict(get_headers)
-                alt_headers["x-user-country"] = "EN" if self.country != "EN" else "ID"
+                alt_headers["x-user-country"] = "US" if self.country != "US" else "ID"
                 alt_headers["x-user-raw-country"] = alt_headers["x-user-country"]
                 get_resp = await client.get(ch_url, headers=alt_headers)
-                if get_resp.status_code == 404:
-                    clean_h = dict(get_headers)
-                    clean_h["x-user-country"] = ""
-                    clean_h["x-user-raw-country"] = ""
-                    get_resp = await client.get(ch_url, headers=clean_h)
 
             get_resp.raise_for_status()
             ch_data = get_resp.json()
@@ -416,7 +424,7 @@ class MemberReaderSession(BaseReaderSession):
             device_id=account_data.get("device_id") or IdentifierGenerator.generate_device_id(),
             user_agent=account_data.get("user_agent") or UserAgentGenerator.get_random_okhttp_ua(),
             country=account_data.get("country", "ID"),
-            timezone_str="Asia/Jakarta",
+            timezone_str=None,
             proxy=proxy,
             timeout=timeout,
         )
@@ -866,12 +874,8 @@ class ReadingSimulationOrchestrator:
         overall_task: TaskID,
     ) -> None:
         worker_id = f"Guest-{worker_idx:02d}"
-        # Rotasi negara acak alami multi-negara (ID, US, GB, JP, DE, AU, SG, CA, dll.)
-        pool_countries = [
-            "ID", "US", "GB", "AU", "CA", "DE", "JP", "FR", "IN", "SG",
-            "NL", "ES", "IT", "CH", "KR", "PH", "TH", "VN", "NO", "SE",
-            "DK", "NZ", "IE", "BE", "AT", "CZ", "PL", "MX", "BR", "MY"
-        ]
+        # Rotasi negara acak dari pool 23 negara resmi Quarterfull yang terverifikasi di API & Proxy
+        pool_countries = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
         proxy_cc = random.choice(pool_countries)
         
         # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
@@ -942,7 +946,8 @@ class ReadingSimulationOrchestrator:
         worker_id = f"Member-{worker_idx:02d}"
         email = account.get("email", "user")
         short_email = email.split("@")[0][:12]
-        acc_country = account.get("country", "ID")
+        raw_cc = str(account.get("country", "ID")).upper().strip()
+        acc_country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
 
         # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
         sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
