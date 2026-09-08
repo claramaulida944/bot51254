@@ -603,6 +603,40 @@ class MemberReaderSession(BaseReaderSession):
             pass
         return True
 
+    async def get_read_chapter_ids(self, novel_id: str) -> set:
+        """
+        Mengambil daftar ID bab (dan nomor bab) yang sudah pernah dibaca oleh akun member ini.
+        Endpoint: GET /api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=true
+        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca (is_read=True atau reading_progress >= 0.95).
+        """
+        read_set = set()
+        client = await self.get_client()
+        url = f"/api/v1/novels/{novel_id}/chapters"
+        params = {
+            "order": "asc",
+            "page": 1,
+            "per_page": 100,
+            "include_read_progress": "true",
+        }
+        try:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("items", [])
+                for item in items:
+                    is_read = item.get("is_read", False)
+                    prog = float(item.get("reading_progress", 0.0) or 0.0)
+                    if is_read or prog >= 0.95:
+                        h_id = item.get("hash_id")
+                        c_num = item.get("chapter_num")
+                        if h_id:
+                            read_set.add(h_id)
+                        if c_num is not None:
+                            read_set.add(c_num)
+        except Exception as exc:
+            logger.debug("[%s] Gagal fetch riwayat baca bab: %s", self.worker_id, exc)
+        return read_set
+
     async def read_chapter(
         self,
         novel_id: str,
@@ -759,6 +793,7 @@ class ReadingSimulationOrchestrator:
         proxies: Optional[List[str]] = None,
         base_delay_per_chapter: float = 8.0,
         origin_country: str = "ID",
+        skip_already_read: bool = True,
     ) -> None:
         self.novel_id: str = novel_id
         self.novel_title: str = novel_title
@@ -768,6 +803,7 @@ class ReadingSimulationOrchestrator:
         self.max_concurrency: int = max(1, max_concurrency)
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.max_concurrency)
         self.origin_country: str = origin_country or "ID"
+        self.skip_already_read: bool = skip_already_read
         if proxies is not None:
             self.proxy_manager = ProxyManager()
             self.proxy_manager.parsed_proxies = [ProxyInfo(p) for p in proxies]
@@ -1135,10 +1171,27 @@ class ReadingSimulationOrchestrator:
                     await session.close()
                     return
 
+                read_ids = set()
+                if self.skip_already_read:
+                    progress.update(task_id, description="[dim]Cek riwayat baca bab...[/]")
+                    read_ids = await session.get_read_chapter_ids(self.novel_id)
+
                 total_chs = len(self.chapters)
                 ch_read_count = 0
                 for ch_idx, ch in enumerate(self.chapters, start=1):
                     ch_num = ch.get("chapter_num", 1)
+                    ch_id = ch.get("hash_id", "")
+
+                    # Cek apakah bab ini sudah pernah dibaca oleh akun ini
+                    if self.skip_already_read and (ch_id in read_ids or ch_num in read_ids):
+                        progress.update(
+                            task_id,
+                            description=f"[dim]Bab {ch_num} (Skip - Sudah Dibaca)[/]",
+                        )
+                        progress.advance(task_id, 1)
+                        await asyncio.sleep(0.3)
+                        continue
+
                     progress.update(
                         task_id,
                         description=f"[yellow]Bab {ch_num} ({ch_idx}/{total_chs})[/]",
@@ -1628,6 +1681,14 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         console.print("[yellow]Tidak ada bab yang dipilih untuk dibaca. Tugas dibatalkan.[/]")
         return
 
+    # Opsi Lewatkan bab yang sudah pernah dibaca (khusus akun member)
+    skip_already_read = True
+    if member_count > 0:
+        skip_already_read = Confirm.ask(
+            "[bold green]?[/] Lewatkan bab yang sudah pernah dibaca oleh akun member? (Auto-skip)",
+            default=True,
+        )
+
     # 3. Ringkasan Tugas & Konfirmasi Eksekusi
     summary_table = Table(title="[bold yellow]Rencana Tugas Simulasi Membaca[/]", border_style="cyan")
     summary_table.add_column("Parameter", style="cyan")
@@ -1635,6 +1696,11 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
 
     summary_table.add_row("Target Novel", f"{novel_title} ({novel_id})")
     summary_table.add_row("Jumlah Bab per Reader", format_chapters_summary(selected_chapters))
+    if member_count > 0:
+        summary_table.add_row(
+            "Auto-Skip Bab Terbaca",
+            "[green]Aktif (Lewati bab yang sudah dibaca)[/]" if skip_already_read else "[yellow]Nonaktif (Baca ulang semua)[/]",
+        )
     summary_table.add_row("Member Readers (Login)", f"{member_count} Akun")
     summary_table.add_row("Guest Readers (Tamu)", f"{guest_count} Sesi")
     summary_table.add_row("Total Sesi Reader", f"{member_count + guest_count} Readers")
@@ -1664,6 +1730,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         proxies=proxies,
         base_delay_per_chapter=4.0,  # 4 detik simulasi per bab untuk efisiensi
         origin_country=novel_info.get("origin_country", "ID") or "ID",
+        skip_already_read=skip_already_read,
     )
 
     start_time = time.time()

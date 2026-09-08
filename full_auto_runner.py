@@ -77,6 +77,7 @@ class FullAutoWorker:
         do_like: bool = True,
         do_bookmark: bool = True,
         do_follow: bool = True,
+        skip_already_read: bool = True,
     ):
         self.worker_id = worker_id
         self.account = account
@@ -102,12 +103,46 @@ class FullAutoWorker:
         self.do_like = do_like
         self.do_bookmark = do_bookmark
         self.do_follow = do_follow
+        self.skip_already_read = skip_already_read
 
         self.like_result = "-"
         self.bookmark_result = "-"
         self.follow_result = "-"
         self.chapters_read = 0
         self.status = "Inisialisasi"
+
+    async def get_read_chapter_ids(self, client: httpx.AsyncClient) -> set:
+        """
+        Mengambil daftar ID bab (dan nomor bab) yang sudah pernah dibaca oleh akun ini.
+        Endpoint: GET /api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=true
+        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca.
+        """
+        read_set = set()
+        url = f"/api/v1/novels/{self.novel_id}/chapters"
+        params = {
+            "order": "asc",
+            "page": 1,
+            "per_page": 100,
+            "include_read_progress": "true",
+        }
+        try:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("items", [])
+                for item in items:
+                    is_read = item.get("is_read", False)
+                    prog = float(item.get("reading_progress", 0.0) or 0.0)
+                    if is_read or prog >= 0.95:
+                        h_id = item.get("hash_id")
+                        c_num = item.get("chapter_num")
+                        if h_id:
+                            read_set.add(h_id)
+                        if c_num is not None:
+                            read_set.add(c_num)
+        except Exception as exc:
+            logger.debug("[%s] Gagal fetch riwayat baca bab: %s", self.worker_id, exc)
+        return read_set
 
     def _get_current_local_date(self) -> str:
         try:
@@ -339,10 +374,25 @@ class FullAutoWorker:
                 # TAHAP 2: SIMULASI MEMBACA (Chapters & Royalty Post-View)
                 # -------------------------------------------------------------
                 if self.chapters:
+                    read_ids = set()
+                    if self.skip_already_read:
+                        progress.update(task_id, description="[dim]Cek riwayat baca...[/]")
+                        read_ids = await self.get_read_chapter_ids(client)
+
                     for ch_idx, ch in enumerate(self.chapters, start=1):
                         ch_num = ch.get("chapter_num", 1)
                         ch_id = ch.get("hash_id", "")
                         ch_title = ch.get("title", f"Bab {ch_num}")[:15]
+
+                        # Deteksi apakah bab sudah pernah dibaca sebelumnya
+                        if self.skip_already_read and (ch_id in read_ids or ch_num in read_ids):
+                            progress.update(
+                                task_id,
+                                description=f"[dim]Bab {ch_num} (Skip - Sudah Dibaca)[/]",
+                            )
+                            progress.advance(task_id, 1)
+                            await asyncio.sleep(0.3)
+                            continue
 
                         progress.update(
                             task_id,
@@ -550,6 +600,7 @@ class FullAutoOrchestrator:
         do_bookmark: bool = True,
         do_follow: bool = True,
         proxies: Optional[List[str]] = None,
+        skip_already_read: bool = True,
     ):
         self.novel_id = novel_id
         self.novel_title = novel_title
@@ -562,6 +613,7 @@ class FullAutoOrchestrator:
         self.do_like = do_like
         self.do_bookmark = do_bookmark
         self.do_follow = do_follow
+        self.skip_already_read = skip_already_read
 
         if proxies is not None:
             self.proxy_manager = ProxyManager()
@@ -602,6 +654,7 @@ class FullAutoOrchestrator:
                     do_like=self.do_like,
                     do_bookmark=self.do_bookmark,
                     do_follow=self.do_follow,
+                    skip_already_read=self.skip_already_read,
                 )
                 return await worker.execute(progress, tid)
             finally:
@@ -613,6 +666,8 @@ class FullAutoOrchestrator:
         total_steps = len(self.chapters) if self.chapters else 1
         num_slots = min(self.concurrency, total_accounts)
 
+        skip_info = f"  •  Auto-Skip Bab Terbaca [{'green' if self.skip_already_read else 'yellow'}]{'[✓]' if self.skip_already_read else '[✗]'}[/]" if self.chapters else ""
+
         console.print(
             Panel(
                 f"[bold cyan]Target Novel:[/] [bold yellow]{self.novel_title}[/] (ID: [cyan]{self.novel_id}[/])\n"
@@ -623,7 +678,8 @@ class FullAutoOrchestrator:
                 f"[bold cyan]Fitur Aktif:[/] "
                 f"Like [{'green' if self.do_like else 'red'}]{'[✓]' if self.do_like else '[✗]'}[/]  •  "
                 f"Simpan/Rak [{'green' if self.do_bookmark else 'red'}]{'[✓]' if self.do_bookmark else '[✗]'}[/]  •  "
-                f"Follow Author [{'green' if self.do_follow else 'red'}]{'[✓]' if self.do_follow else '[✗]'}[/]",
+                f"Follow Author [{'green' if self.do_follow else 'red'}]{'[✓]' if self.do_follow else '[✗]'}[/]"
+                f"{skip_info}",
                 title="[bold green]Memulai Full Auto Bot Suite[/]",
                 border_style="cyan",
             )
@@ -813,7 +869,12 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
     target_chapters = prompt_chapter_selection(chapters, console, allow_skip=True)
 
     base_delay = 6.0
+    skip_already_read = True
     if target_chapters:
+        skip_already_read = Confirm.ask(
+            "[bold green]?[/] Lewatkan bab yang sudah pernah dibaca oleh akun? (Auto-skip)",
+            default=True,
+        )
         base_delay = float(
             Prompt.ask(
                 "[bold green]?[/] Jeda simulasi membaca per bab dalam detik (rekomendasi: 5-10)",
@@ -838,6 +899,7 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
         do_like=do_like,
         do_bookmark=do_bookmark,
         do_follow=do_follow,
+        skip_already_read=skip_already_read,
     )
 
     await orchestrator.run()
