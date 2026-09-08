@@ -794,6 +794,7 @@ class ReadingSimulationOrchestrator:
         base_delay_per_chapter: float = 8.0,
         origin_country: str = "ID",
         skip_already_read: bool = True,
+        inter_chapter_delay: float = 3.0,
     ) -> None:
         self.novel_id: str = novel_id
         self.novel_title: str = novel_title
@@ -804,6 +805,7 @@ class ReadingSimulationOrchestrator:
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.max_concurrency)
         self.origin_country: str = origin_country or "ID"
         self.skip_already_read: bool = skip_already_read
+        self.inter_chapter_delay: float = max(0.0, inter_chapter_delay)
         if proxies is not None:
             self.proxy_manager = ProxyManager()
             self.proxy_manager.parsed_proxies = [ProxyInfo(p) for p in proxies]
@@ -949,72 +951,17 @@ class ReadingSimulationOrchestrator:
         is_guest: bool,
     ) -> None:
         """
-        Jeda 1-2 menit sebelum lanjut ke bab berikutnya, sambil terus mengirim denyut heartbeat
-        ke server Quarterfull agar dwell antar-bab alami dan tidak terputus.
+        Jeda istirahat antar-bab sesuai durasi yang ditentukan pengguna.
+        Heartbeat dan reading progress sudah dikirim bersamaan saat membaca bab.
         """
+        if pause_seconds <= 0:
+            return
         ch_num = chapter.get("chapter_num", 1)
-        ch_id = chapter.get("hash_id", "")
-        start_t = time.time()
-        client = await session.get_client()
-
-        pulse_interval = random.uniform(20.0, 30.0)
-        last_pulse_t = start_t
-
-        while True:
-            elapsed = time.time() - start_t
-            remaining = pause_seconds - elapsed
-            if remaining <= 0:
-                break
-
-            progress.update(
-                task_id,
-                description=f"[cyan]Jeda {ch_num}->{next_chapter_num}[/] [dim]HB({int(remaining)}s)[/]",
-            )
-
-            sleep_chunk = min(1.0, remaining)
-            await asyncio.sleep(sleep_chunk)
-
-            if (time.time() - last_pulse_t) >= pulse_interval:
-                last_pulse_t = time.time()
-                current_active = random.uniform(180.0, 420.0) + (time.time() - start_t)
-                try:
-                    if is_guest:
-                        payload = {
-                            "chapter_hash_id": ch_id,
-                            "progress": 1.0,
-                            "active_reading_seconds": round(current_active, 2),
-                            "completed": True,
-                            "reading_session_id": IdentifierGenerator.generate_session_id("grs"),
-                            "session_active_reading_seconds": round(current_active, 2),
-                            "session_ended": False,
-                            "session_end_reason": None,
-                            "platform": "android",
-                            "entry_source": "chapter_route",
-                            "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
-                            "chapter_number": ch_num,
-                            "content_type": "novel",
-                            "content_character_count": chapter.get("char_count", 1500),
-                            "read_mode": "scroll",
-                        }
-                        await client.put("/api/guest-reading/progress", json=payload)
-                    else:
-                        hb_payload = {
-                            "session_id": f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}",
-                            "novel_id": self.novel_id,
-                            "chapter_id": ch_id,
-                            "active_seconds": int(current_active),
-                            "scroll_percent": 1.0,
-                            "reading_progress": 1.0,
-                            "chapter_num": ch_num,
-                            "novel_title": self.novel_title,
-                            "chapter_title": chapter.get("title", f"Bab {ch_num}"),
-                            "source": "chapter_route",
-                            "ended": False,
-                            "completed": True,
-                        }
-                        await client.post("/api/reading/sessions/heartbeat", json=hb_payload)
-                except Exception as p_exc:
-                    logger.debug("[%s] Heartbeat jeda bab %d: %s", worker_id, ch_num, p_exc)
+        progress.update(
+            task_id,
+            description=f"[cyan]Jeda Bab {ch_num}->{next_chapter_num} ({pause_seconds:.1f}s)[/]",
+        )
+        await asyncio.sleep(pause_seconds)
 
     async def _run_guest_worker(
         self,
@@ -1073,8 +1020,7 @@ class ReadingSimulationOrchestrator:
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
 
-                    if ch_idx < total_chs and success:
-                        pause_sec = random.uniform(60.0, 120.0)
+                    if ch_idx < total_chs and success and self.inter_chapter_delay > 0:
                         next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
                         await self._inter_chapter_pause(
                             session=session,
@@ -1083,7 +1029,7 @@ class ReadingSimulationOrchestrator:
                             progress=progress,
                             chapter=ch,
                             next_chapter_num=next_ch_num,
-                            pause_seconds=pause_sec,
+                            pause_seconds=self.inter_chapter_delay,
                             is_guest=True,
                         )
 
@@ -1206,8 +1152,7 @@ class ReadingSimulationOrchestrator:
                     else:
                         logger.warning("[%s] Bab %d: %s", worker_id, ch_num, status_msg)
 
-                    if ch_idx < total_chs and success:
-                        pause_sec = random.uniform(60.0, 120.0)
+                    if ch_idx < total_chs and success and self.inter_chapter_delay > 0:
                         next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
                         await self._inter_chapter_pause(
                             session=session,
@@ -1216,7 +1161,7 @@ class ReadingSimulationOrchestrator:
                             progress=progress,
                             chapter=ch,
                             next_chapter_num=next_ch_num,
-                            pause_seconds=pause_sec,
+                            pause_seconds=self.inter_chapter_delay,
                             is_guest=False,
                         )
 
@@ -1689,6 +1634,14 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
             default=True,
         )
 
+    # Opsi Jeda Antar-Bab yang fleksibel
+    inter_chapter_delay = float(
+        Prompt.ask(
+            "[bold green]?[/] Waktu jeda istirahat antar-bab dalam detik (rekomendasi: 2 - 5)",
+            default="3.0",
+        )
+    )
+
     # 3. Ringkasan Tugas & Konfirmasi Eksekusi
     summary_table = Table(title="[bold yellow]Rencana Tugas Simulasi Membaca[/]", border_style="cyan")
     summary_table.add_column("Parameter", style="cyan")
@@ -1696,6 +1649,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
 
     summary_table.add_row("Target Novel", f"{novel_title} ({novel_id})")
     summary_table.add_row("Jumlah Bab per Reader", format_chapters_summary(selected_chapters))
+    summary_table.add_row("Jeda Antar-Bab", f"{inter_chapter_delay:.1f} Detik")
     if member_count > 0:
         summary_table.add_row(
             "Auto-Skip Bab Terbaca",
@@ -1731,6 +1685,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         base_delay_per_chapter=4.0,  # 4 detik simulasi per bab untuk efisiensi
         origin_country=novel_info.get("origin_country", "ID") or "ID",
         skip_already_read=skip_already_read,
+        inter_chapter_delay=inter_chapter_delay,
     )
 
     start_time = time.time()

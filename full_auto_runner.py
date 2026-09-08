@@ -78,6 +78,7 @@ class FullAutoWorker:
         do_bookmark: bool = True,
         do_follow: bool = True,
         skip_already_read: bool = True,
+        inter_chapter_delay: float = 3.0,
     ):
         self.worker_id = worker_id
         self.account = account
@@ -104,6 +105,7 @@ class FullAutoWorker:
         self.do_bookmark = do_bookmark
         self.do_follow = do_follow
         self.skip_already_read = skip_already_read
+        self.inter_chapter_delay = max(0.0, inter_chapter_delay)
 
         self.like_result = "-"
         self.bookmark_result = "-"
@@ -514,47 +516,14 @@ class FullAutoWorker:
                         except Exception as log_err:
                             logger.debug("[%s] Gagal post-view bab %d: %s", self.worker_id, ch_num, log_err)
 
-                        # 2.D. Jeda 1 - 2 menit antar-bab dengan denyut heartbeat sebelum lanjut ke bab berikutnya
-                        if ch_idx < len(self.chapters):
-                            pause_sec = random.uniform(60.0, 120.0)
+                        # 2.D. Jeda istirahat antar-bab sesuai konfigurasi user
+                        if ch_idx < len(self.chapters) and self.inter_chapter_delay > 0:
                             next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
-                            start_pause_t = time.time()
-                            pulse_interval = random.uniform(20.0, 30.0)
-                            last_pulse_t = start_pause_t
-
-                            while True:
-                                elapsed = time.time() - start_pause_t
-                                remaining = pause_sec - elapsed
-                                if remaining <= 0:
-                                    break
-
-                                progress.update(
-                                    task_id,
-                                    description=f"[cyan]Jeda Bab {ch_num}->{next_ch_num}[/] [dim]HB({int(remaining)}s)[/]",
-                                )
-                                await asyncio.sleep(min(1.0, remaining))
-
-                                if (time.time() - last_pulse_t) >= pulse_interval:
-                                    last_pulse_t = time.time()
-                                    curr_active = random.uniform(180.0, 420.0) + (time.time() - start_pause_t)
-                                    inter_hb_payload = {
-                                        "session_id": f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}",
-                                        "novel_id": self.novel_id,
-                                        "chapter_id": ch_id,
-                                        "active_seconds": int(curr_active),
-                                        "scroll_percent": 1.0,
-                                        "reading_progress": 1.0,
-                                        "chapter_num": ch_num,
-                                        "novel_title": self.novel_title,
-                                        "chapter_title": ch.get("title", f"Bab {ch_num}"),
-                                        "source": "chapter_route",
-                                        "ended": False,
-                                        "completed": True,
-                                    }
-                                    try:
-                                        await client.post("/api/reading/sessions/heartbeat", json=inter_hb_payload)
-                                    except Exception as p_err:
-                                        logger.debug("[%s] Heartbeat jeda bab %d: %s", self.worker_id, ch_num, p_err)
+                            progress.update(
+                                task_id,
+                                description=f"[cyan]Jeda Bab {ch_num}->{next_ch_num} ({self.inter_chapter_delay:.1f}s)[/]",
+                            )
+                            await asyncio.sleep(self.inter_chapter_delay)
 
                 self.status = "[green]Sukses Selesai[/]"
                 progress.update(
@@ -601,6 +570,7 @@ class FullAutoOrchestrator:
         do_follow: bool = True,
         proxies: Optional[List[str]] = None,
         skip_already_read: bool = True,
+        inter_chapter_delay: float = 3.0,
     ):
         self.novel_id = novel_id
         self.novel_title = novel_title
@@ -614,6 +584,7 @@ class FullAutoOrchestrator:
         self.do_bookmark = do_bookmark
         self.do_follow = do_follow
         self.skip_already_read = skip_already_read
+        self.inter_chapter_delay = max(0.0, inter_chapter_delay)
 
         if proxies is not None:
             self.proxy_manager = ProxyManager()
@@ -655,6 +626,7 @@ class FullAutoOrchestrator:
                     do_bookmark=self.do_bookmark,
                     do_follow=self.do_follow,
                     skip_already_read=self.skip_already_read,
+                    inter_chapter_delay=self.inter_chapter_delay,
                 )
                 return await worker.execute(progress, tid)
             finally:
@@ -674,7 +646,8 @@ class FullAutoOrchestrator:
                 f"[bold cyan]Total Akun:[/] [bold white]{total_accounts}[/] Akun  |  "
                 f"[bold cyan]Bab Dibaca:[/] [bold white]{format_chapters_summary(self.chapters)}[/]\n"
                 f"[bold cyan]Konkurensi:[/] [bold green]{num_slots}[/] Slot Paralel  |  "
-                f"[bold cyan]Jeda Baca:[/] [bold green]{self.base_delay:.1f}s[/] per Bab\n"
+                f"[bold cyan]Jeda Baca:[/] [bold green]{self.base_delay:.1f}s[/] per Bab  |  "
+                f"[bold cyan]Jeda Antar-Bab:[/] [bold green]{self.inter_chapter_delay:.1f}s[/]\n"
                 f"[bold cyan]Fitur Aktif:[/] "
                 f"Like [{'green' if self.do_like else 'red'}]{'[✓]' if self.do_like else '[✗]'}[/]  •  "
                 f"Simpan/Rak [{'green' if self.do_bookmark else 'red'}]{'[✓]' if self.do_bookmark else '[✗]'}[/]  •  "
@@ -870,6 +843,7 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
 
     base_delay = 6.0
     skip_already_read = True
+    inter_chapter_delay = 3.0
     if target_chapters:
         skip_already_read = Confirm.ask(
             "[bold green]?[/] Lewatkan bab yang sudah pernah dibaca oleh akun? (Auto-skip)",
@@ -877,8 +851,14 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
         )
         base_delay = float(
             Prompt.ask(
-                "[bold green]?[/] Jeda simulasi membaca per bab dalam detik (rekomendasi: 5-10)",
-                default="6.0",
+                "[bold green]?[/] Jeda simulasi membaca per bab dalam detik (rekomendasi: 4-6)",
+                default="5.0",
+            )
+        )
+        inter_chapter_delay = float(
+            Prompt.ask(
+                "[bold green]?[/] Waktu jeda istirahat antar-bab dalam detik (rekomendasi: 2-5)",
+                default="3.0",
             )
         )
 
@@ -900,6 +880,7 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
         do_bookmark=do_bookmark,
         do_follow=do_follow,
         skip_already_read=skip_already_read,
+        inter_chapter_delay=inter_chapter_delay,
     )
 
     await orchestrator.run()
