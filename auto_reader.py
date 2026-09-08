@@ -102,21 +102,29 @@ class NovelTargetResolver:
     @classmethod
     async def fetch_readable_chapters(cls, novel_id: str) -> List[Dict[str, Any]]:
         """
-        Mengambil daftar bab novel, memfilter hanya bab yang sudah terbit
-        dan non-premium (gratis), lalu mengurutkannya berdasarkan nomor bab.
+        Mengambil daftar bab novel secara dinamis dengan dukungan paginasi kursor (cursor),
+        memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
         """
-        url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
+        readable = []
+        cursor = None
         async with httpx.AsyncClient(http2=True, timeout=25.0) as client:
-            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0"})
-            resp.raise_for_status()
-            data = resp.json()
+            while True:
+                url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
+                if cursor:
+                    url += f"&cursor={cursor}"
+                resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0"})
+                resp.raise_for_status()
+                data = resp.json()
 
-        items = data.get("items", [])
-        # Filter hanya bab yang terbit dan gratis (non-premium)
-        readable = [
-            ch for ch in items
-            if ch.get("is_published", True) and not ch.get("is_premium", False)
-        ]
+                items = data.get("items", [])
+                for ch in items:
+                    if ch.get("is_published", True) and not ch.get("is_premium", False):
+                        readable.append(ch)
+
+                cursor = data.get("next_cursor")
+                if not cursor:
+                    break
+
         # Urutkan berdasarkan chapter_num terkecil ke terbesar
         readable.sort(key=lambda x: x.get("chapter_num", 0))
         return readable
@@ -202,15 +210,17 @@ class GuestReaderSession(BaseReaderSession):
     def __init__(
         self,
         worker_id: str,
+        country: str = "ID",
         proxy: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
+        tz = "America/New_York" if country.upper() == "EN" else "Asia/Jakarta"
         super().__init__(
             worker_id=worker_id,
             device_id=IdentifierGenerator.generate_device_id(),
             user_agent=UserAgentGenerator.get_random_okhttp_ua(),
-            country="ID",
-            timezone_str="Asia/Jakarta",
+            country=country,
+            timezone_str=tz,
             proxy=proxy,
             timeout=timeout,
         )
@@ -245,25 +255,35 @@ class GuestReaderSession(BaseReaderSession):
         reading_delay_sec: float,
     ) -> Tuple[bool, str]:
         """
-        Membaca satu bab novel sebagai tamu:
+        Membaca satu bab novel sebagai tamu secara dinamis:
         1. GET /api/v1/novels/{novel_id}/chapters/{chapter_id}?rewarded_reader=true
-        2. Tunggu simulasi baca async
+        2. Kirim progress scrolling bertahap tiap ~3 detik
         3. PUT /api/guest-reading/progress
         """
         client = await self.get_client()
         ch_id = chapter.get("hash_id", "")
         ch_num = chapter.get("chapter_num", 1)
 
-        # 1. Fetch teks bab
+        # 1. Fetch teks bab secara dinamis dengan auto-fallback negara
         event_id = IdentifierGenerator.generate_guest_event_id(ch_id)
         get_headers = {"x-guest-event-id": event_id}
 
         char_count = 0
+        ch_url = f"/api/v1/novels/{novel_id}/chapters/{ch_id}?rewarded_reader=true"
         try:
-            get_resp = await client.get(
-                f"/api/v1/novels/{novel_id}/chapters/{ch_id}?rewarded_reader=true",
-                headers=get_headers,
-            )
+            get_resp = await client.get(ch_url, headers=get_headers)
+            # Smart fallback jika terjadi 404 (misal akibat novel asing EN vs ID)
+            if get_resp.status_code == 404:
+                alt_headers = dict(get_headers)
+                alt_headers["x-user-country"] = "EN" if self.country != "EN" else "ID"
+                alt_headers["x-user-raw-country"] = alt_headers["x-user-country"]
+                get_resp = await client.get(ch_url, headers=alt_headers)
+                if get_resp.status_code == 404:
+                    clean_h = dict(get_headers)
+                    clean_h["x-user-country"] = ""
+                    clean_h["x-user-raw-country"] = ""
+                    get_resp = await client.get(ch_url, headers=clean_h)
+
             get_resp.raise_for_status()
             ch_data = get_resp.json()
             content = ch_data.get("content", "")
@@ -363,9 +383,13 @@ class MemberReaderSession(BaseReaderSession):
         ch_id = chapter.get("hash_id", "")
         ch_title = chapter.get("title", f"Bab {chapter.get('chapter_num', 1)}")
 
-        # 1. Mengambil konten bab
+        # 1. Mengambil konten bab secara dinamis dengan smart fallback
+        ch_url = f"/api/v1/novels/{novel_id}/chapters/{ch_id}"
         try:
-            get_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters/{ch_id}")
+            get_resp = await client.get(ch_url)
+            if get_resp.status_code == 404:
+                clean_h = {"authorization": f"Bearer {self.access_token}", "accept": "application/json"}
+                get_resp = await client.get(ch_url, headers=clean_h)
             get_resp.raise_for_status()
         except Exception as exc:
             return False, f"GET Chapter Gagal: {exc}"
@@ -441,6 +465,7 @@ class ReadingSimulationOrchestrator:
         max_concurrency: int = 5,
         proxies: Optional[List[str]] = None,
         base_delay_per_chapter: float = 8.0,
+        origin_country: str = "ID",
     ) -> None:
         self.novel_id: str = novel_id
         self.novel_title: str = novel_title
@@ -448,6 +473,7 @@ class ReadingSimulationOrchestrator:
         self.member_accounts: List[Dict[str, Any]] = member_accounts
         self.guest_count: int = guest_count
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(max_concurrency)
+        self.origin_country: str = origin_country or "ID"
         if proxies is not None:
             self.proxy_manager = ProxyManager()
             self.proxy_manager.parsed_proxies = [ProxyInfo(p) for p in proxies]
@@ -470,8 +496,9 @@ class ReadingSimulationOrchestrator:
     ) -> None:
         """Menjalankan satu sesi pembaca Tamu melalui seluruh bab."""
         worker_id = f"Guest-{worker_idx:02d}"
-        proxy = self._get_proxy_for_worker(country_code="ID")
-        session = GuestReaderSession(worker_id=worker_id, proxy=proxy)
+        proxy_cc = "US" if self.origin_country.upper() == "EN" else self.origin_country
+        proxy = self._get_proxy_for_worker(country_code=proxy_cc)
+        session = GuestReaderSession(worker_id=worker_id, country=self.origin_country, proxy=proxy)
 
         async with self.semaphore:
             task_id = progress.add_task(
@@ -776,6 +803,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         max_concurrency=max_workers,
         proxies=proxies,
         base_delay_per_chapter=4.0,  # 4 detik simulasi per bab untuk efisiensi
+        origin_country=novel_info.get("origin_country", "ID") or "ID",
     )
 
     start_time = time.time()

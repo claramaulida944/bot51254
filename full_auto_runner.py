@@ -219,9 +219,14 @@ class FullAutoWorker:
                             description=f"[cyan]{self.worker_id}[/] ({short_email}) [yellow]Baca Bab {ch_num}[/] [dim]({ch_title})...[/]",
                         )
 
-                        # 2.A. Fetch isi bab
+                        # 2.A. Fetch isi bab secara dinamis dengan smart fallback
                         try:
-                            await client.get(f"/api/v1/novels/{self.novel_id}/chapters/{ch_id}")
+                            ch_url = f"/api/v1/novels/{self.novel_id}/chapters/{ch_id}"
+                            ch_resp = await client.get(ch_url)
+                            if ch_resp.status_code == 404:
+                                clean_h = {"authorization": f"Bearer {self.access_token}", "accept": "application/json"}
+                                ch_resp = await client.get(ch_url, headers=clean_h)
+                            ch_resp.raise_for_status()
                         except Exception as get_err:
                             logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
 
