@@ -654,11 +654,14 @@ class ReadingSimulationOrchestrator:
         progress: Progress,
         overall_task: TaskID,
     ) -> None:
-        """Menjalankan satu sesi pembaca Tamu melalui seluruh bab."""
-        worker_id = f"Guest-{worker_idx:02d}"
-        proxy_cc = "US" if self.origin_country.upper() == "EN" else self.origin_country
+        # Rotasi negara pembaca alami agar view analytics terdistribusi realistis multi-negara
+        if self.origin_country.upper() == "EN":
+            popular_countries = ["ID", "US", "GB", "AU", "CA", "DE", "JP", "FR", "IN", "SG"]
+            proxy_cc = popular_countries[worker_idx % len(popular_countries)]
+        else:
+            proxy_cc = self.origin_country
         proxy = self._get_proxy_for_worker(country_code=proxy_cc)
-        session = GuestReaderSession(worker_id=worker_id, country=self.origin_country, proxy=proxy)
+        session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy)
 
         async with self.semaphore:
             task_id = progress.add_task(

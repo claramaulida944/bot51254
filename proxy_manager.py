@@ -33,9 +33,11 @@ logger = logging.getLogger("ProxyManager")
 console = Console()
 
 
-# Pool negara yang terverifikasi memiliki alokasi IP aktif pada zone Bright Data ISP
+# Pool negara yang terverifikasi memiliki alokasi IP aktif pada zone Bright Data
 BRIGHTDATA_SUPPORTED_COUNTRIES = {
-    "US", "ID", "GB", "JP", "DE", "FR", "IN", "BR", "CO", "NO", "SE", "DK", "AU", "CA"
+    "US", "ID", "GB", "JP", "DE", "FR", "IN", "BR", "CO", "NO", "SE", "DK", "AU", "CA",
+    "SG", "MY", "NL", "ES", "IT", "CH", "KR", "PH", "TH", "VN", "PL", "MX", "NZ", "IE",
+    "BE", "AT", "CZ", "RO", "GR", "PT", "HU", "TR", "SA", "AE", "EG", "ZA", "CL", "AR", "PE"
 }
 
 
