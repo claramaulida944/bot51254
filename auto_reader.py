@@ -61,7 +61,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.prompt import Confirm, IntPrompt, Prompt
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
 from auto_signup import UserAgentGenerator
@@ -1191,8 +1191,8 @@ class ReadingSimulationOrchestrator:
 
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left"),
-            TextColumn("{task.description}", justify="left", no_wrap=True),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(no_wrap=True)),
+            TextColumn("{task.description}", justify="left", table_column=Column(no_wrap=True)),
             BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),

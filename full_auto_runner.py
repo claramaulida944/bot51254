@@ -38,7 +38,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.prompt import Confirm, IntPrompt, Prompt
-from rich.table import Table
+from rich.table import Column, Table
 
 from auto_reader import (
     IdentifierGenerator,
@@ -623,8 +623,8 @@ class FullAutoOrchestrator:
 
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left"),
-            TextColumn("{task.description}", justify="left", no_wrap=True),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(no_wrap=True)),
+            TextColumn("{task.description}", justify="left", table_column=Column(no_wrap=True)),
             BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
