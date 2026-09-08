@@ -19,6 +19,7 @@ Fitur Unggulan:
 
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -104,24 +105,25 @@ class ProxyInfo:
 
         new_username = self.username
 
-        if country_code:
-            target_cc = country_code.upper().strip()
-            # Auto-fallback jika negara tidak didukung oleh paket ISP
-            if target_cc not in BRIGHTDATA_SUPPORTED_COUNTRIES:
-                logger.debug("Negara %s tidak tersedia di pool ISP, fallback ke US", target_cc)
-                target_cc = "US"
-            target_cc = target_cc.lower()
+        if not country_code:
+            # Default ke rotasi acak multi-negara agar tidak terkunci ke US
+            pool = ["ID", "US", "GB", "DE", "JP", "AU", "CA", "FR", "SG", "NL", "BR", "IN", "KR", "ES", "IT"]
+            country_code = random.choice(pool)
 
-            if "-country-" in new_username:
-                new_username = re.sub(r"-country-[a-zA-Z0-9]+", f"-country-{target_cc}", new_username)
+        target_cc = country_code.upper().strip()
+        # Auto-fallback jika negara tidak didukung oleh paket ISP
+        if target_cc not in BRIGHTDATA_SUPPORTED_COUNTRIES:
+            logger.debug("Negara %s tidak tersedia di pool ISP, fallback ke acak", target_cc)
+            target_cc = random.choice(["US", "ID", "GB", "DE", "JP", "AU", "FR", "SG"])
+        target_cc = target_cc.lower()
+
+        if "-country-" in new_username:
+            new_username = re.sub(r"-country-[a-zA-Z0-9]+", f"-country-{target_cc}", new_username)
+        else:
+            if "-zone-" in new_username:
+                new_username = re.sub(r"(-zone-[^-:]+)", rf"\1-country-{target_cc}", new_username)
             else:
-                if "-zone-" in new_username:
-                    new_username = re.sub(r"(-zone-[^-:]+)", rf"\1-country-{target_cc}", new_username)
-                else:
-                    new_username += f"-country-{target_cc}"
-        elif not use_default_if_none:
-            # Hapus flag country jika ingin fallback ke base zone
-            new_username = re.sub(r"-country-[a-zA-Z0-9]+", "", new_username)
+                new_username += f"-country-{target_cc}"
 
         # Tambahkan session jika diminta
         if session_id:
@@ -203,9 +205,7 @@ class ProxyManager:
         self._current_index += 1
 
         if proxy_info.is_brightdata:
-            if country_code:
-                return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
-            return proxy_info.raw_url
+            return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
         return proxy_info.raw_url
 

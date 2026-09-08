@@ -643,10 +643,10 @@ class ReadingSimulationOrchestrator:
         self.base_delay: float = base_delay_per_chapter
         self.total_readers: int = len(member_accounts) + guest_count
 
-    def _get_proxy_for_worker(self, country_code: str = "ID") -> Optional[str]:
+    def _get_proxy_for_worker(self, country_code: str = "ID", session_id: Optional[str] = None) -> Optional[str]:
         if not self.proxy_manager.has_proxies:
             return None
-        return self.proxy_manager.get_proxy(country_code=country_code)
+        return self.proxy_manager.get_proxy(country_code=country_code, session_id=session_id)
 
     async def _run_guest_worker(
         self,
@@ -654,13 +654,17 @@ class ReadingSimulationOrchestrator:
         progress: Progress,
         overall_task: TaskID,
     ) -> None:
-        # Rotasi negara pembaca alami agar view analytics terdistribusi realistis multi-negara
-        if self.origin_country.upper() == "EN":
-            popular_countries = ["ID", "US", "GB", "AU", "CA", "DE", "JP", "FR", "IN", "SG"]
-            proxy_cc = popular_countries[worker_idx % len(popular_countries)]
-        else:
-            proxy_cc = self.origin_country
-        proxy = self._get_proxy_for_worker(country_code=proxy_cc)
+        # Rotasi negara acak alami multi-negara (ID, US, GB, JP, DE, AU, SG, CA, dll.)
+        pool_countries = [
+            "ID", "US", "GB", "AU", "CA", "DE", "JP", "FR", "IN", "SG",
+            "NL", "ES", "IT", "CH", "KR", "PH", "TH", "VN", "NO", "SE",
+            "DK", "NZ", "IE", "BE", "AT", "CZ", "PL", "MX", "BR", "MY"
+        ]
+        proxy_cc = random.choice(pool_countries)
+        
+        # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
+        sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
+        proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
         session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy)
 
         async with self.semaphore:
@@ -708,7 +712,10 @@ class ReadingSimulationOrchestrator:
         email = account.get("email", "user")
         short_email = email.split("@")[0][:12]
         acc_country = account.get("country", "ID")
-        proxy = self._get_proxy_for_worker(country_code=acc_country)
+
+        # Alokasikan IP baru yang unik dari pool Bright Data khusus untuk sesi worker ini
+        sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
+        proxy = self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
         session = MemberReaderSession(
             worker_id=worker_id,
             account_data=account,
@@ -863,10 +870,23 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         str(len(accounts)),
         "Siap untuk simulasi Member Reader" if accounts else "Belum ada akun, silakan buat via auto_signup.py",
     )
+    if default_proxy_manager.is_brightdata:
+        proxy_count_str = "Bright Data"
+        proxy_desc_str = "Dynamic IP Rotation (1 Sesi = 1 IP Baru Berbeda & Negara Acak)"
+        proxy_summary_str = "Bright Data SuperProxy (Rotasi 1 IP Baru per Sesi & Multi-Negara)"
+    elif proxies:
+        proxy_count_str = str(len(proxies))
+        proxy_desc_str = f"{len(proxies)} IP aktif termuat"
+        proxy_summary_str = f"{len(proxies)} Proxy Standar"
+    else:
+        proxy_count_str = "0"
+        proxy_desc_str = "Koneksi Langsung / Direct Connection"
+        proxy_summary_str = "Direct (Tanpa Proxy)"
+
     status_table.add_row(
         "Daftar Proxy (proxies.txt)",
-        str(len(proxies)),
-        f"{len(proxies)} IP aktif termuat" if proxies else "Koneksi Langsung / Direct Connection",
+        proxy_count_str,
+        proxy_desc_str,
     )
 
     console.print(status_table)
@@ -953,7 +973,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
     summary_table.add_row("Guest Readers (Tamu)", f"{guest_count} Sesi")
     summary_table.add_row("Total Sesi Reader", f"{member_count + guest_count} Readers")
     summary_table.add_row("Batas Konkurensi", f"{max_workers} Worker Paralel")
-    summary_table.add_row("Proxy Digunakan", f"{len(proxies)} Proxy" if proxies else "Direct (Tanpa Proxy)")
+    summary_table.add_row("Proxy Digunakan", proxy_summary_str)
 
     console.print("\n", summary_table, "\n")
 
