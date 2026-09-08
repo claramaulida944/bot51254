@@ -165,29 +165,39 @@ class NovelTargetResolver:
         else:
             client_kwargs["http2"] = True
 
-        readable = []
-        cursor = None
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            while True:
-                url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
-                if cursor:
-                    url += f"&cursor={cursor}"
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
+        async def _query_chapters(kwargs_map: Dict[str, Any]) -> List[Dict[str, Any]]:
+            readable_list = []
+            cur = None
+            async with httpx.AsyncClient(**kwargs_map) as client:
+                while True:
+                    url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
+                    if cur:
+                        url += f"&cursor={cur}"
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    data = resp.json()
 
-                items = data.get("items", [])
-                for ch in items:
-                    if ch.get("is_published", True) and not ch.get("is_premium", False):
-                        readable.append(ch)
+                    items = data.get("items", [])
+                    for ch in items:
+                        if ch.get("is_published", True) and not ch.get("is_premium", False):
+                            readable_list.append(ch)
 
-                cursor = data.get("next_cursor")
-                if not cursor:
-                    break
+                    cur = data.get("next_cursor")
+                    if not cur:
+                        break
+            readable_list.sort(key=lambda x: x.get("chapter_num", 0))
+            return readable_list
 
-        # Urutkan berdasarkan chapter_num terkecil ke terbesar
-        readable.sort(key=lambda x: x.get("chapter_num", 0))
-        return readable
+        try:
+            return await _query_chapters(client_kwargs)
+        except Exception as exc:
+            # Jika menggunakan proxy dan gagal (misal 407 Account is suspended / timeout / connection error),
+            # lakukan fallback otomatis ke direct connection (tanpa proxy)
+            if target_proxy:
+                logger.warning("Fetch bab via proxy gagal (%s). Otomatis beralih ke Direct Connection...", exc)
+                direct_kwargs: Dict[str, Any] = {"headers": {"user-agent": "okhttp/4.12.0"}, "timeout": 25.0, "http2": True}
+                return await _query_chapters(direct_kwargs)
+            raise
 
 
 class BaseReaderSession:
@@ -316,6 +326,14 @@ class GuestReaderSession(BaseReaderSession):
                     client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
                     return True
             except Exception as exc:
+                if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
+                    logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, exc)
+                    self.proxy = None
+                    if self._client and not self._client.is_closed:
+                        await self._client.aclose()
+                    self._client = None
+                    client = await self.get_client()
+                    continue
                 if attempt == 1:
                     logger.error("[%s] Gagal inisialisasi guest session: %s", self.worker_id, exc)
                 await asyncio.sleep(1.0)
@@ -357,6 +375,13 @@ class GuestReaderSession(BaseReaderSession):
             content = ch_data.get("content", "")
             char_count = len(content)
         except Exception as exc:
+            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
+                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
+                self.proxy = None
+                if self._client and not self._client.is_closed:
+                    await self._client.aclose()
+                self._client = None
+                return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
         # 2. Simulasi jeda baca natural & heartbeat berkala (tiap ~3 detik)
@@ -619,6 +644,13 @@ class MemberReaderSession(BaseReaderSession):
 
             get_resp.raise_for_status()
         except Exception as exc:
+            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
+                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
+                self.proxy = None
+                if self._client and not self._client.is_closed:
+                    await self._client.aclose()
+                self._client = None
+                return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
         # 2. Simulasi jeda baca natural & heartbeat progress scrolling berkala (tiap ~3 detik)
@@ -993,7 +1025,7 @@ class ReadingSimulationOrchestrator:
                     ch_num = ch.get("chapter_num", 1)
                     progress.update(
                         task_id,
-                        description=f"[yellow]Bab {ch_num}/{total_chs}[/]",
+                        description=f"[yellow]Bab {ch_num} ({ch_idx}/{total_chs})[/]",
                     )
 
                     read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
@@ -1109,7 +1141,7 @@ class ReadingSimulationOrchestrator:
                     ch_num = ch.get("chapter_num", 1)
                     progress.update(
                         task_id,
-                        description=f"[yellow]Bab {ch_num}/{total_chs}[/]",
+                        description=f"[yellow]Bab {ch_num} ({ch_idx}/{total_chs})[/]",
                     )
 
                     read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
@@ -1303,6 +1335,194 @@ def render_banner() -> None:
     )
 
 
+def parse_chapter_selection(input_str: str, chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Mem-parsing input teks pengguna menjadi daftar bab yang dipilih.
+    Mendukung format:
+    - Satu bab: "10" atau "bab 10"
+    - Rentang: "10-25", "10 - 25", "10 to 25", "10 s/d 25", "10 sampai 25"
+    - Daftar: "1, 3, 5, 10-15"
+    - Gabungan koma/spasi/titik dua
+    Mengembalikan daftar bab yang cocok dan berurutan sesuai urutan bab asli.
+    """
+    if not input_str or not chapters:
+        return []
+
+    cleaned = input_str.strip().lower()
+    # Bersihkan kata 'bab' atau 'chapter'
+    cleaned = re.sub(r"\b(bab|chapter|ch)\b", "", cleaned, flags=re.IGNORECASE)
+
+    # Ganti kata-kata penghubung rentang dengan '-'
+    for sep in [" sampai ", " s/d ", " to ", " sd ", ":"]:
+        cleaned = cleaned.replace(sep, "-")
+
+    # Rapikan spasi di sekitar '-'
+    cleaned = re.sub(r"\s*-\s*", "-", cleaned)
+
+    target_nums = set()
+    # Pisahkan berdasarkan koma, titik koma, atau spasi
+    tokens = re.split(r"[,;\s]+", cleaned)
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start = int(parts[0])
+                end = int(parts[1])
+                for n in range(min(start, end), max(start, end) + 1):
+                    target_nums.add(n)
+        elif token.isdigit():
+            target_nums.add(int(token))
+
+    # Cocokkan dengan chapters yang tersedia dan pertahankan urutan aslinya
+    selected = []
+    for idx, ch in enumerate(chapters, start=1):
+        c_num = ch.get("chapter_num")
+        num = c_num if c_num is not None else idx
+        if num in target_nums:
+            selected.append(ch)
+
+    return selected
+
+
+def format_chapters_summary(selected_chapters: List[Dict[str, Any]]) -> str:
+    """Memformat ringkasan bab yang dipilih untuk tampilan tabel ringkasan."""
+    if not selected_chapters:
+        return "0 Bab (Dilewati / Tidak Membaca)"
+
+    nums = [ch.get("chapter_num", i + 1) for i, ch in enumerate(selected_chapters)]
+    total = len(selected_chapters)
+
+    if total == 1:
+        return f"1 Bab (Bab {nums[0]})"
+
+    # Periksa apakah berurutan (kontigu)
+    is_consecutive = all(nums[i] + 1 == nums[i + 1] for i in range(len(nums) - 1))
+    if is_consecutive:
+        return f"{total} Bab (Bab {nums[0]} s/d Bab {nums[-1]})"
+
+    # Jika acak / terpilih sebagian
+    if total <= 5:
+        joined = ", ".join(f"Bab {n}" for n in nums)
+        return f"{total} Bab ({joined})"
+    else:
+        preview = ", ".join(str(n) for n in nums[:5])
+        return f"{total} Bab (Bab {preview}, ... s/d Bab {nums[-1]})"
+
+
+def prompt_chapter_selection(
+    chapters: List[Dict[str, Any]],
+    console: Console,
+    allow_skip: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Antarmuka prompt interaktif untuk memilih bab novel.
+    Mendukung:
+    1. Semua bab gratis
+    2. Satu bab tertentu (contoh: bab 10)
+    3. Rentang bab tertentu (contoh: bab 10-25)
+    4. Beberapa bab kustom (contoh: 1, 3, 5, 10-15)
+    5. N bab pertama (contoh: 3 bab pertama)
+    6. Lewati membaca (jika allow_skip=True)
+    """
+    if not chapters:
+        return []
+
+    min_ch = chapters[0].get("chapter_num", 1)
+    max_ch = chapters[-1].get("chapter_num", len(chapters))
+    total_avail = len(chapters)
+
+    console.print("\n[bold cyan]Pilihan Mode Bab yang Akan Dibaca:[/]")
+    console.print(f"  [bold green][1][/] Baca [bold yellow]Semua Bab Gratis[/] yang tersedia (Total: [cyan]{total_avail}[/] Bab, No. {min_ch} - {max_ch}) [bold green][Default][/]")
+    console.print("  [bold green][2][/] Pilih [bold yellow]Satu Bab Tertentu[/] saja (Contoh: hanya membaca Bab 10)")
+    console.print("  [bold green][3][/] Pilih [bold yellow]Rentang Bab Tertentu[/] (Contoh: Bab 10 sampai 25 / [white]10-25[/])")
+    console.print("  [bold green][4][/] Pilih [bold yellow]Beberapa Bab / Kustom[/] (Contoh: [white]1, 3, 5, 10-15[/])")
+    console.print("  [bold green][5][/] Baca [bold yellow]N Bab Pertama[/] saja (Contoh: 3 bab pertama)")
+    if allow_skip:
+        console.print("  [bold green][6][/] [dim]Lewati Membaca (Hanya jalankan Like, Bookmark/Simpan, & Follow)[/]")
+
+    choices = ["1", "2", "3", "4", "5"]
+    if allow_skip:
+        choices.append("6")
+
+    while True:
+        chapter_mode = Prompt.ask(
+            "[bold green]?[/] Pilih mode bab",
+            choices=choices,
+            default="1",
+        )
+
+        # Mode 1: Semua bab
+        if chapter_mode == "1":
+            return list(chapters)
+
+        # Mode 2: Satu bab tertentu
+        elif chapter_mode == "2":
+            while True:
+                single_input = Prompt.ask(
+                    f"[bold green]?[/] Masukkan nomor bab yang ingin dibaca [contoh: {min_ch} - {max_ch}]",
+                    default=str(min_ch),
+                ).strip()
+                selected = parse_chapter_selection(single_input, chapters)
+                if selected:
+                    ch_info = selected[0]
+                    c_num = ch_info.get("chapter_num", single_input)
+                    c_title = ch_info.get("title", f"Bab {c_num}")
+                    console.print(f"  [bold green][OK][/] Terpilih: [bold yellow]Bab {c_num} - {c_title}[/]")
+                    return selected
+                console.print(f"  [bold red][!][/] Bab '{single_input}' tidak ditemukan di daftar bab gratis (Tersedia: {min_ch} s/d {max_ch}). Silakan coba lagi.")
+
+        # Mode 3: Rentang bab
+        elif chapter_mode == "3":
+            while True:
+                range_input = Prompt.ask(
+                    f"[bold green]?[/] Masukkan rentang bab [contoh: 10-25] (Tersedia: {min_ch} s/d {max_ch})",
+                    default=f"{min_ch}-{min(min_ch + 2, max_ch)}",
+                ).strip()
+                selected = parse_chapter_selection(range_input, chapters)
+                if selected:
+                    start_n = selected[0].get("chapter_num")
+                    end_n = selected[-1].get("chapter_num")
+                    if len(selected) == 1:
+                        console.print(f"  [bold green][OK][/] Terpilih 1 bab: [bold yellow]Bab {start_n}[/]")
+                    else:
+                        console.print(f"  [bold green][OK][/] Terpilih [bold cyan]{len(selected)}[/] bab: [bold yellow]Bab {start_n} s/d Bab {end_n}[/]")
+                    return selected
+                console.print(f"  [bold red][!][/] Rentang '{range_input}' tidak menghasilkan bab gratis yang cocok. Silakan coba lagi.")
+
+        # Mode 4: Beberapa bab kustom
+        elif chapter_mode == "4":
+            while True:
+                custom_input = Prompt.ask(
+                    "[bold green]?[/] Masukkan daftar bab yang ingin dibaca [contoh: 1, 3, 5, 10-15]",
+                ).strip()
+                selected = parse_chapter_selection(custom_input, chapters)
+                if selected:
+                    nums_preview = ", ".join(str(ch.get("chapter_num")) for ch in selected[:8])
+                    more_str = "..." if len(selected) > 8 else ""
+                    console.print(f"  [bold green][OK][/] Terpilih [bold cyan]{len(selected)}[/] bab: [bold yellow]Bab {nums_preview}{more_str}[/]")
+                    return selected
+                console.print(f"  [bold red][!][/] Input '{custom_input}' tidak cocok dengan bab yang tersedia. Silakan coba lagi.")
+
+        # Mode 5: N bab pertama
+        elif chapter_mode == "5":
+            n_first = IntPrompt.ask(
+                f"[bold green]?[/] Berapa bab pertama yang ingin dibaca? [1 - {total_avail}]",
+                default=min(3, total_avail),
+            )
+            n_first = max(1, min(n_first, total_avail))
+            selected = chapters[:n_first]
+            console.print(f"  [bold green][OK][/] Terpilih [bold cyan]{len(selected)}[/] bab pertama (Bab {selected[0].get('chapter_num')} s/d {selected[-1].get('chapter_num')})")
+            return selected
+
+        # Mode 6: Lewati membaca
+        elif chapter_mode == "6" and allow_skip:
+            console.print("  [yellow]Membaca novel dilewati. Hanya menjalankan aksi interaksi.[/]")
+            return []
+
+
 async def main_async(preset_novel_id: Optional[str] = None) -> None:
     """Fungsi utama antarmuka interaktif CLI Auto Readers."""
     render_banner()
@@ -1402,17 +1622,11 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         default=min(4, member_count + guest_count),
     )
 
-    # Input mode bab
-    console.print("\nPilihan mode bab:")
-    console.print("  [1] Baca semua bab gratis yang tersedia")
-    console.print("  [2] Baca N bab pertama saja")
-    chapter_mode = Prompt.ask("[bold green]?[/] Pilih mode bab", choices=["1", "2"], default="1")
-
-    selected_chapters = chapters
-    if chapter_mode == "2":
-        max_n = len(chapters)
-        n_first = IntPrompt.ask(f"[bold green]?[/] Berapa bab pertama yang ingin dibaca? [1 - {max_n}]", default=min(3, max_n))
-        selected_chapters = chapters[:max(1, min(n_first, max_n))]
+    # Input mode bab (Fleksibel: Semua, Satu Bab, Rentang 10-25, Beberapa Bab Kustom, N Pertama)
+    selected_chapters = prompt_chapter_selection(chapters, console, allow_skip=False)
+    if not selected_chapters:
+        console.print("[yellow]Tidak ada bab yang dipilih untuk dibaca. Tugas dibatalkan.[/]")
+        return
 
     # 3. Ringkasan Tugas & Konfirmasi Eksekusi
     summary_table = Table(title="[bold yellow]Rencana Tugas Simulasi Membaca[/]", border_style="cyan")
@@ -1420,7 +1634,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
     summary_table.add_column("Konfigurasi", style="bold green")
 
     summary_table.add_row("Target Novel", f"{novel_title} ({novel_id})")
-    summary_table.add_row("Jumlah Bab per Reader", f"{len(selected_chapters)} Bab (No. {selected_chapters[0].get('chapter_num')} - {selected_chapters[-1].get('chapter_num')})")
+    summary_table.add_row("Jumlah Bab per Reader", format_chapters_summary(selected_chapters))
     summary_table.add_row("Member Readers (Login)", f"{member_count} Akun")
     summary_table.add_row("Guest Readers (Tamu)", f"{guest_count} Sesi")
     summary_table.add_row("Total Sesi Reader", f"{member_count + guest_count} Readers")

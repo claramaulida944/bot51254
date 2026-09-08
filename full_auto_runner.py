@@ -43,7 +43,9 @@ from rich.table import Column, Table
 from auto_reader import (
     IdentifierGenerator,
     NovelTargetResolver,
+    format_chapters_summary,
     load_accounts_from_file,
+    prompt_chapter_selection,
 )
 from interaction_manager import TargetResolver, default_proxy_manager
 from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
@@ -344,7 +346,7 @@ class FullAutoWorker:
 
                         progress.update(
                             task_id,
-                            description=f"[yellow]Bab {ch_num}/{len(self.chapters)}[/]",
+                            description=f"[yellow]Bab {ch_num} ({ch_idx}/{len(self.chapters)})[/]",
                         )
 
                         # 2.A. Fetch isi bab secara dinamis dengan smart fallback unauthenticated jika region isolasi
@@ -367,6 +369,12 @@ class FullAutoWorker:
                                     ch_resp = await clean_client.get(ch_url)
                             ch_resp.raise_for_status()
                         except Exception as get_err:
+                            if self.proxy and ("407" in str(get_err) or "proxy" in str(get_err).lower() or isinstance(get_err, (httpx.ProxyError, httpx.ConnectError))):
+                                logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, get_err)
+                                self.proxy = None
+                                if client and not client.is_closed:
+                                    await client.aclose()
+                                client = httpx.AsyncClient(headers=self.build_headers(), timeout=httpx.Timeout(self.timeout), http2=True, base_url=self.BASE_URL)
                             logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
 
                         # 2.B. Simulasi scrolling membaca bertahap / heartbeat (per ~3 detik & per persen progres)
@@ -609,7 +617,7 @@ class FullAutoOrchestrator:
             Panel(
                 f"[bold cyan]Target Novel:[/] [bold yellow]{self.novel_title}[/] (ID: [cyan]{self.novel_id}[/])\n"
                 f"[bold cyan]Total Akun:[/] [bold white]{total_accounts}[/] Akun  |  "
-                f"[bold cyan]Bab Tersedia:[/] [bold white]{len(self.chapters)}[/] Bab\n"
+                f"[bold cyan]Bab Dibaca:[/] [bold white]{format_chapters_summary(self.chapters)}[/]\n"
                 f"[bold cyan]Konkurensi:[/] [bold green]{num_slots}[/] Slot Paralel  |  "
                 f"[bold cyan]Jeda Baca:[/] [bold green]{self.base_delay:.1f}s[/] per Bab\n"
                 f"[bold cyan]Fitur Aktif:[/] "
@@ -801,26 +809,8 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
         default=True,
     )
 
-    # 3. Opsi Membaca
-    console.print("\n[bold cyan]Mode Membaca Bab:[/]")
-    console.print("  [bold green][1][/] Baca Seluruh Bab (Semua bab gratis yang tersedia - [bold yellow]Wajib Seluruh Bab[/]) [bold green][Default][/]")
-    console.print("  [bold green][2][/] Tentukan Sendiri Jumlah Bab (User input manual berapa bab)")
-    console.print("  [bold green][3][/] Lewati Membaca (Hanya jalankan Like, Bookmark/Simpan, & Follow)")
-    read_choice = Prompt.ask(
-        "[bold green]?[/] Pilih mode membaca bab novel",
-        choices=["1", "2", "3"],
-        default="1",
-    )
-
-    target_chapters = list(chapters)
-    if read_choice == "2":
-        num_ch = IntPrompt.ask(
-            f"[bold green]?[/] Berapa bab pertama yang ingin dibaca per akun? [1-{len(chapters)}]",
-            default=min(3, len(chapters)),
-        )
-        target_chapters = chapters[:num_ch]
-    elif read_choice == "3":
-        target_chapters = []
+    # 3. Opsi Membaca Bab (Fleksibel: Semua, Satu Bab, Rentang 10-25, Beberapa Bab Kustom, N Pertama, atau Lewati)
+    target_chapters = prompt_chapter_selection(chapters, console, allow_skip=True)
 
     base_delay = 6.0
     if target_chapters:
