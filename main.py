@@ -252,6 +252,7 @@ def feature_account_manager() -> None:
     check_tokens = Confirm.ask("[bold green]?[/] Uji keaktifan semua Bearer Token via API sekarang?", default=False)
     if check_tokens:
         console.print("\n[dim]Menguji keaktifan token ke endpoint resmi backend...[/]\n")
+        expired_accounts = []
         with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
             for idx, acc in enumerate(accounts, start=1):
                 headers = {
@@ -265,10 +266,61 @@ def feature_account_manager() -> None:
                         status_str = "[bold green]AKTIF (Valid)[/]"
                     else:
                         status_str = "[bold red]KADALUARSA (Expired)[/]"
+                        expired_accounts.append(acc)
                 except Exception as exc:
                     status_str = f"[yellow]Error: {exc}[/]"
 
                 console.print(f"  [{idx:02d}] {acc.get('email')} -> {status_str}")
+
+        if expired_accounts:
+            console.print(f"\n[yellow]Terdeteksi {len(expired_accounts)} akun dengan token kadaluarsa.[/]")
+            do_relogin = Confirm.ask(
+                "[bold green]?[/] Lakukan Login Ulang otomatis (Re-Login) sekarang dengan email & password?",
+                default=True,
+            )
+            if do_relogin:
+                console.print("\n[cyan]Memulai proses Login Ulang akun...[/]\n")
+                relogin_success = 0
+                lines = []
+                with open("akun.txt", "r", encoding="utf-8", errors="replace") as f:
+                    file_accounts = [json.loads(l.strip()) for l in f if l.strip()]
+
+                with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=20.0) as relogin_client:
+                    for i, acc in enumerate(file_accounts, start=1):
+                        email = acc.get("email")
+                        password = acc.get("password")
+                        if not email or not password:
+                            lines.append(json.dumps(acc, ensure_ascii=False))
+                            continue
+
+                        h = {
+                            "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                            "x-device-id": acc.get("device_id", ""),
+                            "x-platform": "android",
+                            "x-app-variant": "prod",
+                            "x-app-version": "3.0.52",
+                            "content-type": "application/json",
+                            "accept": "application/json",
+                        }
+                        try:
+                            r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
+                            if r.status_code == 200:
+                                d = r.json()
+                                acc["access_token"] = d.get("access_token", acc.get("access_token"))
+                                if "refresh_token" in d:
+                                    acc["refresh_token"] = d.get("refresh_token")
+                                relogin_success += 1
+                                console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru)[/]")
+                            else:
+                                console.print(f"  [{i:02d}] {email} -> [red]Gagal ({r.status_code})[/]")
+                        except Exception as err:
+                            console.print(f"  [{i:02d}] {email} -> [red]Error: {err}[/]")
+
+                        lines.append(json.dumps(acc, ensure_ascii=False))
+
+                with open("akun.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                console.print(f"\n[bold green]Selesai! {relogin_success} akun berhasil diperbarui dan disimpan ke 'akun.txt'.[/]")
 
     wait_for_enter()
 

@@ -438,10 +438,58 @@ class MemberReaderSession(BaseReaderSession):
             logger.debug("[%s] Gagal refresh token: %s", self.worker_id, exc)
         return False
 
+    async def login_with_password(self) -> bool:
+        """Melakukan login ulang penuh ke POST /api/auth/login menggunakan email & password."""
+        password = self.account.get("password")
+        if not self.email or not password:
+            return False
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(self.timeout),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "x-platform": "android",
+                    "x-app-variant": "prod",
+                    "x-app-version": "3.0.52",
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+
+            async with httpx.AsyncClient(**kwargs) as login_client:
+                resp = await login_client.post(
+                    "/api/auth/login",
+                    json={"login_id": self.email, "password": password},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if self._client and not self._client.is_closed:
+                            self._client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal login ulang dengan password: %s", self.worker_id, exc)
+        return False
+
     async def ensure_valid_session(self) -> bool:
-        """Memverifikasi keaktifan sesi token member, auto-refresh bila kedaluwarsa."""
+        """Memverifikasi keaktifan sesi token member; auto-refresh atau re-login bila kedaluwarsa."""
         if not self.access_token:
-            return await self.refresh_access_token()
+            if await self.refresh_access_token():
+                return True
+            return await self.login_with_password()
 
         client = await self.get_client()
         try:
@@ -449,7 +497,9 @@ class MemberReaderSession(BaseReaderSession):
             if resp.status_code == 200:
                 return True
             if resp.status_code == 401:
-                return await self.refresh_access_token()
+                if await self.refresh_access_token():
+                    return True
+                return await self.login_with_password()
         except Exception:
             pass
         return True
@@ -515,7 +565,7 @@ class MemberReaderSession(BaseReaderSession):
                 }
                 prog_resp = await client.post("/api/reading/progress", json=prog_payload)
                 if prog_resp.status_code == 401:
-                    refreshed = await self.refresh_access_token()
+                    refreshed = await self.refresh_access_token() or await self.login_with_password()
                     if refreshed:
                         await client.post("/api/reading/progress", json=prog_payload)
             except Exception as prog_exc:
@@ -553,7 +603,7 @@ class MemberReaderSession(BaseReaderSession):
         try:
             post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
             if post_resp.status_code == 401:
-                refreshed = await self.refresh_access_token()
+                refreshed = await self.refresh_access_token() or await self.login_with_password()
                 if refreshed:
                     post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
             post_resp.raise_for_status()

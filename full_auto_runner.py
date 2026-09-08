@@ -114,14 +114,119 @@ class FullAutoWorker:
             "x-app-version": "3.0.52",
             "x-timezone": "Asia/Jakarta",
             "x-local-date": self._get_current_local_date(),
-            "x-user-country": self.country,
-            "x-user-raw-country": self.country,
             "accept-language": "id" if self.country == "ID" else "en-US,en;q=0.9",
             "x-device-id": self.device_id,
             "authorization": f"Bearer {self.access_token}",
             "content-type": "application/json",
             "accept": "application/json",
         }
+
+    def _save_refreshed_account(self, file_path: str = "akun.txt") -> None:
+        try:
+            if not os.path.exists(file_path):
+                return
+            lines = []
+            updated = False
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        data = json.loads(line_str)
+                        if data.get("email") == self.email:
+                            data["access_token"] = self.access_token
+                            if self.account.get("refresh_token"):
+                                data["refresh_token"] = self.account["refresh_token"]
+                            lines.append(json.dumps(data, ensure_ascii=False))
+                            updated = True
+                            continue
+                    except Exception:
+                        pass
+                    lines.append(line_str)
+            if updated:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            logger.debug("[%s] Gagal menyimpan token ke %s: %s", self.worker_id, file_path, exc)
+
+    async def refresh_access_token(self, client: Optional[httpx.AsyncClient] = None) -> bool:
+        refresh_token = self.account.get("refresh_token")
+        if not refresh_token:
+            return False
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(20.0),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+
+            async with httpx.AsyncClient(**kwargs) as refresh_client:
+                resp = await refresh_client.post("/api/auth/token/refresh", json={"refresh_token": refresh_token})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if client is not None and not client.is_closed:
+                            client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal refresh: %s", self.worker_id, exc)
+        return False
+
+    async def login_with_password(self, client: Optional[httpx.AsyncClient] = None) -> bool:
+        password = self.account.get("password")
+        if not self.email or not password:
+            return False
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(20.0),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "x-platform": "android",
+                    "x-app-variant": "prod",
+                    "x-app-version": "3.0.52",
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+
+            async with httpx.AsyncClient(**kwargs) as login_client:
+                resp = await login_client.post("/api/auth/login", json={"login_id": self.email, "password": password})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if client is not None and not client.is_closed:
+                            client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
+        return False
 
     async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
         short_email = self.email.split("@")[0][:12]
@@ -152,9 +257,16 @@ class FullAutoWorker:
                     if resp.status_code == 200:
                         novel_status_data = resp.json()
                     elif resp.status_code == 401:
-                        self.status = "Token Expired (401)"
-                        progress.update(task_id, description=f"[red]{self.worker_id}[/] ({short_email}) [red]Token Expired![/]")
-                        return self._build_summary()
+                        # Otomatis refresh atau login ulang
+                        relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
+                        if relogged:
+                            retry_resp = await client.get(f"/api/v1/novels/{self.novel_id}")
+                            if retry_resp.status_code == 200:
+                                novel_status_data = retry_resp.json()
+                        if not novel_status_data:
+                            self.status = "Token Expired (401)"
+                            progress.update(task_id, description=f"[red]{self.worker_id}[/] ({short_email}) [red]Sesi Habis (Skip)[/]")
+                            return self._build_summary()
                 except Exception as exc:
                     logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
 
