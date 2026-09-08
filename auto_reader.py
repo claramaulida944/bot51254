@@ -87,6 +87,11 @@ class NovelTargetResolver:
     @classmethod
     def extract_novel_id(cls, raw_input: str) -> Optional[str]:
         """Mengekstrak 16-karakter hash ID dari string teks atau URL novel."""
+        if not raw_input:
+            return None
+        query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", raw_input)
+        if query_hash:
+            return query_hash.group(1)
         match = cls.NOVEL_ID_REGEX.search(raw_input.strip())
         return match.group(1) if match else None
 

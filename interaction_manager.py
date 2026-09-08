@@ -131,25 +131,35 @@ class TargetResolver:
     @classmethod
     def clean_target(cls, raw_input: str) -> Tuple[str, str]:
         """
-        Mengekstrak hash ID dari input string/URL.
+        Mengekstrak hash ID dari input string/URL dengan proteksi anti-double-paste
+        dan dukungan URL web (query param hashId, /novel/, dsb).
         Mengembalikan tuple: (type: 'novel' | 'author' | 'unknown', hash_id)
         """
         raw = raw_input.strip()
 
         # Deteksi URL Author
-        # Contoh: https://quarterfull.io/authors/Yxk8mep482eMyJNj
         author_match = re.search(r"/(?:authors|author-profiles|social/profiles)/([a-zA-Z0-9_-]{10,24})", raw)
         if author_match:
             return "author", author_match.group(1)
 
-        # Deteksi URL Novel
-        # Contoh: https://quarterfull.io/works/Py7LDdwpEQ8e1YKX
-        novel_match = re.search(r"/(?:works|novels|bookstore|read)/([a-zA-Z0-9_-]{10,24})", raw)
+        # Deteksi URL Novel (termasuk /novel/, /works/, query ?hashId=)
+        query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", raw)
+        if query_hash:
+            return "novel", query_hash.group(1)
+
+        novel_match = re.search(r"/(?:works|novel|novels|bookstore|read)/([a-zA-Z0-9_-]{10,24})", raw)
         if novel_match:
             return "novel", novel_match.group(1)
 
-        # Jika langsung berupa Hash ID (biasanya 16 karakter alfanumerik)
+        # Jika langsung berupa Hash ID (tangani jika user tidak sengaja paste 2x)
         clean_id = re.sub(r"[^a-zA-Z0-9_-]", "", raw)
+        if len(clean_id) == 32 and clean_id[:16] == clean_id[16:]:
+            clean_id = clean_id[:16]
+        elif len(clean_id) > 16 and not ("/" in raw):
+            m16 = re.search(r"([a-zA-Z0-9]{16})", clean_id)
+            if m16:
+                clean_id = m16.group(1)
+
         return "unknown", clean_id
 
     @classmethod
