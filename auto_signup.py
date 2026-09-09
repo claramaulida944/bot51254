@@ -50,6 +50,28 @@ from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager
 # Konfigurasi logging
 logger = logging.getLogger("AutoSignup")
 
+def is_proxy_error(exc: Exception) -> bool:
+    """Mendeteksi apakah exception merupakan kegagalan proxy/koneksi jaringan tunnel."""
+    err_str = str(exc).lower()
+    return (
+        isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, ValueError))
+        or "407" in err_str
+        or "proxy" in err_str
+        or "socks" in err_str
+        or "socksio" in err_str
+        or "scheme" in err_str
+        or "tunnel" in err_str
+        or "malformed reply" in err_str
+        or "connection reset" in err_str
+        or "remote end closed" in err_str
+        or "bad gateway" in err_str
+        or "502" in err_str
+        or "503" in err_str
+        or "504" in err_str
+        or "no ips" in err_str
+    )
+
+
 # Tabel pemetaan fonetik Romanisasi Hangul (Revised Romanization of Korean)
 HANGUL_CHOSUNG: List[str] = [
     "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s",
@@ -508,7 +530,7 @@ class RegistrationRunner:
         profile_generator: Optional[HighEntropyProfileGenerator] = None,
         ua_generator: Optional[UserAgentGenerator] = None,
         proxies: Optional[List[str]] = None,
-        timeout: float = 30.0,
+        timeout: float = 6.0,
         max_retries_on_429: int = 3,
         retry_delay_429: float = 12.0,
     ) -> None:
@@ -610,33 +632,42 @@ class RegistrationRunner:
             device_id[:8],
         )
 
-        # Mekanisme retry cerdas jika terkena rate limit (HTTP 429)
+        # Mekanisme retry cerdas: coba proxy kandidat (maks 5 proxy), jika proxy bermasalah langsung prune & coba proxy lain.
+        # Jika semua proxy gagal atau terkena proxy auth/socks/malformed, fallback ke koneksi direct.
+        max_proxy_attempts = 5 if self.proxies else 1
+        proxy_candidates: List[Optional[str]] = []
+        for _ in range(max_proxy_attempts):
+            p = self._get_next_proxy(country_code=profile.country)
+            if p and p not in proxy_candidates:
+                proxy_candidates.append(p)
+        # Tambahkan direct connection (None) sebagai fallback terakhir yang dijamin tembus
+        proxy_candidates.append(None)
+
         last_error = ""
-        for attempt in range(1, self.max_retries_on_429 + 1):
-            proxy = self._get_next_proxy(country_code=profile.country)
+        for p_idx, proxy in enumerate(proxy_candidates, start=1):
             client_kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
                 "http2": False if proxy else True,
-                "timeout": self.timeout,
+                "timeout": httpx.Timeout(5.0 if proxy else 15.0),
             }
             if proxy:
                 client_kwargs["proxy"] = proxy
 
-            with httpx.Client(**client_kwargs) as client:
-                try:
+            try:
+                with httpx.Client(**client_kwargs) as client:
                     response = client.post(self.SIGNUP_ENDPOINT, headers=headers, json=payload)
 
                     if response.status_code == 429:
                         last_error = response.text
-                        if attempt < self.max_retries_on_429:
-                            if self.proxies:
-                                logger.warning("[429] Rate limit terdeteksi, beralih ke proxy berikutnya...")
-                                time.sleep(1.0)
-                            else:
-                                cooldown = self.retry_delay_429 * attempt
-                                logger.warning("[429] Rate limit IP terdeteksi! Menunggu cooldown %.1fs sebelum retry...", cooldown)
-                                time.sleep(cooldown)
-                            continue
+                        logger.warning("[429] Rate limit IP terdeteksi, beralih ke kandidat IP/proxy berikutnya...")
+                        continue
+
+                    # Tangani 400 No IPs in selected country atau 407 Proxy Authentication Required dari proxy
+                    if response.status_code == 407 or (response.status_code == 400 and ("no ips" in response.text.lower() or "proxy" in response.text.lower())):
+                        if proxy:
+                            self.proxy_manager.remove_bad_proxy(proxy)
+                        logger.warning("[Proxy %s] Status %d terdeteksi, eliminasi proxy & rotasi...", proxy, response.status_code)
+                        continue
 
                     response.raise_for_status()
                     data = response.json()
@@ -681,10 +712,11 @@ class RegistrationRunner:
                     self._save_account_to_file(account_record)
 
                     logger.info(
-                        "Registrasi BERHASIL! User ID: %s | Email: %s | Negara: %s",
+                        "Registrasi BERHASIL! User ID: %s | Email: %s | Negara: %s (Koneksi: %s)",
                         user_id,
                         profile.email,
                         profile.country,
+                        proxy or "Direct",
                     )
                     return {
                         "status": "success",
@@ -692,110 +724,35 @@ class RegistrationRunner:
                         "raw_response": data,
                     }
 
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429 and attempt < self.max_retries_on_429:
-                        cooldown = self.retry_delay_429 * attempt
-                        time.sleep(cooldown)
-                        continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    last_error = exc.response.text
+                    continue
+                if is_proxy_error(exc) and proxy:
+                    self.proxy_manager.remove_bad_proxy(proxy)
+                    logger.warning("[Proxy Error %s] Status %s: eliminasi & coba koneksi lain...", proxy, exc.response.status_code)
+                    continue
 
-                    # Jika proxy mengembalikan status 400 No IPs in selected country
-                    if exc.response.status_code == 400 and ("No IPs" in exc.response.text or "selected country" in exc.response.text):
-                        logger.warning(
-                            "[Proxy Warning] IP negara %s tidak tersedia di proxy (400 No IPs). Mencoba lagi menggunakan proxy negara lain...",
-                            profile.country,
-                        )
-                        for alt_cc in ["US", "ID", "GB", "DE", "JP", "FR"]:
-                            if alt_cc.upper() == profile.country.upper():
-                                continue
-                            alt_proxy = self.proxy_manager.get_proxy(country_code=alt_cc)
-                            alt_kwargs = {
-                                "base_url": self.BASE_URL,
-                                "http2": False if alt_proxy else True,
-                                "timeout": self.timeout,
-                            }
-                            if alt_proxy:
-                                alt_kwargs["proxy"] = alt_proxy
+                logger.error("Registrasi GAGAL [HTTP %d]: %s", exc.response.status_code, exc.response.text)
+                return {
+                    "status": "error",
+                    "code": exc.response.status_code,
+                    "error": exc.response.text,
+                    "profile": asdict(profile),
+                }
+            except Exception as exc:
+                if proxy:
+                    self.proxy_manager.remove_bad_proxy(proxy)
+                if is_proxy_error(exc) and p_idx < len(proxy_candidates):
+                    logger.warning("[Proxy Fail %s] %s -> Eliminasi & coba kandidat ke-%d...", proxy, exc, p_idx + 1)
+                    continue
 
-                            try:
-                                with httpx.Client(**alt_kwargs) as alt_client:
-                                    alt_resp = alt_client.post(self.SIGNUP_ENDPOINT, headers=headers, json=payload)
-                                    if alt_resp.status_code == 200:
-                                        data = alt_resp.json()
-                                        access_token = data.get("access_token", "")
-                                        refresh_token = data.get("refresh_token", "")
-                                        user_info = data.get("user", {})
-                                        user_id = user_info.get("id")
-                                        desired_nickname = f"{profile.first_name} {profile.last_name}".strip()
-                                        if access_token and desired_nickname:
-                                            try:
-                                                patch_headers = dict(headers)
-                                                patch_headers["authorization"] = f"Bearer {access_token}"
-                                                patch_headers["content-type"] = "application/json"
-                                                alt_client.patch(
-                                                    "/api/auth/profile",
-                                                    headers=patch_headers,
-                                                    json={"nickname": desired_nickname},
-                                                )
-                                            except Exception:
-                                                pass
-
-                                        account_record = {
-                                            "email": profile.email,
-                                            "password": profile.password,
-                                            "nickname": desired_nickname,
-                                            "access_token": access_token,
-                                            "refresh_token": refresh_token,
-                                            "user_id": user_id,
-                                            "device_id": device_id,
-                                            "user_agent": user_agent,
-                                            "country": profile.country,
-                                            "created_at": datetime.now().isoformat(),
-                                        }
-                                        self._save_account_to_file(account_record)
-                                        logger.info(
-                                            "Registrasi BERHASIL via proxy alternatif %s! User ID: %s | Email: %s",
-                                            alt_cc,
-                                            user_id,
-                                            profile.email,
-                                        )
-                                        return {
-                                            "status": "success",
-                                            "account": account_record,
-                                            "raw_response": data,
-                                        }
-                            except Exception as alt_exc:
-                                logger.debug("Proxy alternatif %s gagal: %s", alt_cc, alt_exc)
-                                continue
-
-                    logger.error(
-                        "Registrasi GAGAL [HTTP %d]: %s",
-                        exc.response.status_code,
-                        exc.response.text,
-                    )
-                    return {
-                        "status": "error",
-                        "code": exc.response.status_code,
-                        "error": exc.response.text,
-                        "profile": asdict(profile),
-                    }
-                except Exception as exc:
-                    err_str = str(exc)
-                    if proxy:
-                        self.proxy_manager.remove_bad_proxy(proxy)
-                    logger.warning(
-                        "[Proxy Error] Proxy bermasalah (%s), eliminasi & beralih ke proxy baru (Percobaan %d/%d)...",
-                        err_str.strip(), attempt, self.max_retries_on_429
-                    )
-                    if attempt < self.max_retries_on_429:
-                        time.sleep(1.0)
-                        continue
-
-                    logger.error("Terjadi exception pada pendaftaran: %s", exc)
-                    return {
-                        "status": "exception",
-                        "error": str(exc),
-                        "profile": asdict(profile),
-                    }
+                logger.error("Terjadi exception pada pendaftaran: %s", exc)
+                return {
+                    "status": "exception",
+                    "error": str(exc),
+                    "profile": asdict(profile),
+                }
 
         return {
             "status": "error",
