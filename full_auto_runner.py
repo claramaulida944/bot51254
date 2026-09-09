@@ -48,7 +48,7 @@ from auto_reader import (
     prompt_chapter_selection,
 )
 from interaction_manager import TargetResolver, default_proxy_manager
-from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES, default_proxy_manager
+from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress)
 logging.basicConfig(level=logging.ERROR)
@@ -57,23 +57,6 @@ logger.setLevel(logging.ERROR)
 for _lib in ("httpx", "httpcore"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 console = Console(highlight=False)
-
-
-def is_proxy_error(exc: Exception) -> bool:
-    """Mendeteksi apakah exception merupakan kegagalan proxy/koneksi jaringan tunnel."""
-    err_str = str(exc).lower()
-    return (
-        isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout))
-        or "407" in err_str
-        or "proxy" in err_str
-        or "tunnel" in err_str
-        or "connection reset" in err_str
-        or "remote end closed" in err_str
-        or "bad gateway" in err_str
-        or "502" in err_str
-        or "503" in err_str
-        or "504" in err_str
-    )
 
 
 class FullAutoWorker:
@@ -90,7 +73,6 @@ class FullAutoWorker:
         author_hash_id: Optional[str],
         chapters: List[Dict[str, Any]],
         proxy: Optional[str] = None,
-        proxy_manager: Optional[ProxyManager] = None,
         base_delay_per_chapter: float = 6.0,
         do_like: bool = True,
         do_bookmark: bool = True,
@@ -118,7 +100,6 @@ class FullAutoWorker:
         self.author_hash_id = author_hash_id
         self.chapters = chapters
         self.proxy = proxy
-        self.proxy_manager = proxy_manager or default_proxy_manager
         self.base_delay = base_delay_per_chapter
         self.do_like = do_like
         self.do_bookmark = do_bookmark
@@ -131,14 +112,6 @@ class FullAutoWorker:
         self.follow_result = "-"
         self.chapters_read = 0
         self.status = "Inisialisasi"
-
-    def rotate_bad_proxy(self) -> Optional[str]:
-        """Menghapus proxy bermasalah dari pool dan mengambil proxy baru."""
-        if self.proxy and self.proxy_manager:
-            logger.info("[%s] Mengeliminasi proxy bermasalah: %s", self.worker_id, self.proxy[:45])
-            self.proxy_manager.remove_bad_proxy(self.proxy)
-            self.proxy = self.proxy_manager.get_proxy(country_code=self.country)
-        return self.proxy
 
     async def get_read_chapter_ids(self, client: httpx.AsyncClient) -> set:
         """
@@ -235,116 +208,78 @@ class FullAutoWorker:
         refresh_token = self.account.get("refresh_token")
         if not refresh_token:
             return False
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(20.0),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
 
-        refresh_headers = {
-            "user-agent": self.user_agent,
-            "x-device-id": self.device_id,
-            "content-type": "application/json",
-            "accept": "application/json",
-        }
-
-        # Coba via proxy terlebih dahulu; jika proxy mati/timeout, fallback ke Direct Connection
-        candidates = [self.proxy, None] if self.proxy else [None]
-        for p in candidates:
-            try:
-                kwargs: Dict[str, Any] = {
-                    "base_url": self.BASE_URL,
-                    "timeout": httpx.Timeout(10.0),
-                    "headers": refresh_headers,
-                    "http2": False if p else True,
-                }
-                if p:
-                    kwargs["proxy"] = p
-
-                async with httpx.AsyncClient(**kwargs) as refresh_client:
-                    resp = await refresh_client.post(
-                        "/api/auth/token/refresh",
-                        json={"refresh_token": refresh_token},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        new_access = data.get("access_token")
-                        new_refresh = data.get("refresh_token")
-                        if new_access:
-                            self.access_token = new_access
-                            self.account["access_token"] = new_access
-                            if new_refresh:
-                                self.account["refresh_token"] = new_refresh
-                            if client is not None and not client.is_closed:
-                                client.headers["authorization"] = f"Bearer {new_access}"
-                            self._save_refreshed_account()
-                            return True
-                    elif resp.status_code == 401:
-                        # Refresh token sudah expired di backend, harus lanjut ke login_with_password
-                        return False
-            except Exception as exc:
-                if p and is_proxy_error(exc):
-                    self.rotate_bad_proxy()
-                continue
-
+            async with httpx.AsyncClient(**kwargs) as refresh_client:
+                resp = await refresh_client.post("/api/auth/token/refresh", json={"refresh_token": refresh_token})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if client is not None and not client.is_closed:
+                            client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal refresh: %s", self.worker_id, exc)
         return False
 
     async def login_with_password(self, client: Optional[httpx.AsyncClient] = None) -> bool:
         password = self.account.get("password")
         if not self.email or not password:
             return False
+        try:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "timeout": httpx.Timeout(20.0),
+                "headers": {
+                    "user-agent": self.user_agent,
+                    "x-device-id": self.device_id,
+                    "x-platform": "android",
+                    "x-app-variant": "prod",
+                    "x-app-version": "3.0.52",
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
 
-        login_headers = {
-            "user-agent": self.user_agent,
-            "x-device-id": self.device_id,
-            "x-platform": "android",
-            "x-app-variant": "prod",
-            "x-app-version": "3.0.52",
-            "content-type": "application/json",
-            "accept": "application/json",
-        }
-
-        # Coba via proxy terlebih dahulu; jika proxy mati/timeout, fallback ke Direct Connection
-        candidates = [self.proxy, None] if self.proxy else [None]
-        for p in candidates:
-            try:
-                kwargs: Dict[str, Any] = {
-                    "base_url": self.BASE_URL,
-                    "timeout": httpx.Timeout(5.0 if p else 15.0),
-                    "headers": login_headers,
-                    "http2": False if p else True,
-                }
-                if p:
-                    kwargs["proxy"] = p
-
-                async with httpx.AsyncClient(**kwargs) as login_client:
-                    resp = await login_client.post(
-                        "/api/auth/login",
-                        json={"login_id": self.email, "password": password},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        new_access = data.get("access_token")
-                        new_refresh = data.get("refresh_token")
-                        if new_access:
-                            self.access_token = new_access
-                            self.account["access_token"] = new_access
-                            if new_refresh:
-                                self.account["refresh_token"] = new_refresh
-                            if client is not None and not client.is_closed:
-                                client.headers["authorization"] = f"Bearer {new_access}"
-                            self._save_refreshed_account()
-                            logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
-                            return True
-                    elif resp.status_code == 401:
-                        # Jika 401 terjadi via proxy, bisa jadi proxy gateway yang menolak.
-                        # Hanya return False jika 401 terjadi saat Direct Connection ke server resmi.
-                        if p is None:
-                            return False
-                        continue
-            except Exception as exc:
-                if p and is_proxy_error(exc):
-                    logger.debug("[%s] Login via proxy gagal (%s), beralih ke jalur cadangan...", self.worker_id, exc)
-                    self.rotate_bad_proxy()
-                continue
-
-        return False
-
+            async with httpx.AsyncClient(**kwargs) as login_client:
+                resp = await login_client.post("/api/auth/login", json={"login_id": self.email, "password": password})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token")
+                    if new_access:
+                        self.access_token = new_access
+                        self.account["access_token"] = new_access
+                        if new_refresh:
+                            self.account["refresh_token"] = new_refresh
+                        if client is not None and not client.is_closed:
+                            client.headers["authorization"] = f"Bearer {new_access}"
+                        self._save_refreshed_account()
+                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                        return True
+        except Exception as exc:
+            logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
     async def ensure_valid_session(self, client: httpx.AsyncClient) -> bool:
         """Memverifikasi validitas token worker via /api/auth/profile; auto refresh atau login ulang jika sesi kedaluwarsa."""
         if self.access_token:
@@ -352,14 +287,8 @@ class FullAutoWorker:
                 profile_resp = await client.get("/api/auth/profile")
                 if profile_resp.status_code == 200:
                     return True
-                if profile_resp.status_code == 401:
-                    relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
-                    return relogged
-            except Exception as exc:
-                if is_proxy_error(exc) and self.proxy:
-                    self.rotate_bad_proxy()
-                relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
-                return relogged
+            except Exception:
+                pass
 
         relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
         return relogged
@@ -524,23 +453,12 @@ class FullAutoWorker:
                                     ch_resp = await clean_client.get(ch_url)
                             ch_resp.raise_for_status()
                         except Exception as get_err:
-                            if is_proxy_error(get_err) and self.proxy:
-                                logger.warning("[%s] Proxy bermasalah (%s), eliminasi & beralih ke proxy lain...", self.worker_id, get_err)
-                                new_p = self.rotate_bad_proxy()
+                            if self.proxy and ("407" in str(get_err) or "proxy" in str(get_err).lower() or isinstance(get_err, (httpx.ProxyError, httpx.ConnectError))):
+                                logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, get_err)
+                                self.proxy = None
                                 if client and not client.is_closed:
-                                    try:
-                                        await client.aclose()
-                                    except Exception:
-                                        pass
-                                new_kwargs = {"headers": self.build_headers(), "timeout": httpx.Timeout(25.0), "base_url": self.BASE_URL, "http2": False if new_p else True}
-                                if new_p:
-                                    new_kwargs["proxy"] = new_p
-                                client = httpx.AsyncClient(**new_kwargs)
-                                try:
-                                    ch_resp = await client.get(ch_url)
-                                    ch_resp.raise_for_status()
-                                except Exception:
-                                    pass
+                                    await client.aclose()
+                                client = httpx.AsyncClient(headers=self.build_headers(), timeout=httpx.Timeout(self.timeout), http2=True, base_url=self.BASE_URL)
                             logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
 
                         # 2.B. Simulasi scrolling membaca bertahap / heartbeat (per ~3 detik & per persen progres)
@@ -735,7 +653,6 @@ class FullAutoOrchestrator:
                     author_hash_id=self.author_hash_id,
                     chapters=self.chapters,
                     proxy=proxy,
-                    proxy_manager=self.proxy_manager,
                     base_delay_per_chapter=self.base_delay,
                     do_like=self.do_like,
                     do_bookmark=self.do_bookmark,
@@ -749,9 +666,6 @@ class FullAutoOrchestrator:
                 slot_queue.put_nowait((slot_idx, tid))
 
     async def run(self) -> List[Dict[str, Any]]:
-        # Selalu pastikan menarik proxy baru sebelum mulai menjalankan fitur
-        self.proxy_manager.ensure_fresh_proxies()
-
         total_accounts = len(self.accounts)
         total_steps = len(self.chapters) if self.chapters else 1
         num_slots = min(self.concurrency, total_accounts)
