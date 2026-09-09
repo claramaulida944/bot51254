@@ -400,12 +400,15 @@ class ProxyManager:
     def remove_bad_proxy(self, bad_proxy_url: Optional[str]) -> None:
         """
         Menghapus proxy yang mati/invalid dari memory pool dan mendaftarkannya ke blacklist.
-        Juga mengeliminasi baris bersangkutan dari daftar aktif.
+        Juga mengeliminasi baris bersangkutan dari daftar aktif (Bright Data tidak dihapus).
         """
         if not bad_proxy_url:
             return
 
         clean_url = bad_proxy_url.strip()
+        if "superproxy.io" in clean_url or "brightdata" in clean_url:
+            return
+
         self.bad_proxies_set.add(clean_url)
 
         # Hapus dari memori parsed_proxies
@@ -484,6 +487,10 @@ class ProxyManager:
             if self.proxy_file.exists()
             else float("inf")
         )
+
+        if self.is_brightdata:
+            logger.debug("Bright Data ISP terdeteksi di proxies.txt, scraper proxy publik dilewati.")
+            return len(self.parsed_proxies)
 
         should_scrape = (
             force
