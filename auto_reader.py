@@ -562,41 +562,53 @@ class MemberReaderSession(BaseReaderSession):
         if not refresh_token:
             return False
 
-        try:
-            kwargs: Dict[str, Any] = {
-                "base_url": self.BASE_URL,
-                "timeout": httpx.Timeout(self.timeout),
-                "headers": {
-                    "user-agent": self.user_agent,
-                    "x-device-id": self.device_id,
-                    "content-type": "application/json",
-                    "accept": "application/json",
-                },
-            }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
+        refresh_headers = {
+            "user-agent": self.user_agent,
+            "x-device-id": self.device_id,
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
 
-            async with httpx.AsyncClient(**kwargs) as refresh_client:
-                resp = await refresh_client.post(
-                    "/api/auth/token/refresh",
-                    json={"refresh_token": refresh_token},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_access = data.get("access_token")
-                    new_refresh = data.get("refresh_token")
-                    if new_access:
-                        self.access_token = new_access
-                        self.account["access_token"] = new_access
-                        if new_refresh:
-                            self.account["refresh_token"] = new_refresh
-                        if self._client and not self._client.is_closed:
-                            self._client.headers["authorization"] = f"Bearer {new_access}"
-                        self._save_refreshed_account()
-                        logger.info("[%s] Token member berhasil diperbarui otomatis!", self.worker_id)
-                        return True
-        except Exception as exc:
-            logger.debug("[%s] Gagal refresh token: %s", self.worker_id, exc)
+        # Coba via proxy terlebih dahulu; jika proxy mati/timeout, fallback ke Direct Connection
+        candidates = [self.proxy, None] if self.proxy else [None]
+        for p in candidates:
+            try:
+                kwargs: Dict[str, Any] = {
+                    "base_url": self.BASE_URL,
+                    "timeout": httpx.Timeout(10.0),
+                    "headers": refresh_headers,
+                    "http2": False if p else True,
+                }
+                if p:
+                    kwargs["proxy"] = p
+
+                async with httpx.AsyncClient(**kwargs) as refresh_client:
+                    resp = await refresh_client.post(
+                        "/api/auth/token/refresh",
+                        json={"refresh_token": refresh_token},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        new_access = data.get("access_token")
+                        new_refresh = data.get("refresh_token")
+                        if new_access:
+                            self.access_token = new_access
+                            self.account["access_token"] = new_access
+                            if new_refresh:
+                                self.account["refresh_token"] = new_refresh
+                            if self._client and not self._client.is_closed:
+                                self._client.headers["authorization"] = f"Bearer {new_access}"
+                            self._save_refreshed_account()
+                            logger.info("[%s] Token member berhasil diperbarui otomatis!", self.worker_id)
+                            return True
+                    elif resp.status_code == 401:
+                        # Refresh token expired, harus login ulang penuh
+                        return False
+            except Exception as exc:
+                if p and is_proxy_error(exc):
+                    await self.rotate_bad_proxy()
+                continue
+
         return False
 
     async def login_with_password(self) -> bool:
@@ -605,44 +617,57 @@ class MemberReaderSession(BaseReaderSession):
         if not self.email or not password:
             return False
 
-        try:
-            kwargs: Dict[str, Any] = {
-                "base_url": self.BASE_URL,
-                "timeout": httpx.Timeout(self.timeout),
-                "headers": {
-                    "user-agent": self.user_agent,
-                    "x-device-id": self.device_id,
-                    "x-platform": "android",
-                    "x-app-variant": "prod",
-                    "x-app-version": "3.0.52",
-                    "content-type": "application/json",
-                    "accept": "application/json",
-                },
-            }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
+        login_headers = {
+            "user-agent": self.user_agent,
+            "x-device-id": self.device_id,
+            "x-platform": "android",
+            "x-app-variant": "prod",
+            "x-app-version": "3.0.52",
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
 
-            async with httpx.AsyncClient(**kwargs) as login_client:
-                resp = await login_client.post(
-                    "/api/auth/login",
-                    json={"login_id": self.email, "password": password},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_access = data.get("access_token")
-                    new_refresh = data.get("refresh_token")
-                    if new_access:
-                        self.access_token = new_access
-                        self.account["access_token"] = new_access
-                        if new_refresh:
-                            self.account["refresh_token"] = new_refresh
-                        if self._client and not self._client.is_closed:
-                            self._client.headers["authorization"] = f"Bearer {new_access}"
-                        self._save_refreshed_account()
-                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
-                        return True
-        except Exception as exc:
-            logger.debug("[%s] Gagal login ulang dengan password: %s", self.worker_id, exc)
+        # Coba via proxy terlebih dahulu; jika proxy mati/timeout, fallback ke Direct Connection
+        candidates = [self.proxy, None] if self.proxy else [None]
+        for p in candidates:
+            try:
+                kwargs: Dict[str, Any] = {
+                    "base_url": self.BASE_URL,
+                    "timeout": httpx.Timeout(12.0),
+                    "headers": login_headers,
+                    "http2": False if p else True,
+                }
+                if p:
+                    kwargs["proxy"] = p
+
+                async with httpx.AsyncClient(**kwargs) as login_client:
+                    resp = await login_client.post(
+                        "/api/auth/login",
+                        json={"login_id": self.email, "password": password},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        new_access = data.get("access_token")
+                        new_refresh = data.get("refresh_token")
+                        if new_access:
+                            self.access_token = new_access
+                            self.account["access_token"] = new_access
+                            if new_refresh:
+                                self.account["refresh_token"] = new_refresh
+                            if self._client and not self._client.is_closed:
+                                self._client.headers["authorization"] = f"Bearer {new_access}"
+                            self._save_refreshed_account()
+                            logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                            return True
+                    elif resp.status_code == 401:
+                        # Password salah pada server
+                        return False
+            except Exception as exc:
+                if p and is_proxy_error(exc):
+                    logger.debug("[%s] Login via proxy gagal (%s), beralih ke jalur cadangan...", self.worker_id, exc)
+                    await self.rotate_bad_proxy()
+                continue
+
         return False
 
     async def ensure_valid_session(self) -> bool:
@@ -661,8 +686,12 @@ class MemberReaderSession(BaseReaderSession):
                 if await self.refresh_access_token():
                     return True
                 return await self.login_with_password()
-        except Exception:
-            pass
+        except Exception as exc:
+            if is_proxy_error(exc) and self.proxy:
+                await self.rotate_bad_proxy()
+            if await self.refresh_access_token():
+                return True
+            return await self.login_with_password()
         return True
 
     async def get_read_chapter_ids(self, novel_id: str) -> set:
