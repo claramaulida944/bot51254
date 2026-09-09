@@ -280,7 +280,18 @@ class FullAutoWorker:
                         return True
         except Exception as exc:
             logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
-        return False
+    async def ensure_valid_session(self, client: httpx.AsyncClient) -> bool:
+        """Memverifikasi validitas token worker via /api/auth/profile; auto refresh atau login ulang jika sesi kedaluwarsa."""
+        if self.access_token:
+            try:
+                profile_resp = await client.get("/api/auth/profile")
+                if profile_resp.status_code == 200:
+                    return True
+            except Exception:
+                pass
+
+        relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
+        return relogged
 
     async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
         short_email = self.email.split("@")[0][:12]
@@ -303,29 +314,24 @@ class FullAutoWorker:
                 progress.update(
                     task_id,
                     role=f"[cyan]{self.worker_id}[/]",
-                    description="[dim]Cek profil & status...[/]",
+                    description="[dim]Cek profil & validasi sesi...[/]",
                 )
+
+                session_valid = await self.ensure_valid_session(client)
+                if not session_valid:
+                    self.status = "Token Expired (401)"
+                    progress.update(task_id, description="[bold red]Sesi Expired (Skip)[/]")
+                    return self._build_summary()
 
                 novel_status_data: Optional[Dict[str, Any]] = None
                 try:
                     resp = await client.get(f"/api/v1/novels/{self.novel_id}")
                     if resp.status_code == 200:
                         novel_status_data = resp.json()
-                    elif resp.status_code == 401:
-                        # Otomatis refresh atau login ulang
-                        relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
-                        if relogged:
-                            retry_resp = await client.get(f"/api/v1/novels/{self.novel_id}")
-                            if retry_resp.status_code == 200:
-                                novel_status_data = retry_resp.json()
-                        if not novel_status_data:
-                            self.status = "Token Expired (401)"
-                            progress.update(task_id, description="[bold red]Sesi Expired (Skip)[/]")
-                            return self._build_summary()
                 except Exception as exc:
                     logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
 
-                # 1.A. Auto Like (dengan deteksi & skip)
+                # 1.A. Auto Like (dengan deteksi, skip, & toggle proteksi)
                 if self.do_like:
                     is_liked = novel_status_data.get("is_liked", False) if novel_status_data else False
                     if is_liked:
@@ -333,14 +339,22 @@ class FullAutoWorker:
                     else:
                         try:
                             like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like")
+                            if like_resp.status_code == 401:
+                                if await self.login_with_password(client):
+                                    like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like")
+
                             if like_resp.status_code == 200:
+                                res_data = like_resp.json()
+                                if not res_data.get("is_liked", True):
+                                    await asyncio.sleep(0.4)
+                                    await client.post(f"/api/v1/novels/{self.novel_id}/like")
                                 self.like_result = "[green]OK (Baru)[/]"
                             else:
                                 self.like_result = f"[red]Gagal ({like_resp.status_code})[/]"
                         except Exception:
                             self.like_result = "[red]Error[/]"
 
-                # 1.B. Auto Bookmark / Simpan (dengan deteksi & skip)
+                # 1.B. Auto Bookmark / Simpan (dengan deteksi, skip, & toggle proteksi)
                 if self.do_bookmark:
                     is_saved = novel_status_data.get("is_saved", False) if novel_status_data else False
                     if is_saved:
@@ -348,7 +362,15 @@ class FullAutoWorker:
                     else:
                         try:
                             bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
+                            if bm_resp.status_code == 401:
+                                if await self.login_with_password(client):
+                                    bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
+
                             if bm_resp.status_code == 200:
+                                res_data = bm_resp.json()
+                                if not res_data.get("is_saved", True):
+                                    await asyncio.sleep(0.4)
+                                    await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
                                 self.bookmark_result = "[green]OK (Baru)[/]"
                             else:
                                 self.bookmark_result = f"[red]Gagal ({bm_resp.status_code})[/]"
@@ -359,16 +381,26 @@ class FullAutoWorker:
                 if self.do_follow and self.author_hash_id:
                     try:
                         rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship")
+                        if rel_resp.status_code == 401:
+                            if await self.login_with_password(client):
+                                rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship")
+
                         if rel_resp.status_code == 200:
                             is_following = rel_resp.json().get("is_following", False)
                             if is_following:
                                 self.follow_result = "[yellow]SKIP (Sudah)[/]"
                             else:
                                 f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow")
+                                if f_resp.status_code == 401:
+                                    if await self.login_with_password(client):
+                                        f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow")
+
                                 if f_resp.status_code == 200:
                                     self.follow_result = "[green]OK (Baru)[/]"
                                 else:
                                     self.follow_result = f"[red]Gagal ({f_resp.status_code})[/]"
+                        else:
+                            self.follow_result = f"[red]Gagal ({rel_resp.status_code})[/]"
                     except Exception:
                         self.follow_result = "[red]Error[/]"
 

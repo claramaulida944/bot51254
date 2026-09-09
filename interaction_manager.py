@@ -378,12 +378,144 @@ class SocialInteractionBot:
             logger.debug(f"Gagal memeriksa status follow akun: {exc}")
         return None
 
+    def _save_refreshed_account(self, account: Dict[str, Any], filepath: str = "akun.txt") -> None:
+        """Menyimpan pembaruan access_token & refresh_token ke berkas akun.txt."""
+        try:
+            p = Path(filepath)
+            if not p.exists():
+                return
+            lines = []
+            updated = False
+            email = account.get("email")
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        data = json.loads(line_str)
+                        if data.get("email") == email:
+                            data["access_token"] = account.get("access_token", "")
+                            if account.get("refresh_token"):
+                                data["refresh_token"] = account.get("refresh_token")
+                            lines.append(json.dumps(data, ensure_ascii=False))
+                            updated = True
+                            continue
+                    except Exception:
+                        pass
+                    lines.append(line_str)
+            if updated:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            logger.debug(f"Gagal menyimpan token ke {filepath}: {exc}")
+
+    def refresh_access_token(self, account: Dict[str, Any]) -> bool:
+        """Memperbarui access_token akun menggunakan refresh_token."""
+        refresh_token = account.get("refresh_token")
+        if not refresh_token:
+            return False
+        country = account.get("country", "ID")
+        headers = {
+            "host": "api.quarterfull.io",
+            "user-agent": account.get("user_agent", "okhttp/4.12.0"),
+            "x-device-id": account.get("device_id", "d24063e7-a5ff-4831-92b2-4e28c0123498"),
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
+        try:
+            resp = self._send_request(
+                "POST",
+                f"{self.BASE_URL}/api/auth/token/refresh",
+                headers=headers,
+                json_body={"refresh_token": refresh_token},
+                account_country=country,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_access = data.get("access_token")
+                new_refresh = data.get("refresh_token")
+                if new_access:
+                    account["access_token"] = new_access
+                    if new_refresh:
+                        account["refresh_token"] = new_refresh
+                    self._save_refreshed_account(account)
+                    return True
+        except Exception as exc:
+            logger.debug(f"Gagal refresh token {account.get('email')}: {exc}")
+        return False
+
+    def login_with_password(self, account: Dict[str, Any]) -> bool:
+        """Melakukan login ulang akun menggunakan login_id (email) dan password."""
+        email = account.get("email")
+        password = account.get("password")
+        if not email or not password:
+            return False
+        country = account.get("country", "ID")
+        headers = {
+            "host": "api.quarterfull.io",
+            "user-agent": account.get("user_agent", "okhttp/4.12.0"),
+            "x-device-id": account.get("device_id", "d24063e7-a5ff-4831-92b2-4e28c0123498"),
+            "x-platform": "android",
+            "x-app-variant": "prod",
+            "x-app-version": "3.0.52",
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
+        try:
+            resp = self._send_request(
+                "POST",
+                f"{self.BASE_URL}/api/auth/login",
+                headers=headers,
+                json_body={"login_id": email, "password": password},
+                account_country=country,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_access = data.get("access_token")
+                new_refresh = data.get("refresh_token")
+                if new_access:
+                    account["access_token"] = new_access
+                    if new_refresh:
+                        account["refresh_token"] = new_refresh
+                    self._save_refreshed_account(account)
+                    logger.info("Akun %s berhasil login ulang!", email)
+                    return True
+        except Exception as exc:
+            logger.debug(f"Gagal login ulang {email}: {exc}")
+        return False
+
+    def ensure_valid_session(self, account: Dict[str, Any]) -> bool:
+        """Memverifikasi validitas token akun via GET /api/auth/profile, auto refresh/relogin jika kedaluwarsa."""
+        token = account.get("access_token")
+        if token:
+            headers = self._build_headers(account)
+            country = account.get("country", "ID")
+            try:
+                resp = self._send_request(
+                    "GET",
+                    f"{self.BASE_URL}/api/auth/profile",
+                    headers=headers,
+                    account_country=country,
+                )
+                if resp.status_code == 200:
+                    return True
+            except Exception:
+                pass
+
+        if self.refresh_access_token(account):
+            return True
+        return self.login_with_password(account)
+
     def like_novel_single(self, novel_id: str, account: Dict[str, Any], check_first: bool = True) -> Dict[str, Any]:
         """
         Menyukai novel via satu akun.
         Jika check_first=True, memeriksa terlebih dahulu:
         - Jika akun sudah Like (is_liked=True), langsung SKIP tanpa melakukan toggle ulang.
         """
+        if not self.ensure_valid_session(account):
+            return {"status": "error", "message": "Sesi akun kedaluwarsa & gagal login", "code": 401}
+
         headers = self._build_headers(account)
         country = account.get("country", "ID")
 
@@ -400,10 +532,17 @@ class SocialInteractionBot:
         url = f"{self.BASE_URL}/api/v1/novels/{novel_id}/like"
         try:
             resp = self._send_request("POST", url, headers=headers, account_country=country)
+            if resp.status_code == 401:
+                # Coba login ulang jika token baru saja expired
+                if self.login_with_password(account):
+                    headers = self._build_headers(account)
+                    resp = self._send_request("POST", url, headers=headers, account_country=country)
+
             if resp.status_code == 200:
                 data = resp.json()
                 is_liked = data.get("is_liked", True)
                 if not is_liked:
+                    # Menghindari un-like (toggle kembali agar menjadi True)
                     time.sleep(0.4)
                     resp2 = self._send_request("POST", url, headers=headers, account_country=country)
                     if resp2.status_code == 200:
@@ -425,6 +564,9 @@ class SocialInteractionBot:
         Jika check_first=True, memeriksa terlebih dahulu:
         - Jika akun sudah menyimpan (is_saved=True), langsung SKIP tanpa melakukan toggle ulang.
         """
+        if not self.ensure_valid_session(account):
+            return {"status": "error", "message": "Sesi akun kedaluwarsa & gagal login", "code": 401}
+
         headers = self._build_headers(account)
         country = account.get("country", "ID")
 
@@ -441,10 +583,16 @@ class SocialInteractionBot:
         url = f"{self.BASE_URL}/api/v1/novels/{novel_id}/bookmark"
         try:
             resp = self._send_request("POST", url, headers=headers, account_country=country)
+            if resp.status_code == 401:
+                if self.login_with_password(account):
+                    headers = self._build_headers(account)
+                    resp = self._send_request("POST", url, headers=headers, account_country=country)
+
             if resp.status_code == 200:
                 data = resp.json()
                 is_saved = data.get("is_saved", True)
                 if not is_saved:
+                    # Menghindari un-bookmark
                     time.sleep(0.4)
                     resp2 = self._send_request("POST", url, headers=headers, account_country=country)
                     if resp2.status_code == 200:
@@ -466,6 +614,9 @@ class SocialInteractionBot:
         Jika check_first=True, memeriksa terlebih dahulu:
         - Jika akun sudah follow (is_following=True), langsung SKIP tanpa melakukan toggle ulang.
         """
+        if not self.ensure_valid_session(account):
+            return {"status": "error", "message": "Sesi akun kedaluwarsa & gagal login", "code": 401}
+
         headers = self._build_headers(account)
         country = account.get("country", "ID")
 
@@ -483,6 +634,11 @@ class SocialInteractionBot:
         url = f"{self.BASE_URL}/api/v1/social/profiles/{author_id}/follow"
         try:
             resp = self._send_request("PUT", url, headers=headers, account_country=country)
+            if resp.status_code == 401:
+                if self.login_with_password(account):
+                    headers = self._build_headers(account)
+                    resp = self._send_request("PUT", url, headers=headers, account_country=country)
+
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -765,8 +921,9 @@ def run_auto_followers_cli(preset_author_id: Optional[str] = None) -> None:
             if author_data and author_data.get("author"):
                 author_name = author_data["author"].get("pen_name", "Penulis")
 
-        # Cek follower count awal
-        rel_info = TargetResolver.get_social_relationship(author_id, accounts[0]["access_token"])
+        # Cek follower count awal dengan memastikan sesi akun valid
+        bot.ensure_valid_session(accounts[0])
+        rel_info = TargetResolver.get_social_relationship(author_id, accounts[0].get("access_token", ""))
         initial_followers = rel_info.get("followers_count", "N/A") if rel_info else "N/A"
 
     console.print(f"[bold green]Profil Penulis:[/] [bold yellow]{author_name}[/] (Author ID: [cyan]{author_id}[/])")
