@@ -282,75 +282,43 @@ class SocialInteractionBot:
         json_body: Optional[Dict[str, Any]] = None,
         account_country: str = "ID",
         timeout: float = 12.0,
+        max_retries: int = 4,
     ) -> httpx.Response:
-        """Mengirim HTTP request melalui proxy yang sesuai dengan auto-fallback ke proxy negara lain jika bermasalah."""
-        proxy = self._get_proxy(account_country)
+        """Mengirim HTTP request melalui proxy dengan auto-retry dan eliminasi otomatis proxy mati/invalid."""
         last_exc: Optional[Exception] = None
 
-        try:
-            with httpx.Client(http2=False if proxy else True, proxy=proxy, timeout=timeout) as client:
-                if method.upper() == "POST":
-                    resp = client.post(url, headers=headers, json=json_body)
-                elif method.upper() == "PUT":
-                    resp = client.put(url, headers=headers, json=json_body)
-                elif method.upper() == "PATCH":
-                    resp = client.patch(url, headers=headers, json=json_body)
-                else:
-                    resp = client.get(url, headers=headers)
+        for attempt in range(max_retries):
+            proxy = self._get_proxy(account_country)
+            try:
+                with httpx.Client(http2=False if proxy else True, proxy=proxy, timeout=timeout) as client:
+                    if method.upper() == "POST":
+                        resp = client.post(url, headers=headers, json=json_body)
+                    elif method.upper() == "PUT":
+                        resp = client.put(url, headers=headers, json=json_body)
+                    elif method.upper() == "PATCH":
+                        resp = client.patch(url, headers=headers, json=json_body)
+                    else:
+                        resp = client.get(url, headers=headers)
 
-                # Jika proxy mengembalikan respons HTTP 400 No IPs
-                if resp.status_code == 400 and ("no ips" in resp.text.lower() or "selected country" in resp.text.lower()):
-                    logger.warning("[Proxy 400] IP negara %s tidak tersedia di proxy. Mencoba proxy negara lain...", account_country)
-                    for alt_cc in ["US", "ID", "GB", "DE", "JP", "FR"]:
-                        if alt_cc.upper() == account_country.upper():
-                            continue
-                        alt_proxy = self._get_proxy(alt_cc)
-                        try:
-                            with httpx.Client(http2=False, proxy=alt_proxy, timeout=timeout) as alt_client:
-                                if method.upper() == "POST":
-                                    alt_resp = alt_client.post(url, headers=headers, json=json_body)
-                                elif method.upper() == "PUT":
-                                    alt_resp = alt_client.put(url, headers=headers, json=json_body)
-                                elif method.upper() == "PATCH":
-                                    alt_resp = alt_client.patch(url, headers=headers, json=json_body)
-                                else:
-                                    alt_resp = alt_client.get(url, headers=headers)
-                                if alt_resp.status_code != 400 or "no ips" not in alt_resp.text.lower():
-                                    return alt_resp
-                        except Exception:
-                            continue
-                return resp
-        except Exception as exc:
-            last_exc = exc
-            err_msg = str(exc)
-            # Jika terjadi ProxyError 400 No IPs atau kegagalan proxy lainnya, rotasi ke negara lain
-            if "no ips" in err_msg.lower() or "400" in err_msg or "proxy" in err_msg.lower():
-                logger.warning(
-                    "[Proxy Warning] Koneksi proxy negara %s gagal (%s). Mencoba ulang dengan proxy negara lain...",
-                    account_country,
-                    err_msg.strip(),
+                    # Jika proxy mengembalikan error upstream/proxy
+                    if resp.status_code in (407, 502, 503, 504) or (resp.status_code == 400 and "no ips" in resp.text.lower()):
+                        if proxy:
+                            self.proxy_manager.remove_bad_proxy(proxy)
+                        continue
+                    return resp
+            except Exception as exc:
+                last_exc = exc
+                if proxy:
+                    self.proxy_manager.remove_bad_proxy(proxy)
+                logger.debug(
+                    "Request %s ke %s gagal via proxy (%s), eliminasi & coba ulang (coba %d/%d)",
+                    method, url, exc, attempt + 1, max_retries
                 )
-                for alt_cc in ["US", "ID", "GB", "DE", "JP", "FR"]:
-                    if alt_cc.upper() == account_country.upper():
-                        continue
-                    alt_proxy = self._get_proxy(alt_cc)
-                    try:
-                        with httpx.Client(http2=False, proxy=alt_proxy, timeout=timeout) as alt_client:
-                            if method.upper() == "POST":
-                                return alt_client.post(url, headers=headers, json=json_body)
-                            elif method.upper() == "PUT":
-                                return alt_client.put(url, headers=headers, json=json_body)
-                            elif method.upper() == "PATCH":
-                                return alt_client.patch(url, headers=headers, json=json_body)
-                            else:
-                                return alt_client.get(url, headers=headers)
-                    except Exception as alt_err:
-                        last_exc = alt_err
-                        continue
+                continue
 
-            if last_exc:
-                raise last_exc
-            raise exc
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Gagal mengirim request {method} {url}")
 
     def get_account_novel_status(self, novel_id: str, account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Mengambil metadata status interaksi novel (is_liked, is_saved) spesifik untuk akun ini."""
@@ -694,6 +662,9 @@ class SocialInteractionBot:
         Menjalankan aksi interaksi massal dengan antarmuka terminal yang rapi.
         action_type: 'like' | 'bookmark' | 'follow'
         """
+        # Pastikan proxy segar selalu tersedia sebelum aksi massal
+        self.proxy_manager.ensure_fresh_proxies()
+
         selected_accounts = self.accounts[:count]
         total = len(selected_accounts)
         success_count = 0

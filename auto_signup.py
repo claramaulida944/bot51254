@@ -551,6 +551,9 @@ class RegistrationRunner:
         :param country_code: Kode negara (contoh: 'ID', 'US', 'JP', dsb) atau 'RANDOM'.
         :return: Kamus data hasil registrasi akun.
         """
+        # Pastikan proxy segar selalu tersedia sebelum registrasi akun
+        self.proxy_manager.ensure_fresh_proxies()
+
         profile: AccountProfile = self.profile_gen.generate_profile(country_code=country_code)
         user_agent: str = self.ua_gen.get_random_ua(mode=ua_mode)
         device_id: str = custom_device_id or IdentifierGenerator.generate_device_id()
@@ -776,75 +779,15 @@ class RegistrationRunner:
                     }
                 except Exception as exc:
                     err_str = str(exc)
-                    # Jika terjadi error 400 No IPs in selected country, coba lagi menggunakan proxy negara lain
-                    if "No IPs" in err_str or "400" in err_str or "proxy" in err_str.lower():
-                        logger.warning(
-                            "[Proxy Warning] IP negara %s tidak tersedia di proxy (%s). Mencoba lagi menggunakan proxy negara lain...",
-                            profile.country,
-                            err_str.strip(),
-                        )
-                        for alt_cc in ["US", "ID", "GB", "DE", "JP", "FR"]:
-                            if alt_cc.upper() == profile.country.upper():
-                                continue
-                            alt_proxy = self.proxy_manager.get_proxy(country_code=alt_cc)
-                            alt_kwargs = {
-                                "base_url": self.BASE_URL,
-                                "http2": False if alt_proxy else True,
-                                "timeout": self.timeout,
-                            }
-                            if alt_proxy:
-                                alt_kwargs["proxy"] = alt_proxy
-
-                            try:
-                                with httpx.Client(**alt_kwargs) as alt_client:
-                                    alt_resp = alt_client.post(self.SIGNUP_ENDPOINT, headers=headers, json=payload)
-                                    if alt_resp.status_code == 200:
-                                        data = alt_resp.json()
-                                        access_token = data.get("access_token", "")
-                                        refresh_token = data.get("refresh_token", "")
-                                        user_info = data.get("user", {})
-                                        user_id = user_info.get("id")
-                                        desired_nickname = f"{profile.first_name} {profile.last_name}".strip()
-                                        if access_token and desired_nickname:
-                                            try:
-                                                patch_headers = dict(headers)
-                                                patch_headers["authorization"] = f"Bearer {access_token}"
-                                                patch_headers["content-type"] = "application/json"
-                                                alt_client.patch(
-                                                    "/api/auth/profile",
-                                                    headers=patch_headers,
-                                                    json={"nickname": desired_nickname},
-                                                )
-                                            except Exception:
-                                                pass
-
-                                        account_record = {
-                                            "email": profile.email,
-                                            "password": profile.password,
-                                            "nickname": desired_nickname,
-                                            "access_token": access_token,
-                                            "refresh_token": refresh_token,
-                                            "user_id": user_id,
-                                            "device_id": device_id,
-                                            "user_agent": user_agent,
-                                            "country": profile.country,
-                                            "created_at": datetime.now().isoformat(),
-                                        }
-                                        self._save_account_to_file(account_record)
-                                        logger.info(
-                                            "Registrasi BERHASIL via proxy alternatif %s! User ID: %s | Email: %s",
-                                            alt_cc,
-                                            user_id,
-                                            profile.email,
-                                        )
-                                        return {
-                                            "status": "success",
-                                            "account": account_record,
-                                            "raw_response": data,
-                                        }
-                            except Exception as alt_exc:
-                                logger.debug("Proxy alternatif %s gagal: %s", alt_cc, alt_exc)
-                                continue
+                    if proxy:
+                        self.proxy_manager.remove_bad_proxy(proxy)
+                    logger.warning(
+                        "[Proxy Error] Proxy bermasalah (%s), eliminasi & beralih ke proxy baru (Percobaan %d/%d)...",
+                        err_str.strip(), attempt, self.max_retries_on_429
+                    )
+                    if attempt < self.max_retries_on_429:
+                        time.sleep(1.0)
+                        continue
 
                     logger.error("Terjadi exception pada pendaftaran: %s", exc)
                     return {

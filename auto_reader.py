@@ -200,6 +200,26 @@ class NovelTargetResolver:
             raise
 
 
+def is_proxy_error(exc: Exception) -> bool:
+    """Mendeteksi apakah exception merupakan kegagalan proxy/koneksi jaringan tunnel."""
+    err_str = str(exc).lower()
+    return (
+        isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, ValueError))
+        or "407" in err_str
+        or "proxy" in err_str
+        or "socks" in err_str
+        or "socksio" in err_str
+        or "scheme" in err_str
+        or "tunnel" in err_str
+        or "connection reset" in err_str
+        or "remote end closed" in err_str
+        or "bad gateway" in err_str
+        or "502" in err_str
+        or "503" in err_str
+        or "504" in err_str
+    )
+
+
 class BaseReaderSession:
     """Basis client HTTP/2 untuk sesi pembaca (Member maupun Guest)."""
 
@@ -213,6 +233,7 @@ class BaseReaderSession:
         country: str = "ID",
         timezone_str: Optional[str] = None,
         proxy: Optional[str] = None,
+        proxy_manager: Optional[ProxyManager] = None,
         timeout: float = 30.0,
     ) -> None:
         self.worker_id: str = worker_id
@@ -229,8 +250,23 @@ class BaseReaderSession:
         self.timezone: str = timezone_str or cfg["timezone"]
         self.lang: str = cfg["lang"]
         self.proxy: Optional[str] = proxy
+        self.proxy_manager: ProxyManager = proxy_manager or default_proxy_manager
         self.timeout: float = timeout
         self._client: Optional[httpx.AsyncClient] = None
+
+    async def rotate_bad_proxy(self) -> Optional[str]:
+        """Menghapus proxy bermasalah dari daftar aktif dan beralih ke proxy pengganti."""
+        if self.proxy and self.proxy_manager:
+            logger.info("[%s] Mengeliminasi proxy bermasalah: %s", self.worker_id, self.proxy[:45])
+            self.proxy_manager.remove_bad_proxy(self.proxy)
+            self.proxy = self.proxy_manager.get_proxy(country_code=self.country)
+        if self._client and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+        self._client = None
+        return self.proxy
 
     def _get_current_local_date(self) -> str:
         """Mengembalikan format YYYY-MM-DD sesuai zona waktu yang dikonfigurasi."""
@@ -263,17 +299,43 @@ class BaseReaderSession:
 
     async def get_client(self) -> httpx.AsyncClient:
         """Menginisialisasi httpx.AsyncClient dengan dukungan HTTP/2 (atau HTTP/1.1 jika via proxy)."""
-        if self._client is None or self._client.is_closed:
-            kwargs: Dict[str, Any] = {
-                "base_url": self.BASE_URL,
-                "http2": False if self.proxy else True,
-                "headers": self.build_base_headers(),
-                "timeout": httpx.Timeout(self.timeout),
-            }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
+        for _ in range(5):
+            if self._client is None or self._client.is_closed:
+                # Sanitasi proxy: jika socks4 atau format rusak, eliminasi dan rotasi
+                if self.proxy and (self.proxy.startswith("socks4://") or "://" not in self.proxy):
+                    await self.rotate_bad_proxy()
+                    continue
 
-            self._client = httpx.AsyncClient(**kwargs)
+                kwargs: Dict[str, Any] = {
+                    "base_url": self.BASE_URL,
+                    "http2": False if self.proxy else True,
+                    "headers": self.build_base_headers(),
+                    "timeout": httpx.Timeout(self.timeout),
+                }
+                if self.proxy:
+                    kwargs["proxy"] = self.proxy
+
+                try:
+                    self._client = httpx.AsyncClient(**kwargs)
+                    return self._client
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Gagal membuat HTTP client dengan proxy %s (%s). Mengeliminasi & rotasi...",
+                        self.worker_id, self.proxy, exc
+                    )
+                    await self.rotate_bad_proxy()
+                    continue
+            else:
+                return self._client
+
+        # Fallback aman jika 5 proxy berturut-turut gagal inisialisasi
+        direct_kwargs: Dict[str, Any] = {
+            "base_url": self.BASE_URL,
+            "http2": True,
+            "headers": self.build_base_headers(),
+            "timeout": httpx.Timeout(self.timeout),
+        }
+        self._client = httpx.AsyncClient(**direct_kwargs)
         return self._client
 
     def detach_client(self) -> Optional[httpx.AsyncClient]:
@@ -297,6 +359,7 @@ class GuestReaderSession(BaseReaderSession):
         worker_id: str,
         country: str = "ID",
         proxy: Optional[str] = None,
+        proxy_manager: Optional[ProxyManager] = None,
         timeout: float = 30.0,
     ) -> None:
         super().__init__(
@@ -305,15 +368,16 @@ class GuestReaderSession(BaseReaderSession):
             user_agent=UserAgentGenerator.get_random_okhttp_ua(),
             country=country,
             proxy=proxy,
+            proxy_manager=proxy_manager,
             timeout=timeout,
         )
         self.guest_id: Optional[str] = None
         self.guest_token: Optional[str] = None
 
-    async def init_guest_session(self) -> bool:
-        """Memanggil POST /api/guest-reading/session untuk memperoleh guest_token."""
-        client = await self.get_client()
-        for attempt in range(2):
+    async def init_guest_session(self, max_retries: int = 3) -> bool:
+        """Memanggil POST /api/guest-reading/session dengan auto-retry proxy jika proxy gagal."""
+        for attempt in range(max_retries):
+            client = await self.get_client()
             try:
                 resp = await client.post("/api/guest-reading/session", content=b"")
                 resp.raise_for_status()
@@ -326,17 +390,16 @@ class GuestReaderSession(BaseReaderSession):
                     client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
                     return True
             except Exception as exc:
-                if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                    logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, exc)
-                    self.proxy = None
-                    if self._client and not self._client.is_closed:
-                        await self._client.aclose()
-                    self._client = None
-                    client = await self.get_client()
+                if is_proxy_error(exc) and self.proxy:
+                    logger.warning(
+                        "[%s] Proxy gagal saat inisialisasi sesi (%s), eliminasi & ganti proxy (coba %d/%d)...",
+                        self.worker_id, exc, attempt + 1, max_retries
+                    )
+                    await self.rotate_bad_proxy()
                     continue
-                if attempt == 1:
+                if attempt == max_retries - 1:
                     logger.error("[%s] Gagal inisialisasi guest session: %s", self.worker_id, exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
         return False
 
     async def read_chapter(
@@ -375,12 +438,9 @@ class GuestReaderSession(BaseReaderSession):
             content = ch_data.get("content", "")
             char_count = len(content)
         except Exception as exc:
-            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
-                self.proxy = None
-                if self._client and not self._client.is_closed:
-                    await self._client.aclose()
-                self._client = None
+            if is_proxy_error(exc) and self.proxy:
+                logger.warning("[%s] Proxy error (%s), mengeliminasi dan mencoba proxy baru...", self.worker_id, exc)
+                await self.rotate_bad_proxy()
                 return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
@@ -441,6 +501,7 @@ class MemberReaderSession(BaseReaderSession):
         account_data: Dict[str, Any],
         novel_title: str = "Novel",
         proxy: Optional[str] = None,
+        proxy_manager: Optional[ProxyManager] = None,
         timeout: float = 30.0,
     ) -> None:
         super().__init__(
@@ -450,6 +511,7 @@ class MemberReaderSession(BaseReaderSession):
             country=account_data.get("country", "ID"),
             timezone_str=None,
             proxy=proxy,
+            proxy_manager=proxy_manager,
             timeout=timeout,
         )
         self.account: Dict[str, Any] = account_data
@@ -678,12 +740,9 @@ class MemberReaderSession(BaseReaderSession):
 
             get_resp.raise_for_status()
         except Exception as exc:
-            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
-                self.proxy = None
-                if self._client and not self._client.is_closed:
-                    await self._client.aclose()
-                self._client = None
+            if is_proxy_error(exc) and self.proxy:
+                logger.warning("[%s] Proxy error (%s), mengeliminasi dan mencoba proxy baru...", self.worker_id, exc)
+                await self.rotate_bad_proxy()
                 return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
@@ -976,7 +1035,7 @@ class ReadingSimulationOrchestrator:
         
         sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
         proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
-        session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy)
+        session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy, proxy_manager=self.proxy_manager)
 
         async with self.semaphore:
             slot_idx, task_id = await slot_queue.get()
@@ -1062,6 +1121,21 @@ class ReadingSimulationOrchestrator:
                     bg_task.add_done_callback(self.background_tasks.discard)
 
                 await session.close()
+            except Exception as exc:
+                logger.error("[%s] Terjadi error pada guest worker: %s", worker_id, exc)
+                progress.update(task_id, description=f"[bold red]Error: {str(exc)[:15]}[/]")
+                self.results.append({
+                    "worker_id": worker_id,
+                    "type": "Guest",
+                    "ident": ident,
+                    "country": proxy_cc,
+                    "chapters_read": ch_read_count,
+                    "status": f"[red]Error: {str(exc)[:15]}[/]",
+                })
+                try:
+                    await session.close()
+                except Exception:
+                    pass
             finally:
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, task_id))
@@ -1088,6 +1162,7 @@ class ReadingSimulationOrchestrator:
             account_data=account,
             novel_title=self.novel_title,
             proxy=proxy,
+            proxy_manager=self.proxy_manager,
         )
 
         async with self.semaphore:
@@ -1194,12 +1269,30 @@ class ReadingSimulationOrchestrator:
                     bg_task.add_done_callback(self.background_tasks.discard)
 
                 await session.close()
+            except Exception as exc:
+                logger.error("[%s] Terjadi error pada member worker: %s", worker_id, exc)
+                progress.update(task_id, description=f"[bold red]Error: {str(exc)[:15]}[/]")
+                self.results.append({
+                    "worker_id": worker_id,
+                    "type": "Member",
+                    "ident": short_email,
+                    "country": acc_country,
+                    "chapters_read": ch_read_count,
+                    "status": f"[red]Error: {str(exc)[:15]}[/]",
+                })
+                try:
+                    await session.close()
+                except Exception:
+                    pass
             finally:
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, task_id))
 
     async def run(self) -> None:
         """Mengeksekusi seluruh antrean reader dengan monitor visual Progress Rich dinamis."""
+        # Selalu pastikan menarik proxy baru sebelum mulai membaca
+        self.proxy_manager.ensure_fresh_proxies()
+
         total_chapters = len(self.chapters)
         if total_chapters == 0:
             console.print("[red]Tidak ada bab gratis yang dapat dibaca pada novel ini.[/]")

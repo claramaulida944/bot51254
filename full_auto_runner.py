@@ -48,7 +48,7 @@ from auto_reader import (
     prompt_chapter_selection,
 )
 from interaction_manager import TargetResolver, default_proxy_manager
-from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
+from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES, default_proxy_manager
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress)
 logging.basicConfig(level=logging.ERROR)
@@ -57,6 +57,23 @@ logger.setLevel(logging.ERROR)
 for _lib in ("httpx", "httpcore"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 console = Console(highlight=False)
+
+
+def is_proxy_error(exc: Exception) -> bool:
+    """Mendeteksi apakah exception merupakan kegagalan proxy/koneksi jaringan tunnel."""
+    err_str = str(exc).lower()
+    return (
+        isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout))
+        or "407" in err_str
+        or "proxy" in err_str
+        or "tunnel" in err_str
+        or "connection reset" in err_str
+        or "remote end closed" in err_str
+        or "bad gateway" in err_str
+        or "502" in err_str
+        or "503" in err_str
+        or "504" in err_str
+    )
 
 
 class FullAutoWorker:
@@ -73,6 +90,7 @@ class FullAutoWorker:
         author_hash_id: Optional[str],
         chapters: List[Dict[str, Any]],
         proxy: Optional[str] = None,
+        proxy_manager: Optional[ProxyManager] = None,
         base_delay_per_chapter: float = 6.0,
         do_like: bool = True,
         do_bookmark: bool = True,
@@ -100,6 +118,7 @@ class FullAutoWorker:
         self.author_hash_id = author_hash_id
         self.chapters = chapters
         self.proxy = proxy
+        self.proxy_manager = proxy_manager or default_proxy_manager
         self.base_delay = base_delay_per_chapter
         self.do_like = do_like
         self.do_bookmark = do_bookmark
@@ -112,6 +131,14 @@ class FullAutoWorker:
         self.follow_result = "-"
         self.chapters_read = 0
         self.status = "Inisialisasi"
+
+    def rotate_bad_proxy(self) -> Optional[str]:
+        """Menghapus proxy bermasalah dari pool dan mengambil proxy baru."""
+        if self.proxy and self.proxy_manager:
+            logger.info("[%s] Mengeliminasi proxy bermasalah: %s", self.worker_id, self.proxy[:45])
+            self.proxy_manager.remove_bad_proxy(self.proxy)
+            self.proxy = self.proxy_manager.get_proxy(country_code=self.country)
+        return self.proxy
 
     async def get_read_chapter_ids(self, client: httpx.AsyncClient) -> set:
         """
@@ -453,12 +480,23 @@ class FullAutoWorker:
                                     ch_resp = await clean_client.get(ch_url)
                             ch_resp.raise_for_status()
                         except Exception as get_err:
-                            if self.proxy and ("407" in str(get_err) or "proxy" in str(get_err).lower() or isinstance(get_err, (httpx.ProxyError, httpx.ConnectError))):
-                                logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, get_err)
-                                self.proxy = None
+                            if is_proxy_error(get_err) and self.proxy:
+                                logger.warning("[%s] Proxy bermasalah (%s), eliminasi & beralih ke proxy lain...", self.worker_id, get_err)
+                                new_p = self.rotate_bad_proxy()
                                 if client and not client.is_closed:
-                                    await client.aclose()
-                                client = httpx.AsyncClient(headers=self.build_headers(), timeout=httpx.Timeout(self.timeout), http2=True, base_url=self.BASE_URL)
+                                    try:
+                                        await client.aclose()
+                                    except Exception:
+                                        pass
+                                new_kwargs = {"headers": self.build_headers(), "timeout": httpx.Timeout(25.0), "base_url": self.BASE_URL, "http2": False if new_p else True}
+                                if new_p:
+                                    new_kwargs["proxy"] = new_p
+                                client = httpx.AsyncClient(**new_kwargs)
+                                try:
+                                    ch_resp = await client.get(ch_url)
+                                    ch_resp.raise_for_status()
+                                except Exception:
+                                    pass
                             logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
 
                         # 2.B. Simulasi scrolling membaca bertahap / heartbeat (per ~3 detik & per persen progres)
@@ -653,6 +691,7 @@ class FullAutoOrchestrator:
                     author_hash_id=self.author_hash_id,
                     chapters=self.chapters,
                     proxy=proxy,
+                    proxy_manager=self.proxy_manager,
                     base_delay_per_chapter=self.base_delay,
                     do_like=self.do_like,
                     do_bookmark=self.do_bookmark,
@@ -666,6 +705,9 @@ class FullAutoOrchestrator:
                 slot_queue.put_nowait((slot_idx, tid))
 
     async def run(self) -> List[Dict[str, Any]]:
+        # Selalu pastikan menarik proxy baru sebelum mulai menjalankan fitur
+        self.proxy_manager.ensure_fresh_proxies()
+
         total_accounts = len(self.accounts)
         total_steps = len(self.chapters) if self.chapters else 1
         num_slots = min(self.concurrency, total_accounts)

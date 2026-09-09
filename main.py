@@ -90,7 +90,7 @@ def render_dashboard_stats() -> None:
         if mgr.is_brightdata:
             proxy_status = f"Bright Data ISP (Dynamic Geo)"
         else:
-            proxy_status = f"{len(mgr.parsed_proxies)} Proxy Aktif"
+            proxy_status = f"{len(mgr.parsed_proxies):,} Proxy Aktif"
     else:
         proxy_status = "Direct Connection (Tanpa Proxy)"
 
@@ -134,6 +134,7 @@ def wait_for_enter() -> None:
 def feature_auto_reader(preset_novel_id: Optional[str] = None) -> None:
     """Menjalankan modul Auto Readers (Member Royalti & Guest Heartbeat)."""
     console.print("\n[bold cyan]>>> Membuka Modul Auto Readers Simulator...[/]\n")
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         asyncio.run(auto_reader.main_async(preset_novel_id=preset_novel_id))
     except (KeyboardInterrupt, EOFError):
@@ -149,6 +150,7 @@ def feature_auto_reader(preset_novel_id: Optional[str] = None) -> None:
 def feature_auto_signup() -> None:
     """Menjalankan modul pendaftaran akun ber-entropi tinggi multi-negara."""
     console.print("\n[bold cyan]>>> Modul Pendaftaran Akun Otomatis (50 Negara & High Entropy)[/]\n")
+    default_proxy_manager.ensure_fresh_proxies()
 
     selected_country = Prompt.ask(
         "[bold green]?[/] Pilih kode negara (contoh: ID, US, JP, DE) atau 'RANDOM' untuk campuran 50 negara",
@@ -446,6 +448,7 @@ def feature_proxy_settings() -> None:
 # =============================================================================
 def feature_auto_like(preset_novel_id: Optional[str] = None) -> None:
     """Menjalankan modul Auto Like Novel via akun terdaftar."""
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         run_auto_like_cli(preset_novel_id=preset_novel_id)
     except (KeyboardInterrupt, EOFError):
@@ -460,6 +463,7 @@ def feature_auto_like(preset_novel_id: Optional[str] = None) -> None:
 # =============================================================================
 def feature_auto_bookmark(preset_novel_id: Optional[str] = None) -> None:
     """Menjalankan modul Auto Bookmark / Simpan ke Rak Buku."""
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         run_auto_bookmark_cli(preset_novel_id=preset_novel_id)
     except (KeyboardInterrupt, EOFError):
@@ -474,6 +478,7 @@ def feature_auto_bookmark(preset_novel_id: Optional[str] = None) -> None:
 # =============================================================================
 def feature_auto_followers(preset_author_id: Optional[str] = None) -> None:
     """Menjalankan modul Auto Followers untuk akun penulis / kreator."""
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         run_auto_followers_cli(preset_author_id=preset_author_id)
     except (KeyboardInterrupt, EOFError):
@@ -488,6 +493,7 @@ def feature_auto_followers(preset_author_id: Optional[str] = None) -> None:
 # =============================================================================
 def feature_sync_nicknames() -> None:
     """Menjalankan modul pembaruan nama pengguna agar sesuai dengan nama asli akun.txt."""
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         run_sync_nicknames_cli()
     except (KeyboardInterrupt, EOFError):
@@ -503,6 +509,7 @@ def feature_sync_nicknames() -> None:
 def feature_full_auto(preset_novel_id: Optional[str] = None) -> None:
     """Menjalankan modul Full Auto Bot (All-in-One Novel Automation)."""
     console.print("\n[bold cyan]>>> Membuka Modul Full Auto Bot...[/]\n")
+    default_proxy_manager.ensure_fresh_proxies()
     try:
         asyncio.run(run_full_auto_cli(preset_target=preset_novel_id))
     except (KeyboardInterrupt, EOFError):
