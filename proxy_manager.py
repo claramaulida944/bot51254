@@ -85,16 +85,28 @@ class ProxyInfo:
         if not self.raw_url:
             return
 
-        url_to_parse = self.raw_url
+        url_to_parse = self.raw_url.strip()
         if "://" not in url_to_parse:
             url_to_parse = "http://" + url_to_parse
 
-        parsed = urlparse(url_to_parse)
-        self.scheme = parsed.scheme or "http"
-        self.host = parsed.hostname or ""
-        self.port = parsed.port or (44445 if "superproxy.io" in self.host else 80)
-        self.username = parsed.username or ""
-        self.password = parsed.password or ""
+        try:
+            # Cegah crash di Python 3.12 jika ada karakter kurung siku '[' atau ']' di username/password
+            clean_for_parse = url_to_parse.replace("[", "%5B").replace("]", "%5D")
+            parsed = urlparse(clean_for_parse)
+            self.scheme = parsed.scheme or "http"
+            self.host = parsed.hostname or ""
+            self.port = parsed.port or (44445 if "superproxy.io" in self.host else 80)
+            self.username = (parsed.username or "").replace("%5B", "[").replace("%5D", "]")
+            self.password = (parsed.password or "").replace("%5B", "[").replace("%5D", "]")
+        except Exception:
+            # Fallback regex parsing jika urlparse bawaan Python gagal
+            m = re.search(r"^(?P<scheme>[a-zA-Z0-9]+)://(?:(?P<user>[^:]+)(?::(?P<pass>[^@]*))?@)?(?P<host>[^:]+)(?::(?P<port>\d+))?", url_to_parse)
+            if m:
+                self.scheme = m.group("scheme") or "http"
+                self.username = m.group("user") or ""
+                self.password = m.group("pass") or ""
+                self.host = m.group("host") or ""
+                self.port = int(m.group("port")) if m.group("port") else (44445 if "superproxy.io" in self.host else 80)
 
         # Deteksi Bright Data
         if "superproxy.io" in self.host or "brd-customer" in self.username or "lum-customer" in self.username:
@@ -200,8 +212,22 @@ class ProxyManager:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                self.raw_proxies.append(line)
-                self.parsed_proxies.append(ProxyInfo(line))
+
+                # Cek jika baris masih berupa placeholder template
+                if any(p in line.lower() for p in ["[replace", "<replace", "[password]", "<password>"]):
+                    logger.warning(
+                        f"⚠️ Baris di {self.proxy_file.name} masih berupa placeholder / belum diisi password: "
+                        f"'{line}'. Silakan ganti '[replace with password]' dengan password zona Bright Data Anda yang sebenarnya."
+                    )
+                    continue
+
+                try:
+                    p_info = ProxyInfo(line)
+                    if p_info.host:
+                        self.raw_proxies.append(line)
+                        self.parsed_proxies.append(p_info)
+                except Exception as exc:
+                    logger.warning(f"⚠️ Gagal membaca format proxy '{line}': {exc}")
 
         return len(self.parsed_proxies)
 

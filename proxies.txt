@@ -14,4 +14,4 @@
 #    socks5://username:password@ip:port
 # =============================================================================
 
-http://brd-customer-hl_cb0138b0-zone-isp_proxy1:[replace with password]@brd.superproxy.io:44445
+http://brd-customer-hl_cb0138b0-zone-isp_proxy1:o2dbx5jdwlcv@brd.superproxy.io:44445
