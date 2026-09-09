@@ -633,7 +633,7 @@ class MemberReaderSession(BaseReaderSession):
             try:
                 kwargs: Dict[str, Any] = {
                     "base_url": self.BASE_URL,
-                    "timeout": httpx.Timeout(12.0),
+                    "timeout": httpx.Timeout(5.0 if p else 15.0),
                     "headers": login_headers,
                     "http2": False if p else True,
                 }
@@ -660,8 +660,11 @@ class MemberReaderSession(BaseReaderSession):
                             logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
                             return True
                     elif resp.status_code == 401:
-                        # Password salah pada server
-                        return False
+                        # Jika 401 via proxy, bisa jadi proxy gateway yang menolak.
+                        # Hanya return False jika 401 saat Direct Connection.
+                        if p is None:
+                            return False
+                        continue
             except Exception as exc:
                 if p and is_proxy_error(exc):
                     logger.debug("[%s] Login via proxy gagal (%s), beralih ke jalur cadangan...", self.worker_id, exc)
