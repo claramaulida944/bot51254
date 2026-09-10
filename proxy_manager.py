@@ -22,10 +22,18 @@ import os
 import random
 import re
 import secrets
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import httpx
 from rich.console import Console
@@ -190,80 +198,253 @@ class ProxyInfo:
 
 
 class ProxyManager:
-    """Manajer Proxy Tunggal untuk seluruh Bot."""
+    """Manajer Proxy Tunggal untuk seluruh Bot dengan Auto-Replenish & Auto-Prune."""
 
-    def __init__(self, proxy_file: str = "proxies.txt"):
+    def __init__(
+        self,
+        proxy_file: str = "proxies.txt",
+        auto_replenish: bool = True,
+        min_replenish_threshold: int = 3,
+    ):
         self.proxy_file = Path(proxy_file)
         self.raw_proxies: List[str] = []
         self.parsed_proxies: List[ProxyInfo] = []
         self._current_index: int = 0
+        self._lock = threading.RLock()
+        self._auto_replenish: bool = auto_replenish
+        self._min_replenish_threshold: int = min_replenish_threshold
         self.load_proxies()
 
+    def _write_to_file(self, proxy_list: List[str]) -> None:
+        """Menulis daftar proxy ke proxies.txt secara aman."""
+        try:
+            with open(self.proxy_file, "w", encoding="utf-8") as f:
+                f.write("# =============================================================================\n")
+                f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL\n")
+                f.write("# Diperbarui secara otomatis melalui FreeProxyScraper (ProxyScrape & Top Sources)\n")
+                f.write("# =============================================================================\n\n")
+                for px in proxy_list:
+                    clean = px.strip()
+                    if clean:
+                        f.write(f"{clean}\n")
+        except Exception as exc:
+            logger.error(f"Gagal menulis file {self.proxy_file}: {exc}")
+
     def load_proxies(self) -> int:
-        """Membaca proxies.txt dan mem-parsing seluruh entri aktif."""
-        self.raw_proxies.clear()
-        self.parsed_proxies.clear()
+        """Membaca proxies.txt dan mem-parsing seluruh entri aktif secara thread-safe."""
+        with self._lock:
+            self.raw_proxies.clear()
+            self.parsed_proxies.clear()
 
-        if not self.proxy_file.exists():
-            return 0
+            if not self.proxy_file.exists():
+                return 0
 
-        with open(self.proxy_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
+            with open(self.proxy_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
 
-                # Cek jika baris masih berupa placeholder template
-                if any(p in line.lower() for p in ["[replace", "<replace", "[password]", "<password>"]):
-                    logger.warning(
-                        f"⚠️ Baris di {self.proxy_file.name} masih berupa placeholder / belum diisi password: "
-                        f"'{line}'. Silakan ganti '[replace with password]' dengan password zona Bright Data Anda yang sebenarnya."
-                    )
-                    continue
+                    # Cek jika baris masih berupa placeholder template
+                    if any(p in line.lower() for p in ["[replace", "<replace", "[password]", "<password>"]):
+                        logger.warning(
+                            f"⚠️ Baris di {self.proxy_file.name} masih berupa placeholder / belum diisi password: "
+                            f"'{line}'. Silakan ganti '[replace with password]' dengan password zona Bright Data Anda yang sebenarnya."
+                        )
+                        continue
 
-                try:
-                    p_info = ProxyInfo(line)
-                    if p_info.host:
-                        self.raw_proxies.append(line)
-                        self.parsed_proxies.append(p_info)
-                except Exception as exc:
-                    logger.warning(f"⚠️ Gagal membaca format proxy '{line}': {exc}")
+                    try:
+                        p_info = ProxyInfo(line)
+                        if p_info.host:
+                            self.raw_proxies.append(line)
+                            self.parsed_proxies.append(p_info)
+                    except Exception as exc:
+                        logger.warning(f"⚠️ Gagal membaca format proxy '{line}': {exc}")
 
-        return len(self.parsed_proxies)
+            return len(self.parsed_proxies)
 
     @property
     def has_proxies(self) -> bool:
-        return len(self.parsed_proxies) > 0
+        with self._lock:
+            return len(self.parsed_proxies) > 0
 
     @property
     def is_brightdata(self) -> bool:
-        return any(p.is_brightdata for p in self.parsed_proxies)
+        with self._lock:
+            return any(p.is_brightdata for p in self.parsed_proxies)
+
+    def ensure_proxies(self, min_count: int = 3, target_count: int = 30) -> int:
+        """
+        Memastikan ketersediaan proxy aktif minimal `min_count`.
+        Jika proxy di memory/file kurang dari `min_count` dan bukan Bright Data,
+        secara otomatis memicu FreeProxyScraper untuk mengambil dan memvalidasi proxy baru.
+        """
+        with self._lock:
+            # Jika sudah ada proxy Bright Data, gateway selalu aktif dan tidak butuh auto-scrape
+            if self.is_brightdata:
+                return len(self.parsed_proxies)
+
+            if len(self.parsed_proxies) >= min_count:
+                return len(self.parsed_proxies)
+
+            console.print(
+                f"\n[bold magenta][AUTO-REPLENISH] Sisa proxy ({len(self.parsed_proxies)}) menipis / habis (min: {min_count}).[/] "
+                f"[yellow]Otomatis scraping {target_count} proxy aktif baru...[/]"
+            )
+            try:
+                FreeProxyScraper.scrape_and_update(
+                    target_count=target_count,
+                    output_file=str(self.proxy_file),
+                    show_table=False,
+                )
+                self.load_proxies()
+                console.print(f"[bold green][AUTO-REPLENISH] Selesai! {len(self.parsed_proxies)} proxy aktif siap digunakan.[/]\n")
+                return len(self.parsed_proxies)
+            except Exception as exc:
+                logger.error(f"[Auto-Replenish] Gagal scraping proxy otomatis: {exc}")
+                return len(self.parsed_proxies)
+
+    def remove_proxy(self, proxy_url: Optional[str], reason: str = "failed") -> bool:
+        """
+        Menghapus proxy dari memory dan file proxies.txt secara thread-safe.
+        Jika proxy merupakan Bright Data SuperProxy, tidak dihapus jika reason=='used',
+        namun jika reason=='failed' (misal akun suspended / 407), tetap dapat diproses jika diinginkan.
+        """
+        if not proxy_url:
+            return False
+
+        with self._lock:
+            target_raw = proxy_url.strip()
+            p_to_remove: Optional[ProxyInfo] = None
+
+            try:
+                target_parsed = urlparse(target_raw if "://" in target_raw else f"http://{target_raw}")
+                target_host = target_parsed.hostname
+                target_port = target_parsed.port
+            except Exception:
+                target_host = None
+                target_port = None
+
+            for p in self.parsed_proxies:
+                if p.raw_url == target_raw:
+                    p_to_remove = p
+                    break
+                if target_host and p.host == target_host and (target_port is None or p.port == target_port):
+                    p_to_remove = p
+                    break
+
+            if not p_to_remove:
+                return False
+
+            # Bright Data gateway tidak dihapus saat "used" karena dirancang reusable dengan dynamic session
+            if p_to_remove.is_brightdata and reason == "used":
+                return False
+
+            if p_to_remove in self.parsed_proxies:
+                self.parsed_proxies.remove(p_to_remove)
+            if p_to_remove.raw_url in self.raw_proxies:
+                self.raw_proxies.remove(p_to_remove.raw_url)
+
+            # Simpan pembaruan ke proxies.txt
+            self._write_to_file([p.raw_url for p in self.parsed_proxies])
+
+            masked = p_to_remove.get_masked_url()
+            sisa = len(self.parsed_proxies)
+            if reason == "failed":
+                logger.warning(f"[-] [ProxyManager] Proxy mati/gagal konek otomatis DIHAPUS: {masked} (Sisa: {sisa})")
+                console.print(f"[dim red][DEL] Proxy mati dihapus:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
+            elif reason == "used":
+                logger.info(f"[+] [ProxyManager] Proxy selesai dipakai & DIHAPUS dari antrean: {masked} (Sisa: {sisa})")
+                console.print(f"[dim yellow][USED] Proxy selesai digunakan & dilepas:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
+
+            # Auto-replenish jika kuota habis/menipis
+            if self._auto_replenish and not self.is_brightdata and sisa < self._min_replenish_threshold:
+                # Jalankan replenish di thread terpisah agar pemanggil tidak terblokir lama jika sedang dalam eksekusi
+                threading.Thread(target=self.ensure_proxies, args=(self._min_replenish_threshold, 30), daemon=True).start()
+
+            return True
+
+    def mark_failed(self, proxy_url: Optional[str], error: Optional[Any] = None) -> bool:
+        """Menandai dan menghapus proxy yang gagal konek / mati / error dari antrean dan file."""
+        return self.remove_proxy(proxy_url, reason="failed")
+
+    def mark_used(self, proxy_url: Optional[str]) -> bool:
+        """Menandai dan menghapus proxy yang telah selesai digunakan (free proxy consumed)."""
+        return self.remove_proxy(proxy_url, reason="used")
+
+    def pop_proxy(
+        self,
+        country_code: Optional[str] = None,
+        session_id: Optional[str] = None,
+        auto_replenish: bool = True,
+    ) -> Optional[str]:
+        """
+        Mengambil proxy dan langsung mengeluarkannya dari antrean / file proxies.txt (khusus free proxy).
+        Jika Bright Data, tidak dihapus dari file karena merupakan gateway rotasi dinamis.
+        """
+        with self._lock:
+            if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
+                self.ensure_proxies(min_count=1, target_count=30)
+
+            if not self.parsed_proxies:
+                return None
+
+            proxy_info = self.parsed_proxies.pop(0)
+            if proxy_info.raw_url in self.raw_proxies:
+                self.raw_proxies.remove(proxy_info.raw_url)
+
+            # Jika bukan Bright Data, simpan ke file
+            if not proxy_info.is_brightdata:
+                self._write_to_file([p.raw_url for p in self.parsed_proxies])
+                console.print(
+                    f"[dim yellow][ALLOC] Proxy dialokasikan & dikeluarkan dari antrean:[/] [dim]{proxy_info.get_masked_url()}[/] "
+                    f"[dim](Sisa {len(self.parsed_proxies)} proxy)[/]"
+                )
+            else:
+                # Bright Data gateway dikembalikan ke pool
+                self.parsed_proxies.append(proxy_info)
+
+            # Auto-replenish jika sisa proxy menipis
+            if auto_replenish and not self.is_brightdata and len(self.parsed_proxies) < self._min_replenish_threshold:
+                threading.Thread(target=self.ensure_proxies, args=(self._min_replenish_threshold, 30), daemon=True).start()
+
+            if proxy_info.is_brightdata:
+                return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
+
+            return proxy_info.raw_url
 
     def get_proxy(
         self,
         country_code: Optional[str] = None,
         session_id: Optional[str] = None,
+        auto_replenish: bool = True,
     ) -> Optional[str]:
         """
         Mengambil proxy berikutnya.
+        Jika proxy kosong dan auto_replenish=True, otomatis mengambil proxy gratis baru.
         Jika proxy merupakan Bright Data, otomatis ditargetkan ke `country_code`.
         """
-        if not self.parsed_proxies:
-            return None
+        with self._lock:
+            if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
+                self.ensure_proxies(min_count=1, target_count=30)
 
-        proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
-        self._current_index += 1
+            if not self.parsed_proxies:
+                return None
 
-        if proxy_info.is_brightdata:
-            return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
+            proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+            self._current_index += 1
 
-        return proxy_info.raw_url
+            if proxy_info.is_brightdata:
+                return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
+
+            return proxy_info.raw_url
 
     def get_base_fallback_proxy(self) -> Optional[str]:
         """Mengambil base proxy tanpa targeting negara spesifik."""
-        if not self.parsed_proxies:
-            return None
-        return self.parsed_proxies[0].get_base_url()
+        with self._lock:
+            if not self.parsed_proxies:
+                return None
+            return self.parsed_proxies[0].get_base_url()
 
     def get_alternate_proxy(self, failed_country: Optional[str] = None) -> Optional[str]:
         """Mengambil proxy dari negara lain secara dinamis dan acak."""
@@ -362,25 +543,16 @@ class ProxyManager:
         return result
 
     def save_proxies(self, proxy_list: List[str]) -> None:
-        """Menyimpan daftar proxy ke proxies.txt dan memuat ulang instance."""
-        with open(self.proxy_file, "w", encoding="utf-8") as f:
-            f.write("# =============================================================================\n")
-            f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL\n")
-            f.write("# Diperbarui secara otomatis melalui FreeProxyScraper (ProxyScrape & Top Sources)\n")
-            f.write("# =============================================================================\n\n")
-            for px in proxy_list:
-                clean = px.strip()
-                if clean:
-                    f.write(f"{clean}\n")
-        self.load_proxies()
+        """Menyimpan daftar proxy ke proxies.txt dan memuat ulang instance secara thread-safe."""
+        with self._lock:
+            self._write_to_file(proxy_list)
+            self.load_proxies()
 
     def clear_proxies(self) -> None:
-        """Mengosongkan daftar proxy agar bot menggunakan Direct Connection."""
-        with open(self.proxy_file, "w", encoding="utf-8") as f:
-            f.write("# =============================================================================\n")
-            f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL (DIRECT CONNECTION)\n")
-            f.write("# =============================================================================\n")
-        self.load_proxies()
+        """Mengosongkan daftar proxy agar bot menggunakan Direct Connection secara thread-safe."""
+        with self._lock:
+            self._write_to_file([])
+            self.load_proxies()
 
 
 class FreeProxyScraper:
@@ -585,6 +757,7 @@ class FreeProxyScraper:
         target_count: int = 50,
         output_file: str = "proxies.txt",
         max_workers: int = 80,
+        show_table: bool = True,
     ) -> List[str]:
         """
         Alur terpadu: Scrape -> Validasi -> Simpan ke proxies.txt.
@@ -610,27 +783,62 @@ class FreeProxyScraper:
             return []
 
         verified_urls = [item["proxy"] for item in verified_data]
-        mgr = ProxyManager(output_file)
+        mgr = ProxyManager(output_file, auto_replenish=False)
         mgr.save_proxies(verified_urls)
 
         console.print(f"\n[bold green][OK] Berhasil menemukan {len(verified_urls)} proxy aktif dan menyimpannya ke '{output_file}'![/]\n")
 
-        # Tampilkan tabel preview 10 proxy tercepat
-        table = Table(title=f"Top 10 Proxy Tercepat (dari {len(verified_urls)} Proxy Aktif Terverifikasi)")
-        table.add_column("No", style="dim", width=4)
-        table.add_column("URL Proxy", style="bold cyan")
-        table.add_column("Latency Target API", style="bold yellow")
-        table.add_column("Status", style="green")
+        if show_table:
+            # Tampilkan tabel preview 10 proxy tercepat
+            table = Table(title=f"Top 10 Proxy Tercepat (dari {len(verified_urls)} Proxy Aktif Terverifikasi)")
+            table.add_column("No", style="dim", width=4)
+            table.add_column("URL Proxy", style="bold cyan")
+            table.add_column("Latency Target API", style="bold yellow")
+            table.add_column("Status", style="green")
 
-        for idx, item in enumerate(verified_data[:10], start=1):
-            table.add_row(
-                str(idx),
-                item["proxy"],
-                f"{item['latency_ms']} ms",
-                "200 OK (Aktif)",
-            )
-        console.print(table)
+            for idx, item in enumerate(verified_data[:10], start=1):
+                table.add_row(
+                    str(idx),
+                    item["proxy"],
+                    f"{item['latency_ms']} ms",
+                    "200 OK (Aktif)",
+                )
+            console.print(table)
         return verified_urls
+
+
+def is_dead_or_proxy_error(exc: Optional[Any]) -> bool:
+    """
+    Mengecek secara komprehensif apakah suatu exception diakibatkan oleh proxy mati / gagal koneksi.
+    Mendukung deteksi httpx ProxyError, ConnectError, ConnectTimeout, ReadTimeout, 407, 502/503/504,
+    SOCKS handshake error, connection refused, reset by peer, dll.
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError)):
+        return True
+    err_str = str(exc).lower()
+    dead_signals = (
+        "proxy",
+        "407",
+        "socks",
+        "connection reset",
+        "connection refused",
+        "actively refused",
+        "tunnel",
+        "502",
+        "503",
+        "504",
+        "timed out",
+        "timeout",
+        "connect call failed",
+        "remote host closed",
+        "broken pipe",
+        "no ips",
+        "unreachable",
+        "handshake failed",
+    )
+    return any(sig in err_str for sig in dead_signals)
 
 
 # Instance singleton global

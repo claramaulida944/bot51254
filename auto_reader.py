@@ -71,6 +71,7 @@ from proxy_manager import (
     ProxyInfo,
     default_proxy_manager,
     SUPPORTED_QUARTERFULL_COUNTRIES,
+    is_dead_or_proxy_error,
 )
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress di konsol)
@@ -326,8 +327,9 @@ class GuestReaderSession(BaseReaderSession):
                     client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
                     return True
             except Exception as exc:
-                if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                    logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, exc)
+                if self.proxy and is_dead_or_proxy_error(exc):
+                    logger.warning("[%s] Proxy bermasalah (%s), otomatis DIHAPUS dan beralih ke Direct Connection...", self.worker_id, exc)
+                    default_proxy_manager.mark_failed(self.proxy, exc)
                     self.proxy = None
                     if self._client and not self._client.is_closed:
                         await self._client.aclose()
@@ -375,8 +377,9 @@ class GuestReaderSession(BaseReaderSession):
             content = ch_data.get("content", "")
             char_count = len(content)
         except Exception as exc:
-            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
+            if self.proxy and is_dead_or_proxy_error(exc):
+                logger.warning("[%s] Proxy error (%s), otomatis DIHAPUS dan fallback ke Direct Connection...", self.worker_id, exc)
+                default_proxy_manager.mark_failed(self.proxy, exc)
                 self.proxy = None
                 if self._client and not self._client.is_closed:
                     await self._client.aclose()
@@ -678,8 +681,9 @@ class MemberReaderSession(BaseReaderSession):
 
             get_resp.raise_for_status()
         except Exception as exc:
-            if self.proxy and ("407" in str(exc) or "proxy" in str(exc).lower() or isinstance(exc, (httpx.ProxyError, httpx.ConnectError))):
-                logger.warning("[%s] Proxy error (%s), otomatis fallback ke Direct Connection...", self.worker_id, exc)
+            if self.proxy and is_dead_or_proxy_error(exc):
+                logger.warning("[%s] Proxy error (%s), otomatis DIHAPUS dan fallback ke Direct Connection...", self.worker_id, exc)
+                default_proxy_manager.mark_failed(self.proxy, exc)
                 self.proxy = None
                 if self._client and not self._client.is_closed:
                     await self._client.aclose()
@@ -1042,6 +1046,8 @@ class ReadingSimulationOrchestrator:
                     "chapters_read": ch_read_count,
                     "status": "[green]Sukses[/]",
                 })
+                if session.proxy:
+                    self.proxy_manager.mark_used(session.proxy)
 
                 detached_client = session.detach_client()
                 if detached_client:
@@ -1174,6 +1180,8 @@ class ReadingSimulationOrchestrator:
                     "chapters_read": ch_read_count,
                     "status": "[green]Sukses[/]",
                 })
+                if session.proxy:
+                    self.proxy_manager.mark_used(session.proxy)
 
                 detached_client = session.detach_client()
                 if detached_client:
@@ -1243,6 +1251,10 @@ class ReadingSimulationOrchestrator:
                     role=f"Slot-{s_idx:02d}",
                 )
                 slot_queue.put_nowait((s_idx, tid))
+
+            # Pastikan ketersediaan proxy mencukupi jika menggunakan proxy free
+            if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+                self.proxy_manager.ensure_proxies(min_count=max(3, self.total_readers // 2), target_count=max(30, self.total_readers))
 
             tasks = []
             for idx, acc in enumerate(self.member_accounts, start=1):

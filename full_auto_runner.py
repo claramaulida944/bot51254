@@ -48,7 +48,7 @@ from auto_reader import (
     prompt_chapter_selection,
 )
 from interaction_manager import TargetResolver, default_proxy_manager
-from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES
+from proxy_manager import ProxyManager, SUPPORTED_QUARTERFULL_COUNTRIES, is_dead_or_proxy_error
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress)
 logging.basicConfig(level=logging.ERROR)
@@ -564,6 +564,8 @@ class FullAutoWorker:
                 )
 
         except Exception as main_exc:
+            if self.proxy and is_dead_or_proxy_error(main_exc):
+                default_proxy_manager.mark_failed(self.proxy, main_exc)
             self.status = f"[red]Error: {str(main_exc)[:30]}[/]"
             progress.update(
                 task_id,
@@ -660,7 +662,11 @@ class FullAutoOrchestrator:
                     skip_already_read=self.skip_already_read,
                     inter_chapter_delay=self.inter_chapter_delay,
                 )
-                return await worker.execute(progress, tid)
+                res = await worker.execute(progress, tid)
+                if proxy:
+                    if "sukses" in str(res.get("status", "")).lower() or res.get("chapters_read", 0) > 0:
+                        self.proxy_manager.mark_used(proxy)
+                return res
             finally:
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, tid))
@@ -700,6 +706,10 @@ class FullAutoOrchestrator:
             console=console,
             refresh_per_second=4,
         ) as progress:
+            # Pastikan proxy mencukupi jika menggunakan free proxy
+            if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+                self.proxy_manager.ensure_proxies(min_count=max(3, total_accounts // 2), target_count=max(30, total_accounts))
+
             overall_task = progress.add_task(
                 description="[dim]Memproses antrean akun...[/]",
                 total=total_accounts,

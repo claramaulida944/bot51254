@@ -48,6 +48,7 @@ from proxy_manager import (
     ProxyInfo,
     default_proxy_manager,
     SUPPORTED_QUARTERFULL_COUNTRIES,
+    is_dead_or_proxy_error,
 )
 
 console = Console(highlight=False)
@@ -319,8 +320,12 @@ class SocialInteractionBot:
                                     return alt_resp
                         except Exception:
                             continue
+                if resp.status_code == 200 and proxy:
+                    self.proxy_manager.mark_used(proxy)
                 return resp
         except Exception as exc:
+            if proxy and is_dead_or_proxy_error(exc):
+                self.proxy_manager.mark_failed(proxy, exc)
             last_exc = exc
             err_msg = str(exc)
             # Jika terjadi ProxyError 400 No IPs atau kegagalan proxy lainnya, rotasi ke negara lain
@@ -337,14 +342,19 @@ class SocialInteractionBot:
                     try:
                         with httpx.Client(http2=False, proxy=alt_proxy, timeout=timeout) as alt_client:
                             if method.upper() == "POST":
-                                return alt_client.post(url, headers=headers, json=json_body)
+                                alt_resp = alt_client.post(url, headers=headers, json=json_body)
                             elif method.upper() == "PUT":
-                                return alt_client.put(url, headers=headers, json=json_body)
+                                alt_resp = alt_client.put(url, headers=headers, json=json_body)
                             elif method.upper() == "PATCH":
-                                return alt_client.patch(url, headers=headers, json=json_body)
+                                alt_resp = alt_client.patch(url, headers=headers, json=json_body)
                             else:
-                                return alt_client.get(url, headers=headers)
+                                alt_resp = alt_client.get(url, headers=headers)
+                            if alt_resp.status_code == 200 and alt_proxy:
+                                self.proxy_manager.mark_used(alt_proxy)
+                            return alt_resp
                     except Exception as alt_err:
+                        if alt_proxy and is_dead_or_proxy_error(alt_err):
+                            self.proxy_manager.mark_failed(alt_proxy, alt_err)
                         last_exc = alt_err
                         continue
 

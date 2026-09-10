@@ -44,7 +44,7 @@ from faker import Faker
 import httpx
 
 from session_manager import IdentifierGenerator
-from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager
+from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager, is_dead_or_proxy_error
 
 # Konfigurasi logging
 logger = logging.getLogger("AutoSignup")
@@ -675,6 +675,8 @@ class RegistrationRunner:
 
                     # Simpan akun ke file akun.txt (format 1 JSON per baris)
                     self._save_account_to_file(account_record)
+                    if proxy:
+                        self.proxy_manager.mark_used(proxy)
 
                     logger.info(
                         "Registrasi BERHASIL! User ID: %s | Email: %s | Negara: %s",
@@ -831,6 +833,8 @@ class RegistrationRunner:
                                             "created_at": datetime.now().isoformat(),
                                         }
                                         self._save_account_to_file(account_record)
+                                        if alt_proxy:
+                                            self.proxy_manager.mark_used(alt_proxy)
                                         logger.info(
                                             "Registrasi BERHASIL via proxy alternatif %s! User ID: %s | Email: %s",
                                             alt_cc,
@@ -843,9 +847,13 @@ class RegistrationRunner:
                                             "raw_response": data,
                                         }
                             except Exception as alt_exc:
+                                if alt_proxy and is_dead_or_proxy_error(alt_exc):
+                                    self.proxy_manager.mark_failed(alt_proxy, alt_exc)
                                 logger.debug("Proxy alternatif %s gagal: %s", alt_cc, alt_exc)
                                 continue
 
+                    if proxy and is_dead_or_proxy_error(exc):
+                        self.proxy_manager.mark_failed(proxy, exc)
                     logger.error("Terjadi exception pada pendaftaran: %s", exc)
                     return {
                         "status": "exception",
