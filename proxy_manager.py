@@ -329,10 +329,10 @@ class ProxyManager:
 
         start_time = time.time()
         try:
-            with httpx.Client(proxy=target_proxy, http2=False, timeout=12.0) as client:
-                # 1. Cek Geo Diagnostic JSON
+            with httpx.Client(proxy=target_proxy, http2=False, timeout=8.0) as client:
+                # 1. Cek Geo Diagnostic JSON (opsional jika proxy standar)
                 try:
-                    geo_resp = client.get("https://geo.brdtest.com/mygeo.json")
+                    geo_resp = client.get("https://geo.brdtest.com/mygeo.json", timeout=3.0)
                     if geo_resp.status_code == 200:
                         geo_data = geo_resp.json()
                         result["country"] = geo_data.get("country")
@@ -345,7 +345,7 @@ class ProxyManager:
                     pass
 
                 # 2. Cek Endpoint Quarterfull API
-                api_resp = client.get("https://api.quarterfull.io/api/auth/app-version")
+                api_resp = client.get("https://api.quarterfull.io/api/auth/app-version", timeout=4.0)
                 if api_resp.status_code == 200:
                     result["target_api_ok"] = True
                     result["success"] = True
@@ -361,6 +361,277 @@ class ProxyManager:
 
         return result
 
+    def save_proxies(self, proxy_list: List[str]) -> None:
+        """Menyimpan daftar proxy ke proxies.txt dan memuat ulang instance."""
+        with open(self.proxy_file, "w", encoding="utf-8") as f:
+            f.write("# =============================================================================\n")
+            f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL\n")
+            f.write("# Diperbarui secara otomatis melalui FreeProxyScraper (ProxyScrape & Top Sources)\n")
+            f.write("# =============================================================================\n\n")
+            for px in proxy_list:
+                clean = px.strip()
+                if clean:
+                    f.write(f"{clean}\n")
+        self.load_proxies()
+
+    def clear_proxies(self) -> None:
+        """Mengosongkan daftar proxy agar bot menggunakan Direct Connection."""
+        with open(self.proxy_file, "w", encoding="utf-8") as f:
+            f.write("# =============================================================================\n")
+            f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL (DIRECT CONNECTION)\n")
+            f.write("# =============================================================================\n")
+        self.load_proxies()
+
+
+class FreeProxyScraper:
+    """
+    Scraper & Validator Proxy Gratis Multi-Source Berkecepatan Tinggi.
+    Mengambil ribuan proxy dari ProxyScrape (v4 API) dan sumber terverifikasi,
+    memvalidasi konektivitasnya langsung ke API target (https://api.quarterfull.io),
+    serta menyimpan proxy yang aktif ke proxies.txt.
+    """
+
+    SOURCES: List[Tuple[str, str]] = [
+        # 1. Sumber Utama: ProxyScrape v4 API (Format protocol:ip:port HTTP & SOCKS5)
+        (
+            "ProxyScrape v4",
+            "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+        ),
+        # 2. Monosans Proxy List (Update tiap 15 menit, GitHub Terverifikasi)
+        (
+            "monosans/proxy-list",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+        ),
+        # 3. Hookzof SOCKS5 List (Kualitas tinggi, latency rendah)
+        (
+            "hookzof/socks5",
+            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        ),
+        # 4. TheSpeedX SOCKS-List (HTTP & SOCKS5)
+        (
+            "SpeedX/HTTP",
+            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+        ),
+        (
+            "SpeedX/SOCKS5",
+            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+        ),
+        # 5. Proxifly Free Proxy List (Multi-region)
+        (
+            "proxifly/all",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+        ),
+        # 6. Roosterkid OpenProxyList (HTTPS & SOCKS5)
+        (
+            "roosterkid/HTTPS",
+            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        ),
+        (
+            "roosterkid/SOCKS5",
+            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        ),
+        # 7. HideIP.me Live Proxies
+        (
+            "hideip/HTTP",
+            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+        ),
+        (
+            "hideip/SOCKS5",
+            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+        ),
+    ]
+
+    TARGET_TEST_URL = "https://api.quarterfull.io/api/auth/app-version"
+
+    @classmethod
+    def scrape_candidates(cls, max_sources: Optional[int] = None) -> List[str]:
+        """
+        Mengunduh seluruh daftar kandidat dari ProxyScrape dan curated repo.
+        Memfilter protocol yang tidak didukung httpx (socks4://) dan menormalisasi format.
+        """
+        candidates: List[str] = []
+        seen = set()
+        sources_to_use = cls.SOURCES[:max_sources] if max_sources else cls.SOURCES
+
+        with httpx.Client(timeout=10.0) as client:
+            for name, url in sources_to_use:
+                try:
+                    resp = client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    count = 0
+                    for raw_line in resp.text.splitlines():
+                        line = raw_line.strip()
+                        if not line or line.startswith("#") or line.startswith("socks4"):
+                            continue
+                        # Normalisasi skema jika belum ada
+                        if "://" not in line:
+                            if "socks5" in url.lower():
+                                line = f"socks5://{line}"
+                            else:
+                                line = f"http://{line}"
+
+                        if line not in seen:
+                            seen.add(line)
+                            candidates.append(line)
+                            count += 1
+                    logger.info("Sumber [%s]: menemukan %d kandidat", name, count)
+                except Exception as exc:
+                    logger.debug("Gagal fetch dari %s: %s", name, exc)
+
+        return candidates
+
+    @classmethod
+    def test_single_proxy(
+        cls,
+        proxy_url: str,
+        timeout: float = 2.5,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Menguji satu proxy secara independen langsung ke Quarterfull API.
+        Mengembalikan Dict informasi jika sukses HTTP 200, atau None jika gagal/timeout.
+        """
+        try:
+            t0 = time.time()
+            with httpx.Client(proxy=proxy_url, timeout=timeout, http2=False) as client:
+                resp = client.get(cls.TARGET_TEST_URL)
+                if resp.status_code == 200:
+                    latency = round((time.time() - t0) * 1000, 1)
+                    return {
+                        "proxy": proxy_url,
+                        "latency_ms": latency,
+                        "status": resp.status_code,
+                    }
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def validate_batch(
+        cls,
+        candidates: List[str],
+        target_count: int = 50,
+        max_workers: int = 80,
+        timeout: float = 2.2,
+    ) -> List[Dict[str, Any]]:
+        """
+        Memvalidasi sekumpulan kandidat proxy secara konkuren menggunakan ThreadPoolExecutor.
+        Mengalirkan kandidat secara kontinyu dan berhenti seketika saat kuota target_count terpenuhi.
+        """
+        import concurrent.futures
+
+        verified: List[Dict[str, Any]] = []
+        tested_count = 0
+        cand_iter = iter(candidates)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        futures: Dict[concurrent.futures.Future, str] = {}
+
+        try:
+            # Isi awal pool sejumlah max_workers * 2
+            for _ in range(min(len(candidates), max_workers * 2)):
+                try:
+                    p = next(cand_iter)
+                    fut = executor.submit(cls.test_single_proxy, p, timeout)
+                    futures[fut] = p
+                except StopIteration:
+                    break
+
+            while futures and len(verified) < target_count:
+                done, _ = concurrent.futures.wait(
+                    list(futures.keys()),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    p_tested = futures.pop(fut, None)
+                    tested_count += 1
+                    try:
+                        res = fut.result()
+                        if res:
+                            verified.append(res)
+                            console.print(
+                                f"  [bold green][ALIVE][/] #{len(verified)}/{target_count}: "
+                                f"[cyan]{res['proxy']}[/] [yellow]({res['latency_ms']} ms)[/]"
+                            )
+                            if len(verified) >= target_count:
+                                break
+                    except Exception:
+                        pass
+
+                    # Tambahkan kandidat berikutnya ke executor jika kuota belum penuh
+                    if len(verified) < target_count:
+                        try:
+                            next_p = next(cand_iter)
+                            new_fut = executor.submit(cls.test_single_proxy, next_p, timeout)
+                            futures[new_fut] = next_p
+                        except StopIteration:
+                            pass
+
+        finally:
+            for f in list(futures.keys()):
+                f.cancel()
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                executor.shutdown(wait=False)
+
+        # Urutkan berdasarkan latency tercepat
+        verified.sort(key=lambda x: x.get("latency_ms", 9999))
+        return verified
+
+    @classmethod
+    def scrape_and_update(
+        cls,
+        target_count: int = 50,
+        output_file: str = "proxies.txt",
+        max_workers: int = 80,
+    ) -> List[str]:
+        """
+        Alur terpadu: Scrape -> Validasi -> Simpan ke proxies.txt.
+        """
+        console.print("\n[bold cyan]>>> Mengambil Kandidat Proxy dari ProxyScrape & Top Sources...[/]")
+        candidates = cls.scrape_candidates()
+        console.print(f"Total kandidat terkumpul: [bold green]{len(candidates):,}[/] alamat proxy unik.")
+
+        if not candidates:
+            console.print("[red]Gagal mengunduh daftar proxy dari semua sumber.[/]")
+            return []
+
+        console.print(f"\n[yellow]Memvalidasi proxy aktif langsung ke Quarterfull API (Target: {target_count} proxy)...[/]\n")
+        verified_data = cls.validate_batch(
+            candidates,
+            target_count=target_count,
+            max_workers=max_workers,
+            timeout=2.2,
+        )
+
+        if not verified_data:
+            console.print("[red]Tidak ada proxy yang merespon dalam batas latency toleransi.[/]")
+            return []
+
+        verified_urls = [item["proxy"] for item in verified_data]
+        mgr = ProxyManager(output_file)
+        mgr.save_proxies(verified_urls)
+
+        console.print(f"\n[bold green][OK] Berhasil menemukan {len(verified_urls)} proxy aktif dan menyimpannya ke '{output_file}'![/]\n")
+
+        # Tampilkan tabel preview 10 proxy tercepat
+        table = Table(title=f"Top 10 Proxy Tercepat (dari {len(verified_urls)} Proxy Aktif Terverifikasi)")
+        table.add_column("No", style="dim", width=4)
+        table.add_column("URL Proxy", style="bold cyan")
+        table.add_column("Latency Target API", style="bold yellow")
+        table.add_column("Status", style="green")
+
+        for idx, item in enumerate(verified_data[:10], start=1):
+            table.add_row(
+                str(idx),
+                item["proxy"],
+                f"{item['latency_ms']} ms",
+                "200 OK (Aktif)",
+            )
+        console.print(table)
+        return verified_urls
+
 
 # Instance singleton global
 default_proxy_manager = ProxyManager("proxies.txt")
@@ -372,57 +643,109 @@ def get_global_proxy_manager() -> ProxyManager:
 
 
 def test_proxy_cli() -> None:
-    """Antarmuka CLI interaktif untuk mengecek status proxy dan berbagai negara."""
-    console.print("\n[bold cyan]=== DIAGNOSTIK KONEKSI PROXY (BRIGHT DATA / ISP) ===[/]\n")
+    """Antarmuka CLI interaktif untuk manajemen, scraping, dan diagnostik proxy."""
+    while True:
+        console.print("\n[bold cyan]=== PUSAT MANAJEMEN & INTEGRASI PROXY (BOT TOODAT) ===[/]\n")
 
-    mgr = ProxyManager("proxies.txt")
-    if not mgr.has_proxies:
-        console.print("[yellow]File 'proxies.txt' kosong atau belum memiliki proxy aktif.[/]")
-        return
-
-    console.print(f"Total Proxy di 'proxies.txt': [bold green]{len(mgr.parsed_proxies)}[/]")
-    p_info = mgr.parsed_proxies[0]
-    console.print(f"Tipe Proxy: [bold {'magenta' if p_info.is_brightdata else 'blue'}]{'Bright Data SuperProxy (Dynamic Geo Routing)' if p_info.is_brightdata else 'Standard HTTP/SOCKS5'}[/]")
-    console.print(f"Host: [bold white]{p_info.host}:{p_info.port}[/] | Masked: [dim]{p_info.get_masked_url()}[/]\n")
-
-    test_countries = ["ID", "US", "JP", "GB"] if p_info.is_brightdata else [None]
-
-    table = Table(title="Hasil Uji Koneksi & Lokasi IP Proxy")
-    table.add_column("Target Negara", style="bold cyan")
-    table.add_column("Negara Asli", style="green")
-    table.add_column("Region / Kota", style="white")
-    table.add_column("Provider / ISP", style="dim")
-    table.add_column("Target API", style="bold")
-    table.add_column("Latency", style="yellow")
-
-    for cc in test_countries:
-        label = cc or "Default"
-        with console.status(f"[bold green]Menguji proxy untuk {label}...[/]"):
-            res = mgr.test_proxy(country_code=cc)
-
-        if res["success"]:
-            api_status = "[bold green]200 OK[/]" if res["target_api_ok"] else "[bold red]FAIL[/]"
-            table.add_row(
-                label,
-                res["country"] or "-",
-                f"{res['region'] or ''} {res['city'] or ''}".strip() or "-",
-                str(res.get("asn") or "-")[:25],
-                api_status,
-                f"{res['latency_ms']} ms",
-            )
+        mgr = ProxyManager("proxies.txt")
+        if mgr.has_proxies:
+            p_info = mgr.parsed_proxies[0]
+            tipe_str = "Bright Data SuperProxy (ISP)" if p_info.is_brightdata else "Free / Standard HTTP & SOCKS5"
+            console.print(f"Status: [bold green]{len(mgr.parsed_proxies)} Proxy Terdaftar[/] | Tipe: [bold yellow]{tipe_str}[/]")
+            console.print(f"Sample: [dim]{mgr.parsed_proxies[0].get_masked_url()}[/]\n")
         else:
-            table.add_row(
-                label,
-                "-",
-                str(res.get("error", ""))[:30],
-                "-",
-                "[red]FAIL[/]",
-                f"{res['latency_ms']} ms",
-            )
+            console.print("[yellow]Status: DIRECT CONNECTION (Tanpa Proxy - proxies.txt kosong)[/]\n")
 
-    console.print(table)
-    console.print("\n[bold green][OK] Semua request melalui proxy berhasil disalurkan dengan HTTP/1.1 tunnel tanpa hang.[/]\n")
+        console.print("Pilih Aksi:")
+        console.print("  [1] [bold green]Scrape & Verifikasi Proxy Gratis Baru[/] (ProxyScrape v4 + Top Sources)")
+        console.print("  [2] [bold cyan]Uji Diagnostik Seluruh Proxy di proxies.txt[/]")
+        console.print("  [3] [bold white]Input / Tambah Proxy Manual ke proxies.txt[/]")
+        console.print("  [4] [bold red]Kosongkan proxies.txt[/] (Gunakan Direct Connection)")
+        console.print("  [0] Kembali ke Menu Utama\n")
+
+        try:
+            from rich.prompt import Prompt, IntPrompt
+            choice = Prompt.ask("[bold green]?[/] Pilihan Anda", choices=["0", "1", "2", "3", "4"], default="1")
+        except (KeyboardInterrupt, EOFError):
+            break
+
+        if choice == "0":
+            break
+
+        elif choice == "1":
+            try:
+                target_n = IntPrompt.ask("[bold green]?[/] Berapa jumlah proxy aktif yang ingin dikumpulkan?", default=50)
+            except Exception:
+                target_n = 50
+            FreeProxyScraper.scrape_and_update(target_count=target_n, output_file="proxies.txt")
+            default_proxy_manager.load_proxies()
+
+        elif choice == "2":
+            if not mgr.has_proxies:
+                console.print("[yellow]File 'proxies.txt' kosong. Tidak ada proxy yang dapat diuji.[/]")
+                continue
+
+            console.print(f"\n[cyan]Menguji konektivitas {min(len(mgr.parsed_proxies), 15)} proxy pertama...[/]")
+            table = Table(title="Hasil Diagnostik Proxy")
+            table.add_column("No", style="dim", width=4)
+            table.add_column("Proxy URL", style="bold cyan")
+            table.add_column("Target API", style="bold")
+            table.add_column("Latency", style="yellow")
+            table.add_column("Catatan", style="dim")
+
+            for idx, p_item in enumerate(mgr.parsed_proxies[:15], start=1):
+                res = mgr.test_proxy(proxy_url=p_item.raw_url)
+                if res["success"]:
+                    table.add_row(
+                        str(idx),
+                        p_item.get_masked_url(),
+                        "[bold green]200 OK[/]",
+                        f"{res['latency_ms']} ms",
+                        res.get("country") or "OK",
+                    )
+                else:
+                    table.add_row(
+                        str(idx),
+                        p_item.get_masked_url(),
+                        "[bold red]FAIL[/]",
+                        f"{res['latency_ms']} ms",
+                        str(res.get("error", "Error"))[:30],
+                    )
+
+            console.print(table)
+
+        elif choice == "3":
+            manual_proxy = Prompt.ask("[bold green]?[/] Masukkan URL Proxy (contoh: http://ip:port atau socks5://ip:port)").strip()
+            if manual_proxy:
+                current_lines = [p.raw_url for p in mgr.parsed_proxies]
+                if manual_proxy not in current_lines:
+                    current_lines.insert(0, manual_proxy)
+                    mgr.save_proxies(current_lines)
+                    default_proxy_manager.load_proxies()
+                    console.print(f"[bold green][OK] Proxy '{manual_proxy}' berhasil ditambahkan ke 'proxies.txt'![/]")
+                else:
+                    console.print("[yellow]Proxy tersebut sudah ada di proxies.txt.[/]")
+
+        elif choice == "4":
+            mgr.clear_proxies()
+            default_proxy_manager.load_proxies()
+            console.print("[bold green][OK] 'proxies.txt' berhasil dikosongkan. Bot akan menggunakan Direct Connection.[/]")
 
 
 if __name__ == "__main__":
-    test_proxy_cli()
+    import sys
+    if "--scrape" in sys.argv or "--free" in sys.argv:
+        count = 50
+        for arg in sys.argv:
+            if arg.isdigit():
+                count = int(arg)
+                break
+        FreeProxyScraper.scrape_and_update(target_count=count)
+    elif "--clear" in sys.argv:
+        default_proxy_manager.clear_proxies()
+        print("[OK] proxies.txt cleared. Using Direct Connection.")
+    elif "--check" in sys.argv:
+        test_proxy_cli()
+    else:
+        test_proxy_cli()
+
