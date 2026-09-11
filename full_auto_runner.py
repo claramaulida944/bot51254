@@ -11,7 +11,9 @@ rotasi proxy cerdas multi-negara, dan tampilan terminal visual interaktif menggu
 """
 
 import asyncio
+import json
 import logging
+import os
 import random
 import secrets
 import time
