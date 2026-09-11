@@ -1306,7 +1306,7 @@ class ReadingSimulationOrchestrator:
             )
         )
         # Pastikan ketersediaan proxy mencukupi sebelum memulai UI Progress
-        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata and not self.proxy_manager.is_hypeproxy:
             self.proxy_manager.ensure_proxies(
                 min_count=max(15, self.total_readers // 2),
                 target_count=max(1000, self.total_readers),
@@ -1633,6 +1633,10 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         proxy_count_str = "Bright Data"
         proxy_desc_str = "Dynamic IP Rotation (1 Sesi = 1 IP Baru Berbeda & Negara Acak)"
         proxy_summary_str = "Bright Data SuperProxy (Rotasi 1 IP Baru per Sesi & Multi-Negara)"
+    elif default_proxy_manager.is_hypeproxy:
+        proxy_count_str = f"{len(default_proxy_manager.parsed_proxies)} Slot"
+        proxy_desc_str = f"HypeProxy API ({len(default_proxy_manager.parsed_proxies)} Slot Aktif • Dynamic IP Rotation)"
+        proxy_summary_str = f"HypeProxy ({len(default_proxy_manager.parsed_proxies)} Slot Dedicated Aktif)"
     elif proxies:
         proxy_count_str = str(len(proxies))
         proxy_desc_str = f"{len(proxies)} IP aktif termuat"

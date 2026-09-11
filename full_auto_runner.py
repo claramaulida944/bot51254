@@ -725,7 +725,7 @@ class FullAutoOrchestrator:
         )
 
         # Pastikan proxy mencukupi jika menggunakan free proxy
-        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata and not self.proxy_manager.is_hypeproxy:
             self.proxy_manager.ensure_proxies(
                 min_count=max(15, total_accounts // 2),
                 target_count=max(1000, total_accounts),

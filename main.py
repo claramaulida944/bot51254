@@ -99,6 +99,8 @@ def render_dashboard_stats() -> None:
     if mgr.has_proxies:
         if mgr.is_brightdata:
             proxy_status = f"Bright Data ISP (Dynamic Geo)"
+        elif mgr.is_hypeproxy:
+            proxy_status = f"HypeProxy ({len(mgr.parsed_proxies)} Slot Aktif • Auto-Rotate)"
         else:
             proxy_status = f"{len(mgr.parsed_proxies)} Proxy Aktif"
     else:
@@ -198,7 +200,7 @@ def feature_auto_signup() -> None:
     runner = RegistrationRunner(accounts_file="akun.txt", proxies=proxies)
 
     # Pastikan proxy mencukupi jika menggunakan free proxy
-    if runner.proxy_manager.has_proxies and not runner.proxy_manager.is_brightdata:
+    if runner.proxy_manager.has_proxies and not runner.proxy_manager.is_brightdata and not runner.proxy_manager.is_hypeproxy:
         runner.proxy_manager.ensure_proxies(
             min_count=max(concurrency * 2, 20),
             target_count=max(1000, count * 2),

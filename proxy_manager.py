@@ -1,22 +1,27 @@
 """
 Modul Manajemen & Integrasi Proxy Cerdas (Proxy Manager)
-Khusus dioptimalkan untuk Bright Data ISP / SuperProxy & Standar HTTP/SOCKS5 Proxies.
+Dioptimalkan untuk HypeProxy API (Official Integration) & Bright Data ISP / SuperProxy.
 
 Fitur Unggulan:
-1. Bright Data Dynamic Country Targeting:
+1. HypeProxy API Integration (16 Endpoint Lengkap):
+   - Sinkronisasi otomatis daftar proxy dari HypeProxy API (X-API-Key).
+   - Format koneksi otomatis via `proxy.hypeproxy.site` (207.241.173.98).
+   - Rotasi IP instan on-demand (`POST /api/proxies/:id/rotate`) saat proxy gagal/selesai digunakan.
+   - Manajemen region/negara dinamis (`PATCH /api/proxies/:id/region`).
+   - Monitoring profil, saldo, daftar order, dan perpanjangan masa aktif proxy.
+2. Bright Data Dynamic Country Targeting:
    - Mendeteksi proxy Bright Data (brd.superproxy.io, lum-superproxy.io).
    - Mengubah parameter negara (`-country-{code}`) secara dinamis saat runtime sesuai
-     negara profil akun atau target pembaca (misal: ID -> Indonesia, US -> Amerika Serikat).
-2. HTTP/2 vs HTTP/1.1 Forward Tunnel Safeguard:
+     negara profil akun atau target pembaca.
+3. HTTP/2 vs HTTP/1.1 Forward Tunnel Safeguard:
    - Secara otomatis menyetel `http2=False` saat melalui proxy untuk mencegah timeout/hang
      pada koneksi HTTP CONNECT tunnel.
-3. Health Check & Geo Diagnostics:
-   - Menguji konektivitas ke geo diagnostics (https://geo.brdtest.com/mygeo.json)
-     serta API target (https://api.quarterfull.io).
-4. Multi-format & Fallback:
-   - Mendukung daftar proxy acak dari `proxies.txt` atau direct connection jika kosong.
+4. Health Check & Geo Diagnostics:
+   - Menguji konektivitas ke geo diagnostics serta API target (https://api.quarterfull.io).
 """
 
+import concurrent.futures
+import json
 import logging
 import os
 import random
@@ -26,7 +31,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -37,6 +42,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import httpx
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 logger = logging.getLogger("ProxyManager")
@@ -77,7 +83,7 @@ def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
     """
     Membersihkan dan menormalisasi URL proxy dari format kotor seperti:
     - socks5://40.160.136.215:1080:United States -> socks5://40.160.136.215:1080
-    - http://103.211.103.170:3128:Hong Kong -> http://103.211.103.170:3128
+    - http://user:pass@proxy.hypeproxy.site:1043 -> http://user:pass@proxy.hypeproxy.site:1043
     - 190.238.231.65:1994 -> http://190.238.231.65:1994
     - ip:port:user:pass -> http://user:pass@ip:port
     - user:pass:ip:port -> http://user:pass@ip:port
@@ -100,7 +106,9 @@ def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
 
     if "@" in remainder:
         auth, host_part = remainder.rsplit("@", 1)
-        hp_tokens = host_part.split(":")
+        # Pisahkan host:port dari trailing fragment atau tag
+        host_tokens = host_part.split("#")[0].split("?")[0]
+        hp_tokens = host_tokens.split(":")
         host = hp_tokens[0].strip()
         if len(hp_tokens) > 1 and hp_tokens[1].isdigit() and 1 <= int(hp_tokens[1]) <= 65535:
             return f"{scheme}://{auth}@{host}:{hp_tokens[1]}"
@@ -134,19 +142,21 @@ def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
 
 
 class ProxyInfo:
-    """Menganalisis dan memformat URL proxy."""
+    """Menganalisis, mengidentifikasi, dan memformat URL proxy."""
 
     def __init__(self, raw_url: str):
         cleaned = sanitize_proxy_url(raw_url)
         self.raw_url = cleaned if cleaned else raw_url.strip()
-        self.is_brightdata = False
-        self.scheme = "http"
-        self.username = ""
-        self.password = ""
-        self.host = ""
-        self.port = 44445
-        self.customer = ""
-        self.zone = ""
+        self.is_brightdata: bool = False
+        self.is_hypeproxy: bool = False
+        self.proxy_id: Optional[int] = None
+        self.scheme: str = "http"
+        self.username: str = ""
+        self.password: str = ""
+        self.host: str = ""
+        self.port: int = 80
+        self.customer: str = ""
+        self.zone: str = ""
         self.current_country: Optional[str] = None
         self._parse()
 
@@ -159,7 +169,6 @@ class ProxyInfo:
             url_to_parse = "http://" + url_to_parse
 
         try:
-            # Cegah crash di Python 3.12 jika ada karakter kurung siku '[' atau ']' di username/password
             clean_for_parse = url_to_parse.replace("[", "%5B").replace("]", "%5D")
             parsed = urlparse(clean_for_parse)
             self.scheme = parsed.scheme or "http"
@@ -168,7 +177,6 @@ class ProxyInfo:
             self.username = (parsed.username or "").replace("%5B", "[").replace("%5D", "]")
             self.password = (parsed.password or "").replace("%5B", "[").replace("%5D", "]")
         except Exception:
-            # Fallback regex parsing jika urlparse bawaan Python gagal
             m = re.search(r"^(?P<scheme>[a-zA-Z0-9]+)://(?:(?P<user>[^:]+)(?::(?P<pass>[^@]*))?@)?(?P<host>[^:]+)(?::(?P<port>\d+))?", url_to_parse)
             if m:
                 self.scheme = m.group("scheme") or "http"
@@ -177,21 +185,37 @@ class ProxyInfo:
                 self.host = m.group("host") or ""
                 self.port = int(m.group("port")) if m.group("port") else (44445 if "superproxy.io" in self.host else 80)
 
-        # Deteksi Bright Data
+        # 1. Deteksi Bright Data
         if "superproxy.io" in self.host or "brd-customer" in self.username or "lum-customer" in self.username:
             self.is_brightdata = True
-
             m_cust = re.search(r"(?:brd|lum)-customer-([^-_]+)", self.username)
             if m_cust:
                 self.customer = m_cust.group(1)
-
             m_zone = re.search(r"-zone-([^-:]+)", self.username)
             if m_zone:
                 self.zone = m_zone.group(1)
-
             m_country = re.search(r"-country-([a-zA-Z]{2})", self.username)
             if m_country:
                 self.current_country = m_country.group(1).upper()
+
+        # 2. Deteksi HypeProxy
+        elif "hypeproxy.site" in self.host or "207.241.173.98" in self.host:
+            self.is_hypeproxy = True
+            # Ekstraksi ID proxy dari pola user{ID} (contoh: user41 -> 41)
+            m_uid = re.search(r"^user(\d+)$", self.username, re.IGNORECASE)
+            if m_uid:
+                try:
+                    self.proxy_id = int(m_uid.group(1))
+                except Exception:
+                    self.proxy_id = None
+            else:
+                # Fallback: jika username angka murni atau ada pola id di query
+                m_num = re.search(r"(\d+)", self.username)
+                if m_num:
+                    try:
+                        self.proxy_id = int(m_num.group(1))
+                    except Exception:
+                        self.proxy_id = None
 
     def format_for_country(
         self,
@@ -202,7 +226,7 @@ class ProxyInfo:
         """
         Menghasilkan URL proxy yang ditargetkan ke negara tertentu.
         Jika ini adalah proxy Bright Data, parameter `-country-xx` akan disesuaikan.
-        Jika negara tidak ada di pool ISP (No IPs in selected country), otomatis fallback ke US.
+        Jika ini adalah proxy HypeProxy, region dapat disesuaikan melalui API HypeProxy.
         """
         if not self.is_brightdata:
             return self.raw_url
@@ -210,11 +234,9 @@ class ProxyInfo:
         new_username = self.username
 
         if not country_code or str(country_code).upper() in ("RANDOM", "ALL", "AUTO"):
-            # Rotasi acak dinamis dari seluruh pool 43+ negara aktif Bright Data
             country_code = random.choice(list(BRIGHTDATA_SUPPORTED_COUNTRIES))
 
         target_cc = str(country_code).upper().strip()
-        # Auto-fallback jika negara tidak didukung oleh paket ISP
         if target_cc not in BRIGHTDATA_SUPPORTED_COUNTRIES:
             logger.debug("Negara %s tidak tersedia di pool ISP, fallback ke acak", target_cc)
             target_cc = random.choice(list(BRIGHTDATA_SUPPORTED_COUNTRIES))
@@ -228,7 +250,6 @@ class ProxyInfo:
             else:
                 new_username += f"-country-{target_cc}"
 
-        # Selalu pastikan ada session_id unik per pemanggilan agar IP Bright Data selalu berganti dan terisolasi
         if not session_id:
             session_id = f"sess_{secrets.token_hex(4)}"
 
@@ -258,14 +279,456 @@ class ProxyInfo:
         return clean
 
 
+class HypeProxyClient:
+    """
+    Klien Resmi HypeProxy API untuk Bot Toodat / Quarterfull.
+    Menangani seluruh 16 Endpoint API HypeProxy:
+    - Autentikasi via header `X-API-Key: 93a8c23e03fe412d1c701b4b014688fc`
+    - Proxy Host default: `proxy.hypeproxy.site` (207.241.173.98)
+    - Rotasi IP instan on-demand (`POST /api/proxies/:id/rotate`) saat proxy gagal/selesai digunakan.
+    - Manajemen region/negara dinamis (`PATCH /api/proxies/:id/region`).
+    - Monitoring profil, saldo, daftar order, dan perpanjangan masa aktif proxy.
+    """
+
+    API_KEY: str = "93a8c23e03fe412d1c701b4b014688fc"
+    BASE_URL: str = "https://hypeproxy.site"
+    PROXY_HOST: str = "proxy.hypeproxy.site"
+    DEFAULT_TIMEOUT: float = 12.0
+    _cached_user_id: Optional[str] = None
+
+    @classmethod
+    def get_headers(cls) -> Dict[str, str]:
+        return {
+            "X-API-Key": cls.API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "ToodatBot/3.0 (HypeProxy Integration)",
+        }
+
+    # =========================================================================
+    # 1. PROFILE & BILLING
+    # =========================================================================
+    @classmethod
+    def get_profile(cls) -> Dict[str, Any]:
+        """[Endpoint 1/16] GET /api/user/profile — Mengambil informasi profil pengguna dan saldo."""
+        url = f"{cls.BASE_URL}/api/user/profile"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    data = resp.json()
+                    uid = data.get("user", {}).get("id")
+                    if uid:
+                        cls._cached_user_id = uid
+                    return data
+                return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def get_transactions(cls) -> Dict[str, Any]:
+        """[Endpoint 2/16] GET /api/billing/transactions — Menampilkan riwayat transaksi pembayaran."""
+        url = f"{cls.BASE_URL}/api/billing/transactions"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "status_code": resp.status_code, "data": []}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 2. PROXY MANAGEMENT
+    # =========================================================================
+    @classmethod
+    def get_proxies(cls, user_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        [Endpoint 3/16] GET /api/proxies — Menampilkan daftar proxy yang dimiliki.
+        Jika `user_only`=True, hanya memfilter proxy milik user aktif (berdasarkan profile.userId).
+        """
+        url = f"{cls.BASE_URL}/api/proxies"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code != 200:
+                    logger.error(f"[HypeProxy] Gagal ambil daftar proxy: HTTP {resp.status_code}")
+                    return []
+
+                payload = resp.json()
+                all_proxies = payload.get("proxies", []) if isinstance(payload, dict) else payload
+
+                if not user_only:
+                    return all_proxies
+
+                # Pastikan user_id tersedia
+                if not cls._cached_user_id:
+                    cls.get_profile()
+
+                target_uid = cls._cached_user_id
+                if target_uid:
+                    user_proxies = [p for p in all_proxies if p.get("userId") == target_uid]
+                    if user_proxies:
+                        return user_proxies
+
+                # Jika filter user kosong, kembalikan semua proxy aktif yang connected
+                return [p for p in all_proxies if p.get("status") == "CONNECTED" or p.get("port")]
+        except Exception as exc:
+            logger.error(f"[HypeProxy] Exception get_proxies: {exc}")
+            return []
+
+    @classmethod
+    def get_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
+        """[Endpoint 4/16] GET /api/proxies/:id — Mengambil detail proxy berdasarkan ID."""
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def rotate_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
+        """[Endpoint 5/16] POST /api/proxies/:id/rotate — Melakukan rotasi IP proxy secara instan."""
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/rotate"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.post(url, headers=cls.get_headers())
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"text": resp.text}
+                data["status_code"] = resp.status_code
+                data["success"] = resp.status_code in (200, 201)
+                return data
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    @classmethod
+    def extend_proxy(cls, proxy_id: Union[int, str], days: int = 7) -> Dict[str, Any]:
+        """
+        [Endpoint 6/16] POST /api/proxies/:id/extend — Memperpanjang masa pakai proxy.
+        Body format: {"value": 7}
+        """
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/extend"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.post(url, headers=cls.get_headers(), json={"value": days})
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"text": resp.text}
+                data["status_code"] = resp.status_code
+                return data
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 3. REGION / LOKASI
+    # =========================================================================
+    @classmethod
+    def get_regions(cls) -> Dict[str, Any]:
+        """[Endpoint 7/16] GET /api/regions — Mengambil daftar wilayah/lokasi yang tersedia."""
+        url = f"{cls.BASE_URL}/api/regions"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def check_region(cls, code: str) -> Dict[str, Any]:
+        """[Endpoint 8/16] GET /api/regions/:code — Memeriksa ketersediaan wilayah tertentu."""
+        target_code = code.upper().strip()
+        url = f"{cls.BASE_URL}/api/regions/{target_code}"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+
+        # Fallback memeriksa dari cache/daftar master regions
+        reg_data = cls.get_regions()
+        data = reg_data.get("data", {})
+        available_codes = set(data.get("codes", []))
+        return {
+            "ok": target_code in available_codes,
+            "code": target_code,
+            "available": target_code in available_codes,
+        }
+
+    @classmethod
+    def set_proxy_region(cls, proxy_id: Union[int, str], country_code: str) -> Dict[str, Any]:
+        """
+        [Endpoint 9/16] PATCH /api/proxies/:id/region — Mengubah lokasi/wilayah proxy.
+        Dilengkapi fallback otomatis ke master PATCH /api/proxies/:id jika endpoint subpath 404.
+        """
+        target_country = country_code.upper().strip()
+        headers = cls.get_headers()
+
+        # Coba endpoint dokumentasi: PATCH /api/proxies/:id/region
+        url_region = f"{cls.BASE_URL}/api/proxies/{proxy_id}/region"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url_region, headers=headers, json={"country": target_country})
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+
+        # Fallback ke master slot update: PATCH /api/proxies/:id
+        url_master = f"{cls.BASE_URL}/api/proxies/{proxy_id}"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url_master, headers=headers, json={"country": target_country})
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"status_code": resp.status_code, "text": resp.text}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 4. PROTOCOL & AUTENTIKASI PROXY
+    # =========================================================================
+    @classmethod
+    def set_proxy_protocol(cls, proxy_id: Union[int, str], protocol: str = "http_https") -> Dict[str, Any]:
+        """
+        [Endpoint 10/16] PATCH /api/proxies/:id/protocol — Mengubah protokol proxy (http_https / socks5).
+        """
+        proto_clean = "socks5" if "sock" in protocol.lower() else "http_https"
+        headers = cls.get_headers()
+
+        url_proto = f"{cls.BASE_URL}/api/proxies/{proxy_id}/protocol"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url_proto, headers=headers, json={"proxyType": proto_clean})
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+
+        # Fallback ke master slot update: PATCH /api/proxies/:id
+        url_master = f"{cls.BASE_URL}/api/proxies/{proxy_id}"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url_master, headers=headers, json={"proxyType": proto_clean})
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"status_code": resp.status_code, "text": resp.text}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def set_proxy_auth(cls, proxy_id: Union[int, str], auth_data: Dict[str, Any]) -> Dict[str, Any]:
+        """[Endpoint 11/16] PATCH /api/proxies/:id/auth — Mengubah metode autentikasi proxy."""
+        headers = cls.get_headers()
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/auth"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url, headers=headers, json=auth_data)
+                if resp.status_code == 200:
+                    return resp.json()
+                # Fallback master slot update
+                resp_master = client.patch(f"{cls.BASE_URL}/api/proxies/{proxy_id}", headers=headers, json=auth_data)
+                try:
+                    return resp_master.json()
+                except Exception:
+                    return {"status_code": resp_master.status_code}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 5. POOL / ROUTER
+    # =========================================================================
+    @classmethod
+    def get_proxy_pools(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
+        """[Endpoint 12/16] GET /api/proxies/:id/pools — Mengambil daftar pool yang tersedia untuk proxy."""
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/pools"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "status_code": resp.status_code}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def set_proxy_pool(cls, proxy_id: Union[int, str], pool_data: Dict[str, Any]) -> Dict[str, Any]:
+        """[Endpoint 13/16] PATCH /api/proxies/:id/pool — Memindahkan/mengubah pool proxy."""
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/pool"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.patch(url, headers=cls.get_headers(), json=pool_data)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "status_code": resp.status_code}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 6. ORDER, BILLING & PRODUCTS
+    # =========================================================================
+    @classmethod
+    def get_products(cls) -> List[Dict[str, Any]]:
+        """[Endpoint 14/16] GET /api/products — Mengambil daftar produk proxy yang dapat dibeli."""
+        url = f"{cls.BASE_URL}/api/products"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data if isinstance(data, list) else data.get("products", [])
+                return []
+        except Exception as exc:
+            return []
+
+    @classmethod
+    def get_orders(cls) -> Dict[str, Any]:
+        """[Endpoint 15/16] GET /api/orders — Menampilkan riwayat pesanan pengguna."""
+        url = f"{cls.BASE_URL}/api/orders"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.get(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"ok": False, "data": []}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def create_order(
+        cls,
+        product_id: str,
+        quantity: int = 1,
+        country: str = "AUTO",
+        method: str = "qris",
+    ) -> Dict[str, Any]:
+        """[Endpoint 16/16] POST /api/orders — Membuat pesanan proxy baru."""
+        url = f"{cls.BASE_URL}/api/orders"
+        payload = {
+            "productId": product_id,
+            "quantity": quantity,
+            "country": country,
+            "method": method,
+        }
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.post(url, headers=cls.get_headers(), json=payload)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"status_code": resp.status_code, "text": resp.text}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # =========================================================================
+    # 7. UTILITIES & SINKRONISASI
+    # =========================================================================
+    @classmethod
+    def build_proxy_url(cls, p: Dict[str, Any]) -> Optional[str]:
+        """Mengubah dict proxy dari HypeProxy API menjadi URL standar httpx."""
+        user = p.get("username")
+        pwd = p.get("password")
+        port = p.get("port")
+        if not port or not user:
+            return None
+
+        scheme = "socks5" if p.get("proxyType") == "socks5" else "http"
+        auth_part = f"{user}:{pwd}@" if pwd else f"{user}@"
+        return f"{scheme}://{auth_part}{cls.PROXY_HOST}:{port}"
+
+    @classmethod
+    def fetch_active_proxy_urls(cls, user_only: bool = True) -> List[str]:
+        """Mengambil seluruh proxy aktif dan memformatnya menjadi daftar URL valid."""
+        proxies_data = cls.get_proxies(user_only=user_only)
+        urls: List[str] = []
+        for p in proxies_data:
+            url = cls.build_proxy_url(p)
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    @classmethod
+    def sync_proxies_to_file(
+        cls,
+        output_file: str = "proxies.txt",
+        user_only: bool = True,
+        verbose: bool = False,
+    ) -> List[str]:
+        """
+        Mengambil proxy aktif dari HypeProxy API dan menyimpannya langsung ke proxies.txt.
+        Menggantikan alur lama scraping proxy gratisan.
+        """
+        if verbose:
+            console.print("\n[bold cyan]>>> Mengambil Daftar Proxy Aktif dari HypeProxy API...[/]")
+
+        urls = cls.fetch_active_proxy_urls(user_only=user_only)
+        if not urls and user_only:
+            # Jika proxy user kosong, ambil dari pool seluruh proxy aktif yang tersedia
+            urls = cls.fetch_active_proxy_urls(user_only=False)
+
+        if not urls:
+            if verbose:
+                console.print("[red]⚠️ Gagal mendapatkan proxy dari HypeProxy API. Periksa API Key atau saldo akun.[/]")
+            return []
+
+        # Tulis ke berkas
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write("# =============================================================================\n")
+                f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL\n")
+                f.write("# Diperbarui secara otomatis melalui HypeProxy API (https://hypeproxy.site)\n")
+                f.write(f"# Total Proxy Aktif: {len(urls)}\n")
+                f.write("# =============================================================================\n\n")
+                for u in urls:
+                    f.write(f"{u}\n")
+
+            if verbose:
+                console.print(f"[bold green][OK] Berhasil menyinkronkan {len(urls)} proxy HypeProxy ke '{output_file}'![/]")
+        except Exception as exc:
+            logger.error(f"Gagal menulis {output_file}: {exc}")
+
+        return urls
+
+    @classmethod
+    def rotate_all_user_proxies(cls) -> Dict[str, Any]:
+        """Melakukan rotasi IP serentak ke seluruh slot proxy milik user."""
+        proxies = cls.get_proxies(user_only=True)
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            fut_map = {
+                executor.submit(cls.rotate_proxy, p["id"]): p["id"]
+                for p in proxies
+                if p.get("id")
+            }
+            for fut in concurrent.futures.as_completed(fut_map):
+                pid = fut_map[fut]
+                try:
+                    res = fut.result()
+                    results[str(pid)] = res.get("success", True)
+                except Exception as e:
+                    results[str(pid)] = False
+        return results
+
+
 class ProxyManager:
-    """Manajer Proxy Tunggal untuk seluruh Bot dengan Auto-Replenish & Auto-Prune."""
+    """Manajer Proxy Tunggal untuk seluruh Bot dengan Auto-Replenish & Auto-Rotate."""
 
     def __init__(
         self,
         proxy_file: str = "proxies.txt",
         auto_replenish: bool = True,
-        min_replenish_threshold: int = 15,
+        min_replenish_threshold: int = 2,
         verbose: bool = False,
     ):
         self.proxy_file = Path(proxy_file)
@@ -284,7 +747,8 @@ class ProxyManager:
             with open(self.proxy_file, "w", encoding="utf-8") as f:
                 f.write("# =============================================================================\n")
                 f.write("# DAFTAR PROXY BOT TOODAT / QUARTERFULL\n")
-                f.write("# Diperbarui secara otomatis melalui FreeProxyScraper (ProxyScrape & Top Sources)\n")
+                f.write("# Diperbarui secara otomatis melalui HypeProxy API (https://hypeproxy.site)\n")
+                f.write(f"# Total Proxy: {len(proxy_list)}\n")
                 f.write("# =============================================================================\n\n")
                 for px in proxy_list:
                     clean = px.strip()
@@ -308,11 +772,9 @@ class ProxyManager:
                     if not line or line.startswith("#"):
                         continue
 
-                    # Cek jika baris masih berupa placeholder template
                     if any(p in line.lower() for p in ["[replace", "<replace", "[password]", "<password>"]):
                         logger.warning(
-                            f"⚠️ Baris di {self.proxy_file.name} masih berupa placeholder / belum diisi password: "
-                            f"'{line}'. Silakan ganti '[replace with password]' dengan password zona Bright Data Anda yang sebenarnya."
+                            f"⚠️ Baris di {self.proxy_file.name} masih berupa placeholder: '{line}'"
                         )
                         continue
 
@@ -336,15 +798,19 @@ class ProxyManager:
         with self._lock:
             return any(p.is_brightdata for p in self.parsed_proxies)
 
-    def ensure_proxies(self, min_count: int = 15, target_count: int = 1000) -> int:
+    @property
+    def is_hypeproxy(self) -> bool:
+        with self._lock:
+            return any(p.is_hypeproxy for p in self.parsed_proxies)
+
+    def ensure_proxies(self, min_count: int = 2, target_count: int = 10) -> int:
         """
         Memastikan ketersediaan proxy aktif minimal `min_count`.
-        Jika proxy di memory/file kurang dari `min_count` dan bukan Bright Data,
-        secara otomatis mengambil proxy baru secara instan tanpa validasi lambat.
+        Jika proxy kosong atau kurang dari `min_count` dan bukan Bright Data,
+        secara otomatis menyinkronkan proxy aktif dari HypeProxy API.
         """
         with self._lock:
-            # Jika sudah ada proxy Bright Data, gateway selalu aktif dan tidak butuh auto-scrape
-            if self.is_brightdata:
+            if self.is_brightdata or (self.is_hypeproxy and len(self.parsed_proxies) > 0):
                 return len(self.parsed_proxies)
 
             if len(self.parsed_proxies) >= min_count:
@@ -352,36 +818,37 @@ class ProxyManager:
 
             if self.verbose:
                 console.print(
-                    f"\n[bold magenta][AUTO-REPLENISH] Sisa proxy ({len(self.parsed_proxies)}) menipis / habis (min: {min_count}).[/] "
-                    f"[yellow]Mengambil {target_count} proxy baru secara instan...[/]"
+                    f"\n[bold magenta][HYPEPROXY-SYNC] Sinkronisasi proxy aktif dari HypeProxy API...[/]"
                 )
             try:
-                FreeProxyScraper.scrape_fast(
-                    target_count=target_count,
+                HypeProxyClient.sync_proxies_to_file(
                     output_file=str(self.proxy_file),
-                    append=True,
+                    user_only=True,
                     verbose=self.verbose,
                 )
                 self.load_proxies()
                 if self.verbose:
-                    console.print(f"[bold green][AUTO-REPLENISH] Selesai! {len(self.parsed_proxies)} proxy baru siap diantrekan.[/]\n")
+                    console.print(
+                        f"[bold green][HYPEPROXY-SYNC] Selesai! {len(self.parsed_proxies)} proxy HypeProxy siap digunakan.[/]\n"
+                    )
                 return len(self.parsed_proxies)
             except Exception as exc:
-                logger.error(f"[Auto-Replenish] Gagal scraping proxy otomatis: {exc}")
+                logger.error(f"[HypeProxy-Sync] Gagal sinkronisasi proxy otomatis: {exc}")
                 return len(self.parsed_proxies)
 
     def remove_proxy(self, proxy_url: Optional[str], reason: str = "failed") -> bool:
         """
-        Menghapus proxy dari memory dan file proxies.txt secara thread-safe.
-        Jika proxy merupakan Bright Data SuperProxy, tidak dihapus jika reason=='used',
-        namun jika reason=='failed' (misal akun suspended / 407), tetap dapat diproses jika diinginkan.
+        Menangani proxy saat gagal (failed) atau selesai digunakan (used).
+        - Pada HypeProxy: slot tidak dihapus, melainkan memicu rotasi IP instan via API!
+        - Pada Bright Data: gateway tidak dihapus karena bersifat dynamic session.
+        - Pada Legacy Free Proxy: dihapus dari antrean file.
         """
         if not proxy_url:
             return False
 
         with self._lock:
             target_raw = proxy_url.strip()
-            p_to_remove: Optional[ProxyInfo] = None
+            p_found: Optional[ProxyInfo] = None
 
             try:
                 target_parsed = urlparse(target_raw if "://" in target_raw else f"http://{target_raw}")
@@ -393,51 +860,64 @@ class ProxyManager:
 
             for p in self.parsed_proxies:
                 if p.raw_url == target_raw:
-                    p_to_remove = p
+                    p_found = p
                     break
                 if target_host and p.host == target_host and (target_port is None or p.port == target_port):
-                    p_to_remove = p
+                    p_found = p
                     break
 
-            if not p_to_remove:
+            if not p_found:
                 return False
 
-            # Bright Data gateway tidak dihapus saat "used" karena dirancang reusable dengan dynamic session
-            if p_to_remove.is_brightdata and reason == "used":
+            masked = p_found.get_masked_url()
+
+            # 1. Penanganan Khusus HypeProxy: ROTASI IP, JANGAN HAPUS SLOT
+            if p_found.is_hypeproxy:
+                if p_found.proxy_id:
+                    # Picu rotasi IP instan di thread terpisah agar pemanggil tidak terblokir
+                    threading.Thread(
+                        target=HypeProxyClient.rotate_proxy,
+                        args=(p_found.proxy_id,),
+                        daemon=True,
+                    ).start()
+
+                if reason == "failed":
+                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id or masked} mengalami error/blokir -> Memicu ROTASI IP instan.")
+                    if self.verbose:
+                        console.print(f"[dim yellow][HYPEPROXY-ROTATE] Slot #{p_found.proxy_id} otomatis dirotasi IP baru![/]")
+                elif reason == "used":
+                    logger.info(f"[HypeProxy] Slot #{p_found.proxy_id or masked} selesai digunakan.")
+                return True
+
+            # 2. Penanganan Bright Data
+            if p_found.is_brightdata and reason == "used":
                 return False
 
-            if p_to_remove in self.parsed_proxies:
-                self.parsed_proxies.remove(p_to_remove)
-            if p_to_remove.raw_url in self.raw_proxies:
-                self.raw_proxies.remove(p_to_remove.raw_url)
+            # 3. Penanganan Free Proxy Biasa (Non-HypeProxy)
+            if p_found in self.parsed_proxies:
+                self.parsed_proxies.remove(p_found)
+            if p_found.raw_url in self.raw_proxies:
+                self.raw_proxies.remove(p_found.raw_url)
 
-            # Simpan pembaruan ke proxies.txt
             self._write_to_file([p.raw_url for p in self.parsed_proxies])
-
-            masked = p_to_remove.get_masked_url()
             sisa = len(self.parsed_proxies)
-            if reason == "failed":
-                logger.warning(f"[-] [ProxyManager] Proxy mati/gagal konek otomatis DIHAPUS: {masked} (Sisa: {sisa})")
-                if self.verbose:
-                    console.print(f"[dim red][DEL] Proxy mati dihapus:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
-            elif reason == "used":
-                logger.info(f"[+] [ProxyManager] Proxy selesai dipakai & DIHAPUS dari antrean: {masked} (Sisa: {sisa})")
-                if self.verbose:
-                    console.print(f"[dim yellow][USED] Proxy selesai digunakan & dilepas:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
 
-            # Auto-replenish jika kuota habis/menipis
+            if reason == "failed":
+                logger.warning(f"[-] [ProxyManager] Proxy dihapus: {masked} (Sisa: {sisa})")
+            elif reason == "used":
+                logger.info(f"[+] [ProxyManager] Proxy selesai dipakai: {masked} (Sisa: {sisa})")
+
             if self._auto_replenish and not self.is_brightdata and sisa < self._min_replenish_threshold:
-                # Jalankan replenish di thread terpisah agar pemanggil tidak terblokir lama jika sedang dalam eksekusi
-                threading.Thread(target=self.ensure_proxies, args=(self._min_replenish_threshold, 30), daemon=True).start()
+                threading.Thread(target=self.ensure_proxies, args=(self._min_replenish_threshold, 10), daemon=True).start()
 
             return True
 
     def mark_failed(self, proxy_url: Optional[str], error: Optional[Any] = None) -> bool:
-        """Menandai dan menghapus proxy yang gagal konek / mati / error dari antrean dan file."""
+        """Menandai proxy yang gagal konek / error. Pada HypeProxy memicu rotasi IP instan."""
         return self.remove_proxy(proxy_url, reason="failed")
 
     def mark_used(self, proxy_url: Optional[str]) -> bool:
-        """Menandai dan menghapus proxy yang telah selesai digunakan (free proxy consumed)."""
+        """Menandai proxy yang selesai digunakan."""
         return self.remove_proxy(proxy_url, reason="used")
 
     def pop_proxy(
@@ -447,34 +927,45 @@ class ProxyManager:
         auto_replenish: bool = True,
     ) -> Optional[str]:
         """
-        Mengambil proxy dan LANGSUNG mengeluarkannya dari antrean dan berkas proxies.txt (khusus free proxy).
-        Menjamin 1 proxy hanya dipakai oleh 1 sesi dan tidak akan pernah digunakan kembali.
-        Jika Bright Data, tidak dihapus dari berkas karena merupakan gateway rotasi dinamis.
+        Mengambil proxy untuk satu sesi kerja:
+        - Jika HypeProxy atau Bright Data: mengambil slot secara round-robin tanpa menghapus slot dari berkas.
+        - Jika negara diminta dan berbeda pada HypeProxy, region dapat disesuaikan otomatis.
         """
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
-                self.ensure_proxies(min_count=1, target_count=1000)
+                self.ensure_proxies(min_count=1, target_count=10)
 
             if not self.parsed_proxies:
                 return None
 
+            # HypeProxy dan Bright Data berputar terus menerus (round-robin)
+            if self.is_brightdata or self.is_hypeproxy:
+                proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+                self._current_index += 1
+
+                if proxy_info.is_brightdata:
+                    return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
+
+                if proxy_info.is_hypeproxy and country_code and country_code.upper() not in ("RANDOM", "ALL", "AUTO"):
+                    # Sesuaikan region proxy jika diperlukan
+                    if proxy_info.proxy_id and proxy_info.current_country != country_code.upper():
+                        threading.Thread(
+                            target=HypeProxyClient.set_proxy_region,
+                            args=(proxy_info.proxy_id, country_code.upper()),
+                            daemon=True,
+                        ).start()
+                        proxy_info.current_country = country_code.upper()
+
+                return proxy_info.raw_url
+
+            # Legacy free proxy (single-use)
             proxy_info = self.parsed_proxies.pop(0)
             if proxy_info.raw_url in self.raw_proxies:
                 self.raw_proxies.remove(proxy_info.raw_url)
+            self._write_to_file([p.raw_url for p in self.parsed_proxies])
 
-            # Jika bukan Bright Data, simpan ke berkas agar tidak pernah dipakai lagi
-            if not proxy_info.is_brightdata:
-                self._write_to_file([p.raw_url for p in self.parsed_proxies])
-            else:
-                # Bright Data gateway dikembalikan ke pool
-                self.parsed_proxies.append(proxy_info)
-
-            # Auto-replenish jika sisa proxy menipis di bawah batas minimum
-            if auto_replenish and not self.is_brightdata and len(self.parsed_proxies) < self._min_replenish_threshold:
-                threading.Thread(target=self.ensure_proxies, args=(self._min_replenish_threshold, 1000), daemon=True).start()
-
-            if proxy_info.is_brightdata:
-                return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
+            if auto_replenish and len(self.parsed_proxies) < self._min_replenish_threshold:
+                threading.Thread(target=self.ensure_proxies, daemon=True).start()
 
             return proxy_info.raw_url
 
@@ -484,14 +975,10 @@ class ProxyManager:
         session_id: Optional[str] = None,
         auto_replenish: bool = True,
     ) -> Optional[str]:
-        """
-        Mengambil proxy berikutnya.
-        Jika proxy kosong dan auto_replenish=True, otomatis mengambil proxy gratis baru.
-        Jika proxy merupakan Bright Data, otomatis ditargetkan ke `country_code`.
-        """
+        """Mengambil proxy berikutnya secara round-robin."""
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
-                self.ensure_proxies(min_count=1, target_count=30)
+                self.ensure_proxies(min_count=1)
 
             if not self.parsed_proxies:
                 return None
@@ -512,14 +999,22 @@ class ProxyManager:
             return self.parsed_proxies[0].get_base_url()
 
     def get_alternate_proxy(self, failed_country: Optional[str] = None) -> Optional[str]:
-        """Mengambil proxy dari negara lain secara dinamis dan acak."""
-        candidates = ["ID", "GB", "DE", "JP", "FR", "AU", "CA", "SG", "NL", "ES", "IT", "KR", "US"]
-        random.shuffle(candidates)
-        for cc in candidates:
-            if failed_country and cc.upper() == failed_country.upper():
-                continue
-            return self.get_proxy(country_code=cc, session_id=f"alt_{secrets.token_hex(4)}")
-        return self.get_proxy(country_code=random.choice(candidates), session_id=f"alt_{secrets.token_hex(4)}")
+        """Mengambil proxy dari slot lain secara dinamis."""
+        with self._lock:
+            if not self.parsed_proxies:
+                return None
+            # Ambil slot acak dari daftar
+            p = random.choice(self.parsed_proxies)
+            if p.is_brightdata:
+                candidates = ["ID", "GB", "DE", "JP", "FR", "AU", "CA", "SG", "NL", "ES", "IT", "KR", "US"]
+                random.shuffle(candidates)
+                cc = [c for c in candidates if c != failed_country][0]
+                return p.format_for_country(country_code=cc, session_id=f"alt_{secrets.token_hex(4)}")
+            elif p.is_hypeproxy and p.proxy_id:
+                # Picu rotasi pada slot ini agar exit IP berganti
+                threading.Thread(target=HypeProxyClient.rotate_proxy, args=(p.proxy_id,), daemon=True).start()
+                return p.raw_url
+            return p.raw_url
 
     @staticmethod
     def get_client_kwargs(
@@ -551,9 +1046,7 @@ class ProxyManager:
         proxy_url: Optional[str] = None,
         country_code: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Menguji koneksi proxy ke Bright Data Geo JSON & Target API.
-        """
+        """Menguji koneksi proxy ke Geo Diagnostics & Quarterfull API."""
         target_proxy = proxy_url or self.get_proxy(country_code=country_code)
 
         result: Dict[str, Any] = {
@@ -576,22 +1069,15 @@ class ProxyManager:
         start_time = time.time()
         try:
             with httpx.Client(proxy=target_proxy, http2=False, timeout=8.0) as client:
-                # 1. Cek Geo Diagnostic JSON (opsional jika proxy standar)
                 try:
-                    geo_resp = client.get("https://geo.brdtest.com/mygeo.json", timeout=3.0)
-                    if geo_resp.status_code == 200:
-                        geo_data = geo_resp.json()
-                        result["country"] = geo_data.get("country")
-                        geo = geo_data.get("geo", {})
-                        result["region"] = geo.get("region") or geo.get("region_name")
-                        result["city"] = geo.get("city")
-                        asn = geo_data.get("asn", {})
-                        result["asn"] = asn.get("org_name")
+                    ip_resp = client.get("https://api.ipify.org?format=json", timeout=4.0)
+                    if ip_resp.status_code == 200:
+                        result["ip"] = ip_resp.json().get("ip")
                 except Exception:
                     pass
 
-                # 2. Cek Endpoint Quarterfull API
-                api_resp = client.get("https://api.quarterfull.io/api/auth/app-version", timeout=4.0)
+                # Cek Endpoint Quarterfull API
+                api_resp = client.get("https://api.quarterfull.io/api/auth/app-version", timeout=5.0)
                 if api_resp.status_code == 200:
                     result["target_api_ok"] = True
                     result["success"] = True
@@ -608,13 +1094,13 @@ class ProxyManager:
         return result
 
     def save_proxies(self, proxy_list: List[str]) -> None:
-        """Menyimpan daftar proxy ke proxies.txt dan memuat ulang instance secara thread-safe."""
+        """Menyimpan daftar proxy ke berkas dan memuat ulang instance."""
         with self._lock:
             self._write_to_file(proxy_list)
             self.load_proxies()
 
     def clear_proxies(self) -> None:
-        """Mengosongkan daftar proxy agar bot menggunakan Direct Connection secara thread-safe."""
+        """Mengosongkan daftar proxy agar bot menggunakan Direct Connection."""
         with self._lock:
             self._write_to_file([])
             self.load_proxies()
@@ -622,193 +1108,10 @@ class ProxyManager:
 
 class FreeProxyScraper:
     """
-    Scraper & Validator Proxy Gratis Multi-Source Berkecepatan Tinggi.
-    Mengambil ribuan proxy dari ProxyScrape (v4 API) dan sumber terverifikasi,
-    memvalidasi konektivitasnya langsung ke API target (https://api.quarterfull.io),
-    serta menyimpan proxy yang aktif ke proxies.txt.
+    Kelas pembungkus kompatibilitas mundur (backward-compatibility alias).
+    Mengarahkan seluruh pemanggilan fungsi lama (scrape_fast, scrape_and_update)
+    secara otomatis ke HypeProxyClient.
     """
-
-    SOURCES: List[Tuple[str, str]] = [
-        # 1. Sumber Utama: ProxyScrape v4 API (Format protocol:ip:port HTTP & SOCKS5)
-        (
-            "ProxyScrape v4",
-            "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-        ),
-        # 2. Monosans Proxy List (Update tiap 15 menit, GitHub Terverifikasi)
-        (
-            "monosans/proxy-list",
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
-        ),
-        # 3. Hookzof SOCKS5 List (Kualitas tinggi, latency rendah)
-        (
-            "hookzof/socks5",
-            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-        ),
-        # 4. TheSpeedX SOCKS-List (HTTP & SOCKS5)
-        (
-            "SpeedX/HTTP",
-            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-        ),
-        (
-            "SpeedX/SOCKS5",
-            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-        ),
-        # 5. Proxifly Free Proxy List (Multi-region)
-        (
-            "proxifly/all",
-            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-        ),
-        # 6. Roosterkid OpenProxyList (HTTPS & SOCKS5)
-        (
-            "roosterkid/HTTPS",
-            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-        ),
-        (
-            "roosterkid/SOCKS5",
-            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-        ),
-        # 7. HideIP.me Live Proxies
-        (
-            "hideip/HTTP",
-            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
-        ),
-        (
-            "hideip/SOCKS5",
-            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
-        ),
-    ]
-
-    TARGET_TEST_URL = "https://api.quarterfull.io/api/auth/app-version"
-
-    @classmethod
-    def scrape_candidates(cls, max_sources: Optional[int] = None) -> List[str]:
-        """
-        Mengunduh seluruh daftar kandidat dari ProxyScrape dan curated repo.
-        Memfilter protocol yang tidak didukung httpx (socks4://) dan menormalisasi format.
-        """
-        candidates: List[str] = []
-        seen = set()
-        sources_to_use = cls.SOURCES[:max_sources] if max_sources else cls.SOURCES
-
-        with httpx.Client(timeout=10.0) as client:
-            for name, url in sources_to_use:
-                try:
-                    resp = client.get(url)
-                    if resp.status_code != 200:
-                        continue
-                    count = 0
-                    for raw_line in resp.text.splitlines():
-                        cleaned_line = sanitize_proxy_url(raw_line)
-                        if not cleaned_line:
-                            continue
-
-                        if cleaned_line not in seen:
-                            seen.add(cleaned_line)
-                            candidates.append(cleaned_line)
-                            count += 1
-                    logger.info("Sumber [%s]: menemukan %d kandidat", name, count)
-                except Exception as exc:
-                    logger.debug("Gagal fetch dari %s: %s", name, exc)
-
-        return candidates
-
-    @classmethod
-    def test_single_proxy(
-        cls,
-        proxy_url: str,
-        timeout: float = 2.5,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Menguji satu proxy secara independen langsung ke Quarterfull API.
-        Mengembalikan Dict informasi jika sukses HTTP 200, atau None jika gagal/timeout.
-        """
-        try:
-            t0 = time.time()
-            with httpx.Client(proxy=proxy_url, timeout=timeout, http2=False) as client:
-                resp = client.get(cls.TARGET_TEST_URL)
-                if resp.status_code == 200:
-                    latency = round((time.time() - t0) * 1000, 1)
-                    return {
-                        "proxy": proxy_url,
-                        "latency_ms": latency,
-                        "status": resp.status_code,
-                    }
-        except Exception:
-            pass
-        return None
-
-    @classmethod
-    def validate_batch(
-        cls,
-        candidates: List[str],
-        target_count: int = 50,
-        max_workers: int = 80,
-        timeout: float = 2.2,
-    ) -> List[Dict[str, Any]]:
-        """
-        Memvalidasi sekumpulan kandidat proxy secara konkuren menggunakan ThreadPoolExecutor.
-        Mengalirkan kandidat secara kontinyu dan berhenti seketika saat kuota target_count terpenuhi.
-        """
-        import concurrent.futures
-
-        verified: List[Dict[str, Any]] = []
-        tested_count = 0
-        cand_iter = iter(candidates)
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        futures: Dict[concurrent.futures.Future, str] = {}
-
-        try:
-            # Isi awal pool sejumlah max_workers * 2
-            for _ in range(min(len(candidates), max_workers * 2)):
-                try:
-                    p = next(cand_iter)
-                    fut = executor.submit(cls.test_single_proxy, p, timeout)
-                    futures[fut] = p
-                except StopIteration:
-                    break
-
-            while futures and len(verified) < target_count:
-                done, _ = concurrent.futures.wait(
-                    list(futures.keys()),
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                for fut in done:
-                    p_tested = futures.pop(fut, None)
-                    tested_count += 1
-                    try:
-                        res = fut.result()
-                        if res:
-                            verified.append(res)
-                            console.print(
-                                f"  [bold green][ALIVE][/] #{len(verified)}/{target_count}: "
-                                f"[cyan]{res['proxy']}[/] [yellow]({res['latency_ms']} ms)[/]"
-                            )
-                            if len(verified) >= target_count:
-                                break
-                    except Exception:
-                        pass
-
-                    # Tambahkan kandidat berikutnya ke executor jika kuota belum penuh
-                    if len(verified) < target_count:
-                        try:
-                            next_p = next(cand_iter)
-                            new_fut = executor.submit(cls.test_single_proxy, next_p, timeout)
-                            futures[new_fut] = next_p
-                        except StopIteration:
-                            pass
-
-        finally:
-            for f in list(futures.keys()):
-                f.cancel()
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                executor.shutdown(wait=False)
-
-        # Urutkan berdasarkan latency tercepat
-        verified.sort(key=lambda x: x.get("latency_ms", 9999))
-        return verified
 
     @classmethod
     def scrape_fast(
@@ -818,37 +1121,7 @@ class FreeProxyScraper:
         append: bool = False,
         verbose: bool = False,
     ) -> List[str]:
-        """
-        Pengambilan proxy instan super cepat TANPA validasi lambat sebelumnya.
-        Mengambil ribuan proxy dari seluruh curated sources, mengacak urutannya,
-        dan langsung menyimpannya ke berkas dalam 2-3 detik.
-        Validasi dilakukan secara dinamis (on-the-fly) saat bot berjalan.
-        """
-        if verbose:
-            console.print(f"\n[bold cyan]>>> Mengambil {target_count:,} Proxy secara Instan (Tanpa Validasi Awal)...[/]")
-        candidates = cls.scrape_candidates()
-        if not candidates:
-            if verbose:
-                console.print("[red]Gagal mengambil daftar proxy dari sumber.[/]")
-            return []
-
-        random.shuffle(candidates)
-        selected = candidates[:target_count]
-
-        mgr = ProxyManager(output_file, auto_replenish=False, verbose=False)
-        if append and mgr.has_proxies:
-            existing = [p.raw_url for p in mgr.parsed_proxies]
-            merged = existing + [p for p in selected if p not in existing]
-            mgr.save_proxies(merged)
-        else:
-            mgr.save_proxies(selected)
-
-        if verbose:
-            console.print(
-                f"[bold green][OK] Berhasil memuat {len(selected):,} proxy mentah ke '{output_file}' dalam sekejap![/]\n"
-                f"[dim]Proxy mati akan langsung dihapus dan diganti saat sesi berjalan.[/]\n"
-            )
-        return selected
+        return HypeProxyClient.sync_proxies_to_file(output_file=output_file, verbose=verbose)
 
     @classmethod
     def scrape_and_update(
@@ -858,60 +1131,11 @@ class FreeProxyScraper:
         max_workers: int = 80,
         show_table: bool = True,
     ) -> List[str]:
-        """
-        Alur terpadu: Scrape -> Validasi -> Simpan ke proxies.txt.
-        """
-        console.print("\n[bold cyan]>>> Mengambil Kandidat Proxy dari ProxyScrape & Top Sources...[/]")
-        candidates = cls.scrape_candidates()
-        console.print(f"Total kandidat terkumpul: [bold green]{len(candidates):,}[/] alamat proxy unik.")
-
-        if not candidates:
-            console.print("[red]Gagal mengunduh daftar proxy dari semua sumber.[/]")
-            return []
-
-        console.print(f"\n[yellow]Memvalidasi proxy aktif langsung ke Quarterfull API (Target: {target_count} proxy)...[/]\n")
-        verified_data = cls.validate_batch(
-            candidates,
-            target_count=target_count,
-            max_workers=max_workers,
-            timeout=2.2,
-        )
-
-        if not verified_data:
-            console.print("[red]Tidak ada proxy yang merespon dalam batas latency toleransi.[/]")
-            return []
-
-        verified_urls = [item["proxy"] for item in verified_data]
-        mgr = ProxyManager(output_file, auto_replenish=False)
-        mgr.save_proxies(verified_urls)
-
-        console.print(f"\n[bold green][OK] Berhasil menemukan {len(verified_urls)} proxy aktif dan menyimpannya ke '{output_file}'![/]\n")
-
-        if show_table:
-            # Tampilkan tabel preview 10 proxy tercepat
-            table = Table(title=f"Top 10 Proxy Tercepat (dari {len(verified_urls)} Proxy Aktif Terverifikasi)")
-            table.add_column("No", style="dim", width=4)
-            table.add_column("URL Proxy", style="bold cyan")
-            table.add_column("Latency Target API", style="bold yellow")
-            table.add_column("Status", style="green")
-
-            for idx, item in enumerate(verified_data[:10], start=1):
-                table.add_row(
-                    str(idx),
-                    item["proxy"],
-                    f"{item['latency_ms']} ms",
-                    "200 OK (Aktif)",
-                )
-            console.print(table)
-        return verified_urls
+        return HypeProxyClient.sync_proxies_to_file(output_file=output_file, verbose=show_table)
 
 
 def is_dead_or_proxy_error(exc: Optional[Any]) -> bool:
-    """
-    Mengecek secara komprehensif apakah suatu exception diakibatkan oleh proxy mati / gagal koneksi.
-    Mendukung deteksi httpx ProxyError, ConnectError, ConnectTimeout, ReadTimeout, 407, 502/503/504,
-    SOCKS handshake error, connection refused, reset by peer, dll.
-    """
+    """Mengecek secara komprehensif apakah suatu exception diakibatkan oleh proxy mati / gagal koneksi."""
     if exc is None:
         return False
     if isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError)):
@@ -950,30 +1174,51 @@ def get_global_proxy_manager() -> ProxyManager:
 
 
 def test_proxy_cli() -> None:
-    """Antarmuka CLI interaktif untuk manajemen, scraping, dan diagnostik proxy."""
+    """Antarmuka CLI interaktif untuk manajemen, rotasi, profil, dan diagnostik proxy HypeProxy."""
     while True:
-        console.print("\n[bold cyan]=== PUSAT MANAJEMEN & INTEGRASI PROXY (BOT TOODAT) ===[/]\n")
+        console.print("\n[bold cyan]=== PUSAT MANAJEMEN & INTEGRASI PROXY (HYPEPROXY & BOT TOODAT) ===[/]\n")
 
         mgr = ProxyManager("proxies.txt")
         if mgr.has_proxies:
             p_info = mgr.parsed_proxies[0]
-            tipe_str = "Bright Data SuperProxy (ISP)" if p_info.is_brightdata else "Free / Standard HTTP & SOCKS5"
+            if p_info.is_brightdata:
+                tipe_str = "Bright Data SuperProxy (ISP)"
+            elif p_info.is_hypeproxy:
+                tipe_str = "HypeProxy API (Official Integration)"
+            else:
+                tipe_str = "Standard HTTP / SOCKS5 Proxy"
+
             console.print(f"Status: [bold green]{len(mgr.parsed_proxies)} Proxy Terdaftar[/] | Tipe: [bold yellow]{tipe_str}[/]")
             console.print(f"Sample: [dim]{mgr.parsed_proxies[0].get_masked_url()}[/]\n")
-        else:
-            console.print("[yellow]Status: DIRECT CONNECTION (Tanpa Proxy - proxies.txt kosong)[/]\n")
+        console.print(
+            Panel(
+                "[bold green]✓ SISTEM PROXY 100% FULL AUTO-PILOT SUDAH AKTIF![/]\n"
+                "[dim]Anda [bold white]TIDAK PERLU[/] melakukan rotasi IP atau ganti negara manual di menu ini.[/]\n\n"
+                "• [bold cyan]Rotasi IP Otomatis:[/] Bot memutar IP sendiri tiap kali sesi selesai atau kena rate limit.\n"
+                "• [bold cyan]Ganti Negara Otomatis:[/] Proxy otomatis berubah lokasi mengikuti negara akun target.\n"
+                "• [bold cyan]Load Balancing 8 Slot:[/] Ke-8 proxy Anda dibagi bergiliran (Round-Robin) ke tiap thread.\n\n"
+                "[italic yellow]Menu manual di bawah ini HANYA opsi diagnostik jika Anda ingin cek saldo / cek order HypeProxy.[/]",
+                title="[bold green]STATUS OTOMATISASI HYPEPROXY[/]",
+                border_style="green",
+                padding=(0, 1),
+            )
+        )
 
-        console.print("Pilih Aksi:")
-        console.print("  [1] [bold green]Ambil Cepat Proxy Instan[/] (Tanpa Validasi Awal - Default 1.000 Proxy)")
-        console.print("  [2] [bold yellow]Scrape dengan Validasi Awal[/] (ProxyScrape v4 + Health Check)")
-        console.print("  [3] [bold cyan]Uji Diagnostik Seluruh Proxy di proxies.txt[/]")
-        console.print("  [4] [bold white]Input / Tambah Proxy Manual ke proxies.txt[/]")
-        console.print("  [5] [bold red]Kosongkan proxies.txt[/] (Gunakan Direct Connection)")
+        console.print("Menu Diagnostik & Manual (Opsional):")
+        console.print("  [1] [bold green]One-Click Refresh & Rotasi Semua 8 Proxy[/]")
+        console.print("  [2] [bold yellow]Rotasi IP Manual[/] (Semua Slot / Berdasarkan ID)")
+        console.print("  [3] [bold cyan]Cek Profil & Saldo HypeProxy[/]")
+        console.print("  [4] [bold white]Cek Riwayat Pesanan & Order HypeProxy[/]")
+        console.print("  [5] [bold blue]Ubah Negara / Region Proxy Manual[/]")
+        console.print("  [6] [bold magenta]Uji Diagnostik Seluruh Proxy di proxies.txt[/]")
+        console.print("  [7] [bold white]Input / Tambah Proxy Manual ke proxies.txt[/]")
+        console.print("  [8] [bold yellow]Perpanjang Masa Aktif Proxy Slot (Extend)[/]")
+        console.print("  [9] [bold red]Kosongkan proxies.txt[/] (Gunakan Direct Connection)")
         console.print("  [0] Kembali ke Menu Utama\n")
 
         try:
             from rich.prompt import Prompt, IntPrompt
-            choice = Prompt.ask("[bold green]?[/] Pilihan Anda", choices=["0", "1", "2", "3", "4", "5"], default="1")
+            choice = Prompt.ask("[bold green]?[/] Pilihan Anda", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], default="1")
         except (KeyboardInterrupt, EOFError):
             break
 
@@ -981,56 +1226,132 @@ def test_proxy_cli() -> None:
             break
 
         elif choice == "1":
-            try:
-                target_n = IntPrompt.ask("[bold green]?[/] Berapa jumlah proxy yang ingin diambil instan?", default=1000)
-            except Exception:
-                target_n = 1000
-            FreeProxyScraper.scrape_fast(target_count=target_n, output_file="proxies.txt", verbose=True)
+            # One-Click Refresh & Rotasi Semua 8 Proxy
+            console.print("\n[bold cyan]>>> Menyinkronkan daftar proxy dan merotasi IP seluruh 8 slot...[/]")
+            HypeProxyClient.sync_proxies_to_file(output_file="proxies.txt", verbose=True)
+            HypeProxyClient.rotate_all_user_proxies()
             default_proxy_manager.load_proxies()
+            console.print("[bold green]✓ Seluruh 8 Slot Proxy HypeProxy berhasil disinkronkan & dirotasi IP baru![/]\n")
 
         elif choice == "2":
-            try:
-                target_n = IntPrompt.ask("[bold green]?[/] Berapa jumlah proxy aktif yang ingin divalidasi?", default=50)
-            except Exception:
-                target_n = 50
-            FreeProxyScraper.scrape_and_update(target_count=target_n, output_file="proxies.txt")
-            default_proxy_manager.load_proxies()
+            # Rotasi IP Proxy
+            console.print("\nPilih Mode Rotasi IP:")
+            console.print("  [1] Rotasi SEMUA slot proxy aktif")
+            console.print("  [2] Rotasi SATU slot proxy tertentu (input ID)")
+            sub_choice = Prompt.ask("Pilihan", choices=["1", "2"], default="1")
+
+            if sub_choice == "1":
+                console.print("[yellow]Memproses rotasi IP seluruh slot proxy...[/]")
+                res = HypeProxyClient.rotate_all_user_proxies()
+                console.print(f"[bold green]Selesai! {len(res)} slot telah dipicu untuk rotasi IP.[/]")
+            else:
+                pid = Prompt.ask("Masukkan ID Proxy yang ingin dirotasi (contoh: 41)").strip()
+                if pid:
+                    res = HypeProxyClient.rotate_proxy(pid)
+                    if res.get("success", False):
+                        console.print(f"[bold green][OK] Rotasi IP untuk Slot #{pid} berhasil diinisiasi: {res.get('message', 'Sukses')}[/]")
+                    else:
+                        console.print(f"[bold yellow]Respon rotasi Slot #{pid}: {res}[/]")
 
         elif choice == "3":
+            # Profil & Saldo HypeProxy
+            console.print("\n[cyan]Mengambil profil pengguna HypeProxy...[/]")
+            prof = HypeProxyClient.get_profile()
+            if prof.get("ok"):
+                u = prof.get("user", {})
+                t = Table(title="Profil Akun HypeProxy")
+                t.add_column("Parameter", style="bold cyan")
+                t.add_column("Nilai", style="bold green")
+                t.add_row("Username", u.get("username", "-"))
+                t.add_row("Nama", u.get("firstname", "-"))
+                t.add_row("Email", u.get("email", "-"))
+                t.add_row("User ID", u.get("id", "-"))
+                t.add_row("Saldo (Balance)", f"Rp {u.get('balance', 0):,}")
+                t.add_row("Default Country", u.get("defaultCountry", "AUTO"))
+                t.add_row("Terdaftar Sejak", str(u.get("registeredAt", "-"))[:10])
+                console.print(t)
+            else:
+                console.print(f"[red]Gagal mengambil profil: {prof.get('error')}[/]")
+
+        elif choice == "4":
+            # Riwayat Pesanan
+            console.print("\n[cyan]Mengambil riwayat order HypeProxy...[/]")
+            orders_data = HypeProxyClient.get_orders()
+            orders = orders_data.get("data", []) if isinstance(orders_data, dict) else []
+            if orders:
+                t = Table(title=f"Riwayat Pesanan HypeProxy ({len(orders)} Pesanan)")
+                t.add_column("Order ID", style="dim")
+                t.add_column("Produk", style="bold cyan")
+                t.add_column("Tier", style="yellow")
+                t.add_column("Jumlah", style="green")
+                t.add_column("Total Harga", style="bold white")
+                t.add_column("Status", style="bold green")
+                t.add_column("Proxy IDs", style="dim")
+
+                for o in orders:
+                    p_ids = ", ".join(o.get("proxyIds", []))
+                    t.add_row(
+                        str(o.get("id", "-")),
+                        str(o.get("productId", "-")),
+                        str(o.get("tierLabel", "-")),
+                        str(o.get("quantity", 1)),
+                        f"Rp {o.get('totalPrice', 0):,}",
+                        str(o.get("status", "-")).upper(),
+                        p_ids[:30] + ("..." if len(p_ids) > 30 else ""),
+                    )
+                console.print(t)
+            else:
+                console.print("[yellow]Tidak ada data riwayat pesanan.[/]")
+
+        elif choice == "5":
+            # Ubah Negara / Region
+            pid = Prompt.ask("Masukkan ID Proxy yang ingin diubah negaranya (contoh: 41)").strip()
+            cc = Prompt.ask("Masukkan Kode Negara 2 huruf (contoh: ID, US, SG, JP, KR, DE)").strip().upper()
+            if pid and cc:
+                res = HypeProxyClient.set_proxy_region(pid, cc)
+                console.print(f"[bold green]Hasil update region slot #{pid} -> {cc}:[/] {res}")
+
+        elif choice == "6":
+            # Uji Diagnostik Seluruh Proxy
             if not mgr.has_proxies:
                 console.print("[yellow]File 'proxies.txt' kosong. Tidak ada proxy yang dapat diuji.[/]")
                 continue
 
-            console.print(f"\n[cyan]Menguji konektivitas {min(len(mgr.parsed_proxies), 15)} proxy pertama...[/]")
+            test_count = min(len(mgr.parsed_proxies), 15)
+            console.print(f"\n[cyan]Menguji konektivitas {test_count} proxy pertama ke target API...[/]")
             table = Table(title="Hasil Diagnostik Proxy")
             table.add_column("No", style="dim", width=4)
             table.add_column("Proxy URL", style="bold cyan")
+            table.add_column("Exit IP", style="bold yellow")
             table.add_column("Target API", style="bold")
             table.add_column("Latency", style="yellow")
-            table.add_column("Catatan", style="dim")
+            table.add_column("Status", style="dim")
 
-            for idx, p_item in enumerate(mgr.parsed_proxies[:15], start=1):
+            for idx, p_item in enumerate(mgr.parsed_proxies[:test_count], start=1):
                 res = mgr.test_proxy(proxy_url=p_item.raw_url)
                 if res["success"]:
                     table.add_row(
                         str(idx),
                         p_item.get_masked_url(),
+                        res.get("ip") or "-",
                         "[bold green]200 OK[/]",
                         f"{res['latency_ms']} ms",
-                        res.get("country") or "OK",
+                        "[green]Aktif[/]",
                     )
                 else:
                     table.add_row(
                         str(idx),
                         p_item.get_masked_url(),
+                        "-",
                         "[bold red]FAIL[/]",
                         f"{res['latency_ms']} ms",
-                        str(res.get("error", "Error"))[:30],
+                        str(res.get("error", "Error"))[:25],
                     )
 
             console.print(table)
 
-        elif choice == "4":
+        elif choice == "7":
+            # Input manual
             manual_proxy = Prompt.ask("[bold green]?[/] Masukkan URL Proxy (contoh: http://ip:port atau socks5://ip:port)").strip()
             if manual_proxy:
                 current_lines = [p.raw_url for p in mgr.parsed_proxies]
@@ -1042,7 +1363,19 @@ def test_proxy_cli() -> None:
                 else:
                     console.print("[yellow]Proxy tersebut sudah ada di proxies.txt.[/]")
 
-        elif choice == "5":
+        elif choice == "8":
+            # Perpanjang masa aktif proxy
+            pid = Prompt.ask("Masukkan ID Proxy yang ingin diperpanjang (contoh: 41)").strip()
+            try:
+                days = IntPrompt.ask("Berapa hari perpanjangan?", default=7)
+            except Exception:
+                days = 7
+            if pid:
+                res = HypeProxyClient.extend_proxy(pid, days=days)
+                console.print(f"[bold green]Hasil perpanjangan slot #{pid} ({days} hari):[/] {res}")
+
+        elif choice == "9":
+            # Kosongkan proxies.txt
             mgr.clear_proxies()
             default_proxy_manager.load_proxies()
             console.print("[bold green][OK] 'proxies.txt' berhasil dikosongkan. Bot akan menggunakan Direct Connection.[/]")
@@ -1050,13 +1383,17 @@ def test_proxy_cli() -> None:
 
 if __name__ == "__main__":
     import sys
-    if "--scrape" in sys.argv or "--free" in sys.argv:
-        count = 50
-        for arg in sys.argv:
-            if arg.isdigit():
-                count = int(arg)
-                break
-        FreeProxyScraper.scrape_and_update(target_count=count)
+
+    if "--sync" in sys.argv or "--scrape" in sys.argv or "--free" in sys.argv:
+        HypeProxyClient.sync_proxies_to_file(output_file="proxies.txt", verbose=True)
+        default_proxy_manager.load_proxies()
+    elif "--rotate" in sys.argv:
+        print("Memutar IP seluruh proxy...")
+        res = HypeProxyClient.rotate_all_user_proxies()
+        print("Hasil rotasi:", res)
+    elif "--profile" in sys.argv:
+        prof = HypeProxyClient.get_profile()
+        print("Profil HypeProxy:", json.dumps(prof, indent=2))
     elif "--clear" in sys.argv:
         default_proxy_manager.clear_proxies()
         print("[OK] proxies.txt cleared. Using Direct Connection.")
@@ -1064,4 +1401,3 @@ if __name__ == "__main__":
         test_proxy_cli()
     else:
         test_proxy_cli()
-
