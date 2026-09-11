@@ -73,11 +73,72 @@ SUPPORTED_QUARTERFULL_COUNTRIES: Dict[str, Dict[str, str]] = {
 BRIGHTDATA_SUPPORTED_COUNTRIES = set(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
 
 
+def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
+    """
+    Membersihkan dan menormalisasi URL proxy dari format kotor seperti:
+    - socks5://40.160.136.215:1080:United States -> socks5://40.160.136.215:1080
+    - http://103.211.103.170:3128:Hong Kong -> http://103.211.103.170:3128
+    - 190.238.231.65:1994 -> http://190.238.231.65:1994
+    - ip:port:user:pass -> http://user:pass@ip:port
+    - user:pass:ip:port -> http://user:pass@ip:port
+    """
+    raw = (raw_proxy or "").strip()
+    if not raw or raw.startswith("#"):
+        return None
+
+    scheme = "http"
+    if "://" in raw:
+        parts = raw.split("://", 1)
+        scheme = parts[0].lower()
+        remainder = parts[1]
+    else:
+        remainder = raw
+
+    # Jangan dukung protokol tidak kompatibel httpx
+    if scheme in ("socks4", "socks4a"):
+        return None
+
+    if "@" in remainder:
+        auth, host_part = remainder.rsplit("@", 1)
+        hp_tokens = host_part.split(":")
+        host = hp_tokens[0].strip()
+        if len(hp_tokens) > 1 and hp_tokens[1].isdigit() and 1 <= int(hp_tokens[1]) <= 65535:
+            return f"{scheme}://{auth}@{host}:{hp_tokens[1]}"
+        return None
+
+    tokens = remainder.split(":")
+    if len(tokens) == 2:
+        host, port_str = tokens[0].strip(), tokens[1].strip()
+        if port_str.isdigit() and 1 <= int(port_str) <= 65535:
+            return f"{scheme}://{host}:{port_str}"
+    elif len(tokens) >= 3:
+        # Format ip:port:country atau ip:port:user:pass
+        if tokens[1].isdigit() and 1 <= int(tokens[1]) <= 65535:
+            host = tokens[0].strip()
+            port = tokens[1].strip()
+            if len(tokens) == 4 and not any(" " in t for t in tokens[2:]):
+                user, pwd = tokens[2].strip(), tokens[3].strip()
+                return f"{scheme}://{user}:{pwd}@{host}:{port}"
+            return f"{scheme}://{host}:{port}"
+        # Format user:pass:ip:port
+        elif tokens[-1].isdigit() and 1 <= int(tokens[-1]) <= 65535:
+            port = tokens[-1].strip()
+            host = tokens[-2].strip()
+            if len(tokens) >= 4:
+                user = tokens[0].strip()
+                pwd = ":".join(tokens[1:-2]).strip()
+                return f"{scheme}://{user}:{pwd}@{host}:{port}"
+            return f"{scheme}://{host}:{port}"
+
+    return None
+
+
 class ProxyInfo:
     """Menganalisis dan memformat URL proxy."""
 
     def __init__(self, raw_url: str):
-        self.raw_url = raw_url.strip()
+        cleaned = sanitize_proxy_url(raw_url)
+        self.raw_url = cleaned if cleaned else raw_url.strip()
         self.is_brightdata = False
         self.scheme = "http"
         self.username = ""
@@ -258,7 +319,7 @@ class ProxyManager:
                     try:
                         p_info = ProxyInfo(line)
                         if p_info.host:
-                            self.raw_proxies.append(line)
+                            self.raw_proxies.append(p_info.raw_url)
                             self.parsed_proxies.append(p_info)
                     except Exception as exc:
                         logger.warning(f"⚠️ Gagal membaca format proxy '{line}': {exc}")
@@ -637,19 +698,13 @@ class FreeProxyScraper:
                         continue
                     count = 0
                     for raw_line in resp.text.splitlines():
-                        line = raw_line.strip()
-                        if not line or line.startswith("#") or line.startswith("socks4"):
+                        cleaned_line = sanitize_proxy_url(raw_line)
+                        if not cleaned_line:
                             continue
-                        # Normalisasi skema jika belum ada
-                        if "://" not in line:
-                            if "socks5" in url.lower():
-                                line = f"socks5://{line}"
-                            else:
-                                line = f"http://{line}"
 
-                        if line not in seen:
-                            seen.add(line)
-                            candidates.append(line)
+                        if cleaned_line not in seen:
+                            seen.add(cleaned_line)
+                            candidates.append(cleaned_line)
                             count += 1
                     logger.info("Sumber [%s]: menemukan %d kandidat", name, count)
                 except Exception as exc:

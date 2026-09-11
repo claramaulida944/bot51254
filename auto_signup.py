@@ -48,7 +48,7 @@ from faker import Faker
 import httpx
 
 from session_manager import IdentifierGenerator
-from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager, is_dead_or_proxy_error
+from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager, is_dead_or_proxy_error, sanitize_proxy_url
 
 # Konfigurasi logging
 logger = logging.getLogger("AutoSignup")
@@ -636,18 +636,16 @@ def resolve_signup_market_country(country_code: str) -> str:
 
 
 def load_proxies_if_available(file_path: str = "proxies.txt") -> List[str]:
-    """Membaca daftar proxy dari file jika tersedia."""
+    """Membaca daftar proxy dari file jika tersedia dan membersihkan format kotor."""
     p = Path(file_path)
     if not p.exists():
         return []
     proxies = []
     with open(p, "r", encoding="utf-8") as f:
         for line in f:
-            px = line.strip()
-            if px and not px.startswith("#"):
-                if not (px.startswith("http://") or px.startswith("https://") or px.startswith("socks5://")):
-                    px = f"http://{px}"
-                proxies.append(px)
+            cleaned = sanitize_proxy_url(line)
+            if cleaned:
+                proxies.append(cleaned)
     return proxies
 
 

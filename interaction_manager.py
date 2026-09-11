@@ -48,6 +48,7 @@ from proxy_manager import (
     ProxyInfo,
     default_proxy_manager,
     SUPPORTED_QUARTERFULL_COUNTRIES,
+    sanitize_proxy_url,
     is_dead_or_proxy_error,
 )
 
@@ -115,7 +116,7 @@ def clean_name_from_email(email: str) -> str:
 
 
 def load_proxies_from_file(filepath: str = "proxies.txt") -> List[str]:
-    """Membaca daftar proxy dari berkas."""
+    """Membaca daftar proxy dari berkas dan membersihkan format kotor."""
     proxies = []
     p = Path(filepath)
     if not p.exists():
@@ -123,9 +124,9 @@ def load_proxies_from_file(filepath: str = "proxies.txt") -> List[str]:
 
     with open(p, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                proxies.append(line)
+            cleaned = sanitize_proxy_url(line)
+            if cleaned:
+                proxies.append(cleaned)
     return proxies
 
 

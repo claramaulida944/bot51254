@@ -73,6 +73,7 @@ from proxy_manager import (
     default_proxy_manager,
     SUPPORTED_QUARTERFULL_COUNTRIES,
     is_dead_or_proxy_error,
+    sanitize_proxy_url,
 )
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress di konsol)
@@ -1392,7 +1393,7 @@ def load_accounts_from_file(file_path: str = "akun.txt") -> List[Dict[str, Any]]
 
 
 def load_proxies_from_file(file_path: str = "proxies.txt") -> List[str]:
-    """Membaca daftar proxy dari file teks jika ada."""
+    """Membaca daftar proxy dari file teks jika ada dan membersihkan format kotor."""
     p = Path(file_path)
     if not p.exists():
         return []
@@ -1400,12 +1401,9 @@ def load_proxies_from_file(file_path: str = "proxies.txt") -> List[str]:
     proxies = []
     with open(p, "r", encoding="utf-8") as f:
         for line in f:
-            px = line.strip()
-            if px and not px.startswith("#"):
-                # Normalisasi prefix http jika belum ada
-                if not (px.startswith("http://") or px.startswith("https://") or px.startswith("socks5://")):
-                    px = f"http://{px}"
-                proxies.append(px)
+            cleaned = sanitize_proxy_url(line)
+            if cleaned:
+                proxies.append(cleaned)
     return proxies
 
 
