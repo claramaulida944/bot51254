@@ -79,6 +79,7 @@ class FullAutoWorker:
         do_follow: bool = True,
         skip_already_read: bool = True,
         inter_chapter_delay: float = 3.0,
+        proxy_manager: Optional[ProxyManager] = None,
     ):
         self.worker_id = worker_id
         self.account = account
@@ -100,6 +101,7 @@ class FullAutoWorker:
         self.author_hash_id = author_hash_id
         self.chapters = chapters
         self.proxy = proxy
+        self.proxy_manager = proxy_manager or default_proxy_manager
         self.base_delay = base_delay_per_chapter
         self.do_like = do_like
         self.do_bookmark = do_bookmark
@@ -241,14 +243,16 @@ class FullAutoWorker:
             logger.debug("[%s] Gagal refresh: %s", self.worker_id, exc)
         return False
 
-    async def login_with_password(self, client: Optional[httpx.AsyncClient] = None) -> bool:
+    async def login_with_password(self, client: Optional[httpx.AsyncClient] = None, max_retries: int = 5) -> bool:
         password = self.account.get("password")
         if not self.email or not password:
             return False
-        try:
+
+        for attempt in range(1, max_retries + 1):
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "timeout": httpx.Timeout(20.0),
+                "http2": False if self.proxy else True,
+                "timeout": httpx.Timeout(15.0),
                 "headers": {
                     "user-agent": self.user_agent,
                     "x-device-id": self.device_id,
@@ -262,25 +266,38 @@ class FullAutoWorker:
             if self.proxy:
                 kwargs["proxy"] = self.proxy
 
-            async with httpx.AsyncClient(**kwargs) as login_client:
-                resp = await login_client.post("/api/auth/login", json={"login_id": self.email, "password": password})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_access = data.get("access_token")
-                    new_refresh = data.get("refresh_token")
-                    if new_access:
-                        self.access_token = new_access
-                        self.account["access_token"] = new_access
-                        if new_refresh:
-                            self.account["refresh_token"] = new_refresh
-                        if client is not None and not client.is_closed:
-                            client.headers["authorization"] = f"Bearer {new_access}"
-                        self._save_refreshed_account()
-                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
-                        return True
-        except Exception as exc:
-            logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
-    async def ensure_valid_session(self, client: httpx.AsyncClient) -> bool:
+            try:
+                async with httpx.AsyncClient(**kwargs) as login_client:
+                    resp = await login_client.post("/api/auth/login", json={"login_id": self.email, "password": password})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        new_access = data.get("access_token")
+                        new_refresh = data.get("refresh_token")
+                        if new_access:
+                            self.access_token = new_access
+                            self.account["access_token"] = new_access
+                            if new_refresh:
+                                self.account["refresh_token"] = new_refresh
+                            if client is not None and not client.is_closed:
+                                client.headers["authorization"] = f"Bearer {new_access}"
+                            self._save_refreshed_account()
+                            logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                            return True
+                    elif resp.status_code in (400, 401, 403, 404, 422):
+                        logger.warning("[%s] Login ditolak server (HTTP %d): %s", self.worker_id, resp.status_code, resp.text[:100])
+                        return False
+            except Exception as exc:
+                if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
+                    if self.proxy:
+                        self.proxy_manager.mark_failed(self.proxy, exc)
+                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                    self.proxy = new_proxy
+                    continue
+                logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
+
+        return False
+
+    async def ensure_valid_session(self, client: httpx.AsyncClient, max_retries: int = 5) -> bool:
         """Memverifikasi validitas token worker via /api/auth/profile; auto refresh atau login ulang jika sesi kedaluwarsa."""
         if self.access_token:
             try:
@@ -290,7 +307,11 @@ class FullAutoWorker:
             except Exception:
                 pass
 
-        relogged = await self.refresh_access_token(client) or await self.login_with_password(client)
+        # Coba refresh token dulu
+        relogged = await self.refresh_access_token(client)
+        if not relogged:
+            # Refresh token kedaluwarsa, wajib login ulang dengan password & rotasi proxy
+            relogged = await self.login_with_password(client, max_retries=max_retries)
         return relogged
 
     async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
@@ -319,8 +340,12 @@ class FullAutoWorker:
 
                 session_valid = await self.ensure_valid_session(client)
                 if not session_valid:
-                    self.status = "Token Expired (401)"
-                    progress.update(task_id, description="[bold red]Sesi Expired (Skip)[/]")
+                    progress.update(task_id, description="[yellow]Sesi exp, login ulang...[/]")
+                    session_valid = await self.login_with_password(client, max_retries=5)
+
+                if not session_valid:
+                    self.status = "Gagal Login (Skip)"
+                    progress.update(task_id, description="[bold red]Gagal Login (Skip)[/]")
                     return self._build_summary()
 
                 novel_status_data: Optional[Dict[str, Any]] = None
@@ -661,6 +686,7 @@ class FullAutoOrchestrator:
                     do_follow=self.do_follow,
                     skip_already_read=self.skip_already_read,
                     inter_chapter_delay=self.inter_chapter_delay,
+                    proxy_manager=self.proxy_manager,
                 )
                 res = await worker.execute(progress, tid)
                 if proxy:

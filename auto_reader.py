@@ -563,16 +563,18 @@ class MemberReaderSession(BaseReaderSession):
             logger.debug("[%s] Gagal refresh token: %s", self.worker_id, exc)
         return False
 
-    async def login_with_password(self) -> bool:
-        """Melakukan login ulang penuh ke POST /api/auth/login menggunakan email & password."""
+    async def login_with_password(self, max_retries: int = 5) -> bool:
+        """Melakukan login ulang penuh ke POST /api/auth/login menggunakan email & password.
+        Mendukung rotasi proxy otomatis jika terjadi kendala jaringan/proxy mati."""
         password = self.account.get("password")
         if not self.email or not password:
             return False
 
-        try:
+        for attempt in range(1, max_retries + 1):
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "timeout": httpx.Timeout(self.timeout),
+                "http2": False if self.proxy else True,
+                "timeout": httpx.Timeout(15.0),
                 "headers": {
                     "user-agent": self.user_agent,
                     "x-device-id": self.device_id,
@@ -586,27 +588,40 @@ class MemberReaderSession(BaseReaderSession):
             if self.proxy:
                 kwargs["proxy"] = self.proxy
 
-            async with httpx.AsyncClient(**kwargs) as login_client:
-                resp = await login_client.post(
-                    "/api/auth/login",
-                    json={"login_id": self.email, "password": password},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_access = data.get("access_token")
-                    new_refresh = data.get("refresh_token")
-                    if new_access:
-                        self.access_token = new_access
-                        self.account["access_token"] = new_access
-                        if new_refresh:
-                            self.account["refresh_token"] = new_refresh
-                        if self._client and not self._client.is_closed:
-                            self._client.headers["authorization"] = f"Bearer {new_access}"
-                        self._save_refreshed_account()
-                        logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
-                        return True
-        except Exception as exc:
-            logger.debug("[%s] Gagal login ulang dengan password: %s", self.worker_id, exc)
+            try:
+                async with httpx.AsyncClient(**kwargs) as login_client:
+                    resp = await login_client.post(
+                        "/api/auth/login",
+                        json={"login_id": self.email, "password": password},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        new_access = data.get("access_token")
+                        new_refresh = data.get("refresh_token")
+                        if new_access:
+                            self.access_token = new_access
+                            self.account["access_token"] = new_access
+                            if new_refresh:
+                                self.account["refresh_token"] = new_refresh
+                            if self._client and not self._client.is_closed:
+                                self._client.headers["authorization"] = f"Bearer {new_access}"
+                            self._save_refreshed_account()
+                            logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis!", self.worker_id)
+                            return True
+                    elif resp.status_code in (400, 401, 403, 404, 422):
+                        logger.warning("[%s] Login ditolak oleh server (HTTP %d): %s", self.worker_id, resp.status_code, resp.text[:100])
+                        return False
+                    else:
+                        logger.debug("[%s] Login respons status %d, mencoba proxy lain...", self.worker_id, resp.status_code)
+            except Exception as exc:
+                if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
+                    if self.proxy:
+                        self.proxy_manager.mark_failed(self.proxy, exc)
+                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                    await self.set_proxy(new_proxy)
+                    continue
+                logger.debug("[%s] Gagal login ulang dengan password: %s", self.worker_id, exc)
+
         return False
 
     async def ensure_valid_session(self, max_retries: int = 5) -> bool:
@@ -615,7 +630,7 @@ class MemberReaderSession(BaseReaderSession):
             if not self.access_token:
                 if await self.refresh_access_token():
                     return True
-                return await self.login_with_password()
+                return await self.login_with_password(max_retries=max_retries)
 
             try:
                 client = await self.get_client()
@@ -623,11 +638,23 @@ class MemberReaderSession(BaseReaderSession):
                 if resp.status_code == 200:
                     return True
                 if resp.status_code == 401:
+                    # Token kedaluwarsa: Coba refresh token dulu
                     if await self.refresh_access_token():
                         return True
-                    return await self.login_with_password()
+                    # Jika refresh gagal, langsung login ulang dengan password & rotasi proxy
+                    logged_in = await self.login_with_password(max_retries=max_retries)
+                    if logged_in:
+                        return True
+                    # Jika gagal karena proxy, loop attempt berikutnya akan mencoba proxy baru
+                    if attempt < max_retries:
+                        if self.proxy:
+                            self.proxy_manager.mark_failed(self.proxy, "login failed on 401 profile")
+                        new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                        await self.set_proxy(new_proxy)
+                        continue
+                    return False
             except Exception as exc:
-                if is_dead_or_proxy_error(exc):
+                if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
                     if self.proxy:
                         logger.warning(
                             "[%s] Proxy error saat verifikasi sesi (%s), otomatis DIHAPUS dan mencoba proxy baru (%d/%d)...",
@@ -641,7 +668,9 @@ class MemberReaderSession(BaseReaderSession):
                     await self.set_proxy(new_proxy)
                     continue
                 return False
-        return False
+
+        # Fallback akhir: coba login ulang sekali lagi dengan password
+        return await self.login_with_password(max_retries=3)
 
     async def get_read_chapter_ids(self, novel_id: str) -> set:
         """
@@ -1149,9 +1178,14 @@ class ReadingSimulationOrchestrator:
                 )
                 is_valid = await session.ensure_valid_session()
                 if not is_valid:
+                    # Jangan langsung skip! Coba login ulang langsung dengan password & rotasi proxy
+                    progress.update(task_id, description="[yellow]Sesi exp, login ulang...[/]")
+                    is_valid = await session.login_with_password(max_retries=5)
+
+                if not is_valid:
                     progress.update(
                         task_id,
-                        description="[bold red]Sesi Expired (Skip)[/]",
+                        description="[bold red]Gagal Login (Skip)[/]",
                     )
                     self.results.append({
                         "worker_id": worker_id,
@@ -1159,7 +1193,7 @@ class ReadingSimulationOrchestrator:
                         "ident": short_email,
                         "country": acc_country,
                         "chapters_read": 0,
-                        "status": "[red]Expired[/]",
+                        "status": "[red]Gagal Login[/]",
                     })
                     await asyncio.sleep(1.0)
                     await session.close()
