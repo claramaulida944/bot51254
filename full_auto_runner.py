@@ -640,7 +640,7 @@ class FullAutoOrchestrator:
             try:
                 acc_country = account.get("country", "ID")
                 sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
-                proxy = self.proxy_manager.get_proxy(country_code=acc_country, session_id=sess_id)
+                proxy = self.proxy_manager.pop_proxy(country_code=acc_country, session_id=sess_id)
                 progress.reset(tid, total=total_steps)
                 progress.update(
                     tid,

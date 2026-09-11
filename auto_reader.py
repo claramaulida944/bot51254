@@ -283,6 +283,16 @@ class BaseReaderSession:
         self._client = None
         return client
 
+    async def set_proxy(self, new_proxy: Optional[str]) -> None:
+        """Mengganti proxy aktif dan me-reset client HTTP secara bersih."""
+        self.proxy = new_proxy
+        if self._client and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+        self._client = None
+
     async def close(self) -> None:
         """Menutup koneksi client HTTP jika belum dilepas."""
         if self._client and not self._client.is_closed:
@@ -299,6 +309,7 @@ class GuestReaderSession(BaseReaderSession):
         country: str = "ID",
         proxy: Optional[str] = None,
         timeout: float = 30.0,
+        proxy_manager: Optional[ProxyManager] = None,
     ) -> None:
         super().__init__(
             worker_id=worker_id,
@@ -310,12 +321,15 @@ class GuestReaderSession(BaseReaderSession):
         )
         self.guest_id: Optional[str] = None
         self.guest_token: Optional[str] = None
+        self.proxy_manager: ProxyManager = proxy_manager or default_proxy_manager
 
-    async def init_guest_session(self) -> bool:
-        """Memanggil POST /api/guest-reading/session untuk memperoleh guest_token."""
-        client = await self.get_client()
-        for attempt in range(2):
+    async def init_guest_session(self, max_retries: int = 10) -> bool:
+        """Memanggil POST /api/guest-reading/session untuk memperoleh guest_token.
+        Jika proxy mati/gagal koneksi, otomatis hapus dari pool dan langsung coba proxy baru.
+        """
+        for attempt in range(1, max_retries + 1):
             try:
+                client = await self.get_client()
                 resp = await client.post("/api/guest-reading/session", content=b"")
                 resp.raise_for_status()
                 data = resp.json()
@@ -327,18 +341,22 @@ class GuestReaderSession(BaseReaderSession):
                     client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
                     return True
             except Exception as exc:
-                if self.proxy and is_dead_or_proxy_error(exc):
-                    logger.warning("[%s] Proxy bermasalah (%s), otomatis DIHAPUS dan beralih ke Direct Connection...", self.worker_id, exc)
-                    default_proxy_manager.mark_failed(self.proxy, exc)
-                    self.proxy = None
-                    if self._client and not self._client.is_closed:
-                        await self._client.aclose()
-                    self._client = None
-                    client = await self.get_client()
+                if is_dead_or_proxy_error(exc):
+                    if self.proxy:
+                        logger.warning(
+                            "[%s] Proxy mati/error (%s), otomatis DIHAPUS dan mencoba proxy baru (%d/%d)...",
+                            self.worker_id,
+                            exc,
+                            attempt,
+                            max_retries,
+                        )
+                        self.proxy_manager.mark_failed(self.proxy, exc)
+                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                    await self.set_proxy(new_proxy)
                     continue
-                if attempt == 1:
+                if attempt == max_retries:
                     logger.error("[%s] Gagal inisialisasi guest session: %s", self.worker_id, exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
         return False
 
     async def read_chapter(
@@ -377,13 +395,16 @@ class GuestReaderSession(BaseReaderSession):
             content = ch_data.get("content", "")
             char_count = len(content)
         except Exception as exc:
-            if self.proxy and is_dead_or_proxy_error(exc):
-                logger.warning("[%s] Proxy error (%s), otomatis DIHAPUS dan fallback ke Direct Connection...", self.worker_id, exc)
-                default_proxy_manager.mark_failed(self.proxy, exc)
-                self.proxy = None
-                if self._client and not self._client.is_closed:
-                    await self._client.aclose()
-                self._client = None
+            if is_dead_or_proxy_error(exc):
+                if self.proxy:
+                    logger.warning("[%s] Proxy mati saat ambil bab (%s), otomatis DIHAPUS dan mencoba proxy baru...", self.worker_id, exc)
+                    self.proxy_manager.mark_failed(self.proxy, exc)
+                new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                await self.set_proxy(new_proxy)
+                if self.guest_token:
+                    new_client = await self.get_client()
+                    new_client.headers["x-guest-token"] = self.guest_token
+                    new_client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
                 return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
@@ -445,6 +466,7 @@ class MemberReaderSession(BaseReaderSession):
         novel_title: str = "Novel",
         proxy: Optional[str] = None,
         timeout: float = 30.0,
+        proxy_manager: Optional[ProxyManager] = None,
     ) -> None:
         super().__init__(
             worker_id=worker_id,
@@ -460,6 +482,7 @@ class MemberReaderSession(BaseReaderSession):
         self.user_id: Any = account_data.get("user_id", 0)
         self.email: str = account_data.get("email", "unknown@user.com")
         self.novel_title: str = novel_title
+        self.proxy_manager: ProxyManager = proxy_manager or default_proxy_manager
 
     def build_base_headers(self) -> Dict[str, str]:
         headers = super().build_base_headers()
@@ -586,25 +609,39 @@ class MemberReaderSession(BaseReaderSession):
             logger.debug("[%s] Gagal login ulang dengan password: %s", self.worker_id, exc)
         return False
 
-    async def ensure_valid_session(self) -> bool:
+    async def ensure_valid_session(self, max_retries: int = 5) -> bool:
         """Memverifikasi keaktifan sesi token member; auto-refresh atau re-login bila kedaluwarsa."""
-        if not self.access_token:
-            if await self.refresh_access_token():
-                return True
-            return await self.login_with_password()
-
-        client = await self.get_client()
-        try:
-            resp = await client.get("/api/auth/profile")
-            if resp.status_code == 200:
-                return True
-            if resp.status_code == 401:
+        for attempt in range(1, max_retries + 1):
+            if not self.access_token:
                 if await self.refresh_access_token():
                     return True
                 return await self.login_with_password()
-        except Exception:
-            pass
-        return True
+
+            try:
+                client = await self.get_client()
+                resp = await client.get("/api/auth/profile")
+                if resp.status_code == 200:
+                    return True
+                if resp.status_code == 401:
+                    if await self.refresh_access_token():
+                        return True
+                    return await self.login_with_password()
+            except Exception as exc:
+                if is_dead_or_proxy_error(exc):
+                    if self.proxy:
+                        logger.warning(
+                            "[%s] Proxy error saat verifikasi sesi (%s), otomatis DIHAPUS dan mencoba proxy baru (%d/%d)...",
+                            self.worker_id,
+                            exc,
+                            attempt,
+                            max_retries,
+                        )
+                        self.proxy_manager.mark_failed(self.proxy, exc)
+                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                    await self.set_proxy(new_proxy)
+                    continue
+                return False
+        return False
 
     async def get_read_chapter_ids(self, novel_id: str) -> set:
         """
@@ -681,13 +718,12 @@ class MemberReaderSession(BaseReaderSession):
 
             get_resp.raise_for_status()
         except Exception as exc:
-            if self.proxy and is_dead_or_proxy_error(exc):
-                logger.warning("[%s] Proxy error (%s), otomatis DIHAPUS dan fallback ke Direct Connection...", self.worker_id, exc)
-                default_proxy_manager.mark_failed(self.proxy, exc)
-                self.proxy = None
-                if self._client and not self._client.is_closed:
-                    await self._client.aclose()
-                self._client = None
+            if is_dead_or_proxy_error(exc):
+                if self.proxy:
+                    logger.warning("[%s] Proxy error saat baca bab (%s), otomatis DIHAPUS dan mencoba proxy baru...", self.worker_id, exc)
+                    self.proxy_manager.mark_failed(self.proxy, exc)
+                new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                await self.set_proxy(new_proxy)
                 return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
@@ -824,7 +860,7 @@ class ReadingSimulationOrchestrator:
     def _get_proxy_for_worker(self, country_code: str = "ID", session_id: Optional[str] = None) -> Optional[str]:
         if not self.proxy_manager.has_proxies:
             return None
-        return self.proxy_manager.get_proxy(country_code=country_code, session_id=session_id)
+        return self.proxy_manager.pop_proxy(country_code=country_code, session_id=session_id)
 
     async def _background_dwell_pulser(
         self,
@@ -980,7 +1016,12 @@ class ReadingSimulationOrchestrator:
         
         sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
         proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
-        session = GuestReaderSession(worker_id=worker_id, country=proxy_cc, proxy=proxy)
+        session = GuestReaderSession(
+            worker_id=worker_id,
+            country=proxy_cc,
+            proxy=proxy,
+            proxy_manager=self.proxy_manager,
+        )
 
         async with self.semaphore:
             slot_idx, task_id = await slot_queue.get()
@@ -1094,6 +1135,7 @@ class ReadingSimulationOrchestrator:
             account_data=account,
             novel_title=self.novel_title,
             proxy=proxy,
+            proxy_manager=self.proxy_manager,
         )
 
         async with self.semaphore:
@@ -1254,7 +1296,7 @@ class ReadingSimulationOrchestrator:
 
             # Pastikan ketersediaan proxy mencukupi jika menggunakan proxy free
             if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
-                self.proxy_manager.ensure_proxies(min_count=max(3, self.total_readers // 2), target_count=max(30, self.total_readers))
+                self.proxy_manager.ensure_proxies(min_count=max(15, self.total_readers // 2), target_count=max(1000, self.total_readers))
 
             tasks = []
             for idx, acc in enumerate(self.member_accounts, start=1):

@@ -246,11 +246,11 @@ class SocialInteractionBot:
         self.proxy_index = 0
 
     def _get_proxy(self, country_code: str = "ID") -> Optional[str]:
-        """Mengambil proxy secara rotasi dengan targeting negara jika Bright Data dan IP unik per sesi."""
+        """Mengambil proxy secara satu kali pakai (pop_proxy) dengan targeting negara jika Bright Data."""
         if not self.proxy_manager.has_proxies:
             return None
         sess_id = f"soc_{secrets.token_hex(4)}"
-        return self.proxy_manager.get_proxy(country_code=country_code, session_id=sess_id)
+        return self.proxy_manager.pop_proxy(country_code=country_code, session_id=sess_id)
 
     def _build_headers(self, account: Dict[str, Any]) -> Dict[str, str]:
         """Menyusun header mobile fingerprint yang konsisten."""

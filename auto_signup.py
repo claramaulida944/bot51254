@@ -528,11 +528,11 @@ class RegistrationRunner:
         self.retry_delay_429: float = retry_delay_429
 
     def _get_next_proxy(self, country_code: Optional[str] = None) -> Optional[str]:
-        """Mengambil proxy berikutnya. Jika Bright Data, disesuaikan ke country_code dengan IP unik per sesi."""
+        """Mengambil proxy berikutnya secara satu kali pakai (pop_proxy) dengan targeting negara."""
         if not self.proxy_manager.has_proxies:
             return None
         sess_id = f"signup_{secrets.token_hex(4)}"
-        return self.proxy_manager.get_proxy(country_code=country_code, session_id=sess_id)
+        return self.proxy_manager.pop_proxy(country_code=country_code, session_id=sess_id)
 
     def register_account(
         self,
@@ -608,7 +608,8 @@ class RegistrationRunner:
 
         # Mekanisme retry cerdas jika terkena rate limit (HTTP 429)
         last_error = ""
-        for attempt in range(1, self.max_retries_on_429 + 1):
+        max_attempts = max(self.max_retries_on_429, 8)
+        for attempt in range(1, max_attempts + 1):
             proxy = self._get_next_proxy(country_code=profile.country)
             client_kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
@@ -854,6 +855,10 @@ class RegistrationRunner:
 
                     if proxy and is_dead_or_proxy_error(exc):
                         self.proxy_manager.mark_failed(proxy, exc)
+                        logger.warning("[Proxy Error] Proxy mati (%s). Mengambil proxy baru dan mencoba lagi...", exc)
+                        time.sleep(0.5)
+                        continue
+
                     logger.error("Terjadi exception pada pendaftaran: %s", exc)
                     return {
                         "status": "exception",
