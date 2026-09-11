@@ -48,7 +48,14 @@ from faker import Faker
 import httpx
 
 from session_manager import IdentifierGenerator
-from proxy_manager import ProxyManager, ProxyInfo, default_proxy_manager, is_dead_or_proxy_error, sanitize_proxy_url
+from proxy_manager import (
+    ProxyManager,
+    ProxyInfo,
+    default_proxy_manager,
+    is_dead_or_proxy_error,
+    sanitize_proxy_url,
+    get_weighted_royalty_country,
+)
 
 # Konfigurasi logging
 logger = logging.getLogger("AutoSignup")
@@ -463,15 +470,15 @@ class HighEntropyProfileGenerator:
         all_countries = list(COUNTRY_CONFIG.keys())
 
         if not country_code or country_code.upper() in ("RANDOM", "ALL"):
-            selected_country = secrets.choice(all_countries)
+            selected_country = get_weighted_royalty_country(all_countries)
         else:
             selected_country = country_code.upper()
             if selected_country not in COUNTRY_CONFIG:
                 logger.warning(
-                    "Kode negara '%s' tidak ditemukan dalam katalog. Menggunakan negara acak.",
+                    "Kode negara '%s' tidak ditemukan dalam katalog. Menggunakan negara acak berbobot royalti.",
                     selected_country,
                 )
-                selected_country = secrets.choice(all_countries)
+                selected_country = get_weighted_royalty_country(all_countries)
 
         cfg = COUNTRY_CONFIG[selected_country]
         faker_instance = self._get_faker(selected_country)

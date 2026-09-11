@@ -74,6 +74,7 @@ from proxy_manager import (
     SUPPORTED_QUARTERFULL_COUNTRIES,
     is_dead_or_proxy_error,
     sanitize_proxy_url,
+    get_weighted_royalty_country,
 )
 
 # Konfigurasi logger dasar (level ERROR agar tidak merusak tata letak Rich Progress di konsol)
@@ -1043,7 +1044,7 @@ class ReadingSimulationOrchestrator:
     ) -> None:
         worker_id = f"Guest-{worker_idx:02d}"
         pool_countries = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
-        proxy_cc = random.choice(pool_countries)
+        proxy_cc = get_weighted_royalty_country(pool_countries)
         
         sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
         proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)

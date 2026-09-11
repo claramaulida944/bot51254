@@ -52,6 +52,8 @@ console = Console()
 # 23 Negara Resmi Quarterfull yang Terverifikasi di API /api/v1/service-countries & Memiliki IP Aktif
 SUPPORTED_QUARTERFULL_COUNTRIES: Dict[str, Dict[str, str]] = {
     "US": {"name": "United States", "timezone": "America/New_York", "lang": "en-US,en;q=0.9"},
+    "KR": {"name": "South Korea", "timezone": "Asia/Seoul", "lang": "ko-KR,ko;q=0.9"},
+    "JP": {"name": "Japan", "timezone": "Asia/Tokyo", "lang": "ja-JP,ja;q=0.9"},
     "ID": {"name": "Indonesia", "timezone": "Asia/Jakarta", "lang": "id"},
     "GB": {"name": "United Kingdom", "timezone": "Europe/London", "lang": "en-GB,en;q=0.9"},
     "AU": {"name": "Australia", "timezone": "Australia/Sydney", "lang": "en-AU,en;q=0.9"},
@@ -77,6 +79,37 @@ SUPPORTED_QUARTERFULL_COUNTRIES: Dict[str, Dict[str, str]] = {
 }
 
 BRIGHTDATA_SUPPORTED_COUNTRIES = set(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
+
+
+def get_weighted_royalty_country(candidate_countries: Optional[List[str]] = None) -> str:
+    """
+    Memilih kode negara dengan pembobotan prioritas royalti tinggi (Tier 1):
+    - US (Amerika Serikat): ~20% - 25% (2 dari 10 sesi)
+    - KR (Korea Selatan): ~15% (1-2 dari 10 sesi)
+    - JP (Jepang): ~15% (1-2 dari 10 sesi)
+    - Sisanya (~45% - 50%): didistribusikan merata ke negara-negara lain.
+    """
+    if candidate_countries:
+        pool = list(candidate_countries)
+    else:
+        pool = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
+
+    tier1_weights = {
+        "US": 25.0,
+        "KR": 15.0,
+        "JP": 15.0,
+    }
+    present_tier1 = [c for c in tier1_weights if c in pool]
+    sum_tier1 = sum(tier1_weights[c] for c in present_tier1)
+    remaining_pool = [c for c in pool if c not in tier1_weights]
+
+    if not remaining_pool:
+        weights = [tier1_weights.get(c, 1.0) for c in pool]
+    else:
+        rem_weight = max(0.1, (100.0 - sum_tier1) / len(remaining_pool))
+        weights = [tier1_weights.get(c, rem_weight) for c in pool]
+
+    return random.choices(pool, weights=weights, k=1)[0]
 
 
 def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
@@ -417,6 +450,67 @@ class HypeProxyClient:
                 return data
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    @classmethod
+    def start_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
+        """
+        POST /api/proxies/:id/start — Menghidupkan kembali proxy yang statusnya ERROR atau Berhenti.
+        Sama persis seperti menekan tombol 'Mulai' di web dashboard HypeProxy.
+        """
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/start"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.post(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {"ok": True, "message": "Slot started"}
+                return {"ok": False, "status_code": resp.status_code, "text": resp.text}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def stop_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
+        """
+        POST /api/proxies/:id/stop — Menghentikan sementara slot proxy.
+        Sama persis seperti menekan tombol 'Berhenti' di web dashboard HypeProxy.
+        """
+        url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/stop"
+        try:
+            with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
+                resp = client.post(url, headers=cls.get_headers())
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {"ok": True, "message": "Slot stopped"}
+                return {"ok": False, "status_code": resp.status_code, "text": resp.text}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def auto_recover_proxies(cls) -> Dict[str, Any]:
+        """
+        Memeriksa seluruh proxy milik user. Jika ditemukan status ERROR atau STOPPED,
+        secara otomatis memanggil start_proxy(), memperbaiki region jika exhausted, dan rotasi IP.
+        """
+        proxies = cls.get_proxies(user_only=True)
+        results = {}
+        for p in proxies:
+            pid = p.get("id")
+            status = str(p.get("status", "")).upper()
+            if status in ("ERROR", "STOPPED", "STOP") and pid:
+                # 1. Hidupkan slot
+                start_res = cls.start_proxy(pid)
+                # 2. Jika IP negara habis (IPs Exhausted), alihkan ke AUTO
+                if "exhausted" in str(p.get("lastError", "")).lower():
+                    cls.set_proxy_region(pid, "AUTO")
+                # 3. Picu rotasi IP baru
+                cls.rotate_proxy(pid)
+                results[str(pid)] = {"recovered": True, "details": start_res}
+                logger.info(f"[HypeProxy] Slot #{pid} berstatus {status} berhasil di-recovery otomatis (Auto-Start)!")
+        return results
 
     @classmethod
     def extend_proxy(cls, proxy_id: Union[int, str], days: int = 7) -> Dict[str, Any]:
@@ -823,6 +917,9 @@ class ProxyManager:
         """
         with self._lock:
             if self.is_brightdata or (self.is_hypeproxy and len(self.parsed_proxies) > 0):
+                if self.is_hypeproxy:
+                    # Otomatis pulihkan di background jika ada slot yang berstatus ERROR atau STOPPED di dashboard
+                    threading.Thread(target=HypeProxyClient.auto_recover_proxies, daemon=True).start()
                 return len(self.parsed_proxies)
 
             if len(self.parsed_proxies) >= min_count:
@@ -883,18 +980,19 @@ class ProxyManager:
 
             masked = p_found.get_masked_url()
 
-            # 1. Penanganan Khusus HypeProxy: ROTASI IP HANYA SAAT GAGAL / RATE-LIMIT (BUKAN TIAP KALI USED)
+            # 1. Penanganan Khusus HypeProxy: AUTO-START (MULAI) & ROTASI IP SAAT GAGAL / ERROR
             if p_found.is_hypeproxy:
                 if reason == "failed" and p_found.proxy_id:
-                    # Picu rotasi IP instan di thread terpisah HANYA jika proxy gagal/kena limit
-                    threading.Thread(
-                        target=HypeProxyClient.rotate_proxy,
-                        args=(p_found.proxy_id,),
-                        daemon=True,
-                    ).start()
-                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/blokir -> Memicu ROTASI IP instan.")
+                    def _recover_slot():
+                        # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
+                        HypeProxyClient.start_proxy(p_found.proxy_id)
+                        # 2. Picu rotasi IP instan di thread terpisah
+                        HypeProxyClient.rotate_proxy(p_found.proxy_id)
+
+                    threading.Thread(target=_recover_slot, daemon=True).start()
+                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start) & rotasi IP.")
                     if self.verbose:
-                        console.print(f"[dim yellow][HYPEPROXY-ROTATE] Slot #{p_found.proxy_id} otomatis dirotasi IP baru![/]")
+                        console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
                 elif reason == "used":
                     logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan.")
                 return True
