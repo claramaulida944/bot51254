@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,15 @@ if hasattr(sys.stderr, "reconfigure"):
 import httpx
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -166,37 +176,75 @@ def feature_auto_signup() -> None:
         default="okhttp",
     )
 
-    console.print(f"\n[yellow]Memulai pendaftaran {count} akun target ({selected_country})...[/]\n")
+    default_concurrency = min(5, max(1, count))
+    concurrency = IntPrompt.ask(
+        "[bold green]?[/] Jumlah sesi paralel simultan (Multi-Session)",
+        default=default_concurrency,
+    )
+    concurrency = max(1, min(concurrency, count, 50))
+
+    console.print(
+        Panel(
+            f"[bold cyan]Negara Target :[/] [bold yellow]{selected_country}[/]\n"
+            f"[bold cyan]Jumlah Akun   :[/] [bold white]{count}[/] Akun\n"
+            f"[bold cyan]Konkurensi    :[/] [bold green]{concurrency}[/] Sesi Paralel Simultan\n"
+            f"[bold cyan]Mode UA       :[/] [bold white]{ua_mode}[/]",
+            title="[bold green]Memulai Auto Signup Multi-Sesi[/]",
+            border_style="cyan",
+        )
+    )
 
     proxies = load_proxies_from_file("proxies.txt")
     runner = RegistrationRunner(accounts_file="akun.txt", proxies=proxies)
+
+    # Pastikan proxy mencukupi jika menggunakan free proxy
+    if runner.proxy_manager.has_proxies and not runner.proxy_manager.is_brightdata:
+        runner.proxy_manager.ensure_proxies(
+            min_count=max(concurrency * 2, 20),
+            target_count=max(1000, count * 2),
+        )
+    runner.proxy_manager.verbose = False
+
     success_count = 0
+    fail_count = 0
+    lock = threading.Lock()
 
-    with console.status("[bold cyan]Memproses pendaftaran akun ke API Quarterfull...[/]"):
-        for i in range(1, count + 1):
-            res = runner.register_account(country_code=selected_country, ua_mode=ua_mode)
-            if res.get("status") == "success":
-                success_count += 1
-                acc = res["account"]
-                console.print(f"  [bold green][OK][/] Akun #{i}: [bold white]{acc.get('email')}[/] | Negara: [cyan]{acc.get('country')}[/] | User ID: [yellow]{acc.get('user_id')}[/]")
-            else:
-                err_text = str(res.get("error", ""))
-                # Jika terdeteksi 400 No IPs in selected country, coba lagi menggunakan proxy negara lain
-                if "No IPs" in err_text or "400" in err_text:
-                    console.print(f"  [yellow][RETRY][/] Akun #{i}: 400 No IPs in selected country. Mencoba lagi menggunakan proxy negara alternatif (US)...")
-                    retry_res = runner.register_account(country_code="US", ua_mode=ua_mode)
-                    if retry_res.get("status") == "success":
-                        success_count += 1
-                        acc = retry_res["account"]
-                        console.print(f"  [bold green][OK][/] Akun #{i} (Retry): [bold white]{acc.get('email')}[/] | Negara: [cyan]{acc.get('country')}[/] | User ID: [yellow]{acc.get('user_id')}[/]")
-                        continue
-                console.print(f"  [bold red][GAGAL][/] Akun #{i}: {res.get('error')}")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        overall_task = progress.add_task(f"[yellow]Mendaftarkan {count} akun...[/]", total=count)
 
-            # Jeda pacing natural untuk menjaga IP agar tidak diblokir rate limit
-            if i < count:
-                time.sleep(0.5 if proxies else 2.0)
+        def handle_result(idx: int, res: Dict[str, Any]) -> None:
+            nonlocal success_count, fail_count
+            with lock:
+                if res.get("status") == "success":
+                    success_count += 1
+                    acc = res["account"]
+                    progress.console.print(
+                        f"  [bold green][OK][/] Akun #{idx}: [bold white]{acc.get('email')}[/] | "
+                        f"Negara: [cyan]{acc.get('country')}[/] | User ID: [yellow]{acc.get('user_id')}[/]"
+                    )
+                else:
+                    fail_count += 1
+                    err_msg = str(res.get("error", "Unknown error"))[:60]
+                    progress.console.print(f"  [bold red][GAGAL][/] Akun #{idx}: {err_msg}")
+                progress.advance(overall_task, 1)
 
-    console.print(f"\n[bold green][OK] Berhasil mendaftarkan {success_count}/{count} akun dan disimpan ke 'akun.txt'![/]")
+        runner.register_batch_concurrent(
+            total_count=count,
+            concurrency=concurrency,
+            country_code=selected_country,
+            ua_mode=ua_mode,
+            on_result=handle_result,
+        )
+
+    console.print(f"\n[bold green][OK] Selesai! Berhasil mendaftarkan {success_count}/{count} akun (Gagal: {fail_count}) dan disimpan ke 'akun.txt'![/]")
     wait_for_enter()
 
 

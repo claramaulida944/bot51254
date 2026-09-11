@@ -22,6 +22,7 @@ Fitur Utama:
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -30,12 +31,13 @@ import re
 import secrets
 import string
 import sys
+import threading
 import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -171,17 +173,19 @@ class HighEntropyProfileGenerator:
         self._faker_cache: Dict[str, Faker] = {}
         # Faker universal untuk fallback nama Latin pada script non-Latin murni
         self._universal_faker: Faker = Faker("en_US")
+        self._lock = threading.Lock()
 
     def _get_faker(self, country_code: str) -> Faker:
-        """Mengambil atau menginisialisasi Faker instance untuk negara tertentu."""
-        if country_code not in self._faker_cache:
-            target_locale = COUNTRY_CONFIG[country_code]["locale"]
-            try:
-                self._faker_cache[country_code] = Faker(target_locale)
-            except Exception:
-                fallback_locale = FAKER_LOCALE_FALLBACKS.get(target_locale, "en_US")
-                self._faker_cache[country_code] = Faker(fallback_locale)
-        return self._faker_cache[country_code]
+        """Mengambil atau menginisialisasi Faker instance untuk negara tertentu secara thread-safe."""
+        with self._lock:
+            if country_code not in self._faker_cache:
+                target_locale = COUNTRY_CONFIG[country_code]["locale"]
+                try:
+                    self._faker_cache[country_code] = Faker(target_locale)
+                except Exception:
+                    fallback_locale = FAKER_LOCALE_FALLBACKS.get(target_locale, "en_US")
+                    self._faker_cache[country_code] = Faker(fallback_locale)
+            return self._faker_cache[country_code]
 
     @staticmethod
     def romanize_korean(text: str) -> str:
@@ -528,6 +532,7 @@ class RegistrationRunner:
         self.timeout: float = timeout
         self.max_retries_on_429: int = max_retries_on_429
         self.retry_delay_429: float = retry_delay_429
+        self._file_lock = threading.Lock()
 
     def _get_next_proxy(self, country_code: Optional[str] = None) -> Optional[str]:
         """Mengambil proxy berikutnya secara satu kali pakai (pop_proxy) dengan targeting negara."""
@@ -878,8 +883,56 @@ class RegistrationRunner:
     def _save_account_to_file(self, account_record: Dict[str, Any]) -> None:
         """Menyimpan record akun secara thread-safe / append ke berkas JSON Lines."""
         line = json.dumps(account_record, ensure_ascii=False)
-        with open(self.accounts_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with self._file_lock:
+            with open(self.accounts_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def register_batch_concurrent(
+        self,
+        total_count: int,
+        concurrency: int = 5,
+        country_code: str = "RANDOM",
+        ua_mode: str = "okhttp",
+        on_result: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Mendaftarkan banyak akun secara simultan / multi-session menggunakan ThreadPoolExecutor.
+        :param total_count: Total akun yang ingin didaftarkan.
+        :param concurrency: Jumlah thread / sesi paralel yang berjalan bersamaan.
+        :param country_code: Kode negara (ID, US, JP, dll) atau 'RANDOM'.
+        :param ua_mode: Mode UA ('okhttp', 'dalvik', 'webview').
+        :param on_result: Callback opsional on_result(index, res_dict).
+        :return: List berisi seluruh hasil pendaftaran akun.
+        """
+        concurrency = max(1, min(concurrency, total_count))
+        results: List[Dict[str, Any]] = []
+
+        def _worker_task(idx: int) -> Dict[str, Any]:
+            res = self.register_account(country_code=country_code, ua_mode=ua_mode)
+            # Smart retry jika terdeteksi 400 No IPs in selected country
+            if res.get("status") != "success":
+                err_text = str(res.get("error", ""))
+                if "No IPs" in err_text or "400" in err_text:
+                    retry_res = self.register_account(country_code="US", ua_mode=ua_mode)
+                    if retry_res.get("status") == "success":
+                        res = retry_res
+            if on_result:
+                try:
+                    on_result(idx, res)
+                except Exception:
+                    pass
+            return res
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(_worker_task, i) for i in range(1, total_count + 1)]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    res = future.result()
+                    results.append(res)
+                except Exception as exc:
+                    results.append({"status": "error", "error": str(exc)})
+
+        return results
 
 
 def print_safe(text: str) -> None:
@@ -922,6 +975,13 @@ if __name__ == "__main__":
         choices=["okhttp", "dalvik", "webview"],
         help="Mode User-Agent (okhttp, dalvik, webview) [default: okhttp]",
     )
+    parser.add_argument(
+        "--concurrency",
+        "-j",
+        type=int,
+        default=1,
+        help="Jumlah sesi pendaftaran paralel / simultan (default: 1)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -948,7 +1008,7 @@ if __name__ == "__main__":
         else:
             selected_country = "RANDOM"
 
-    print_safe(f"\n[Konfigurasi Target: Negara = {selected_country} | Jumlah Akun = {args.count} | UA = {args.ua_mode}]")
+    print_safe(f"\n[Konfigurasi Target: Negara = {selected_country} | Jumlah Akun = {args.count} | Sesi Simultan = {args.concurrency} | UA = {args.ua_mode}]")
 
     profile_gen = HighEntropyProfileGenerator()
     ua_gen = UserAgentGenerator()
@@ -966,27 +1026,48 @@ if __name__ == "__main__":
         print_safe(f"  Accept-Language : {p.accept_language}")
 
     # 2. Eksekusi Pendaftaran Akun ke Live API
-    print_safe(f"\n--- Menjalankan Pendaftaran {args.count} Akun ke API Quarterfull ---")
     runner = RegistrationRunner(accounts_file="akun.txt", profile_generator=profile_gen, ua_generator=ua_gen)
 
     success_count = 0
-    for i in range(1, args.count + 1):
-        print_safe(f"\n[Akun #{i} / {args.count}]")
-        result = runner.register_account(country_code=selected_country, ua_mode=args.ua_mode)
+    if args.concurrency > 1:
+        print_safe(f"\n--- Menjalankan Pendaftaran {args.count} Akun ({args.concurrency} Sesi Paralel Simultan) ---")
+        lock = threading.Lock()
+        def on_res(idx: int, res: Dict[str, Any]) -> None:
+            global success_count
+            with lock:
+                if res.get("status") == "success":
+                    success_count += 1
+                    acc = res["account"]
+                    print_safe(f"  [OK] Akun #{idx}: {acc.get('email')} | Negara: {acc.get('country')} | User ID: {acc.get('user_id')}")
+                else:
+                    print_safe(f"  [GAGAL] Akun #{idx}: {res.get('error')}")
 
-        if result.get("status") == "success":
-            acc = result["account"]
-            success_count += 1
-            print_safe("  Status       : BERHASIL (201 Created)")
-            print_safe(f"  User ID      : {acc.get('user_id')}")
-            print_safe(f"  Email        : {acc.get('email')}")
-            print_safe(f"  Password     : {acc.get('password')}")
-            print_safe(f"  Negara       : {acc.get('country')}")
-            print_safe(f"  Access Token : {acc.get('access_token')[:32]}...")
-            print_safe(f"  Device ID    : {acc.get('device_id')}")
-            print_safe(f"  User Agent   : {acc.get('user_agent')}")
-        else:
-            print_safe(f"  Status       : GAGAL ({result.get('error')})")
+        runner.register_batch_concurrent(
+            total_count=args.count,
+            concurrency=args.concurrency,
+            country_code=selected_country,
+            ua_mode=args.ua_mode,
+            on_result=on_res,
+        )
+    else:
+        print_safe(f"\n--- Menjalankan Pendaftaran {args.count} Akun ke API Quarterfull ---")
+        for i in range(1, args.count + 1):
+            print_safe(f"\n[Akun #{i} / {args.count}]")
+            result = runner.register_account(country_code=selected_country, ua_mode=args.ua_mode)
+
+            if result.get("status") == "success":
+                acc = result["account"]
+                success_count += 1
+                print_safe("  Status       : BERHASIL (201 Created)")
+                print_safe(f"  User ID      : {acc.get('user_id')}")
+                print_safe(f"  Email        : {acc.get('email')}")
+                print_safe(f"  Password     : {acc.get('password')}")
+                print_safe(f"  Negara       : {acc.get('country')}")
+                print_safe(f"  Access Token : {acc.get('access_token')[:32]}...")
+                print_safe(f"  Device ID    : {acc.get('device_id')}")
+                print_safe(f"  User Agent   : {acc.get('user_agent')}")
+            else:
+                print_safe(f"  Status       : GAGAL ({result.get('error')})")
 
     print_safe("\n" + "=" * 80)
     print_safe(f"PROSES SELESAI: {success_count}/{args.count} Akun Berhasil Didaftarkan dan Disimpan ke 'akun.txt'")
