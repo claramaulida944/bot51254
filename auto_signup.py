@@ -152,18 +152,57 @@ class HighEntropyProfileGenerator:
     dengan transliterasi fonetik dan fallback username Latin bersih.
     """
 
-    # Distribusi domain email populer
-    EMAIL_DOMAINS: List[Tuple[str, float]] = [
-        ("gmail.com", 0.40),
-        ("yahoo.com", 0.15),
-        ("outlook.com", 0.15),
-        ("hotmail.com", 0.12),
-        ("icloud.com", 0.10),
-        ("proton.me", 0.08),
+    # Distribusi 20+ domain email populer & terpercaya
+    GLOBAL_EMAIL_DOMAINS: List[Tuple[str, float]] = [
+        ("gmail.com", 0.28),
+        ("yahoo.com", 0.12),
+        ("outlook.com", 0.12),
+        ("hotmail.com", 0.10),
+        ("icloud.com", 0.08),
+        ("proton.me", 0.05),
+        ("protonmail.com", 0.04),
+        ("zoho.com", 0.04),
+        ("mail.com", 0.03),
+        ("gmx.com", 0.03),
+        ("gmx.net", 0.02),
+        ("fastmail.com", 0.02),
+        ("live.com", 0.02),
+        ("msn.com", 0.01),
+        ("yandex.com", 0.01),
+        ("aol.com", 0.01),
+        ("tutanota.com", 0.01),
+        ("tutamail.com", 0.01),
     ]
 
-    # Separator nama untuk format email
-    SEPARATORS: List[str] = [".", "_", ""]
+    # Domain email regional spesifik per negara
+    COUNTRY_SPECIFIC_DOMAINS: Dict[str, List[str]] = {
+        "ID": ["yahoo.co.id", "gmail.com"],
+        "GB": ["yahoo.co.uk", "outlook.co.uk", "virginmedia.com"],
+        "DE": ["gmx.de", "web.de", "yahoo.de", "t-online.de"],
+        "FR": ["orange.fr", "free.fr", "laposte.net", "sfr.fr", "yahoo.fr"],
+        "IT": ["libero.it", "virgilio.it", "tiscali.it", "yahoo.it"],
+        "ES": ["yahoo.es"],
+        "BR": ["uol.com.br", "bol.com.br", "terra.com.br", "yahoo.com.br"],
+        "JP": ["yahoo.co.jp"],
+        "KR": ["naver.com", "daum.net", "kakao.com"],
+        "PL": ["wp.pl", "onet.pl", "interia.pl"],
+        "RU": ["mail.ru", "yandex.ru", "rambler.ru", "bk.ru"],
+        "UA": ["ukr.net", "i.ua"],
+    }
+
+    # Separator pemisah nama & variasi
+    SEPARATORS: List[str] = [".", "_", "", "-"]
+
+    # Kumpulan kata awalan & akhiran realistis untuk membedakan email
+    WORDS_PREFIX: List[str] = [
+        "the", "real", "my", "im", "iam", "hey", "go", "pro", "mr", "ms",
+        "official", "just", "its", "hi", "all", "true", "live", "vip"
+    ]
+    WORDS_SUFFIX: List[str] = [
+        "dev", "app", "hub", "mail", "box", "net", "web", "zone", "star", "sky",
+        "life", "play", "core", "run", "one", "lab", "peak", "fox", "wave", "link",
+        "post", "flow", "cloud", "sync", "code", "work", "tech", "site", "base", "space"
+    ]
 
     # Karakter simbol aman untuk password
     PASSWORD_SPECIAL_CHARS: str = "!@#$%^&*"
@@ -244,20 +283,37 @@ class HighEntropyProfileGenerator:
         return cleaned or ("user" if is_first else "reader")
 
     @classmethod
+    def generate_entropy(cls) -> str:
+        """
+        Menghasilkan komponen entropi dinamis dengan 5 strategi acak:
+        1. Alphanumeric 4-7 karakter acak (cth: 7k3m9a)
+        2. Token hex 4-6 karakter + angka acak (cth: f3a842)
+        3. Angka acak 3-6 digit (cth: 94821)
+        4. Kata kunci tematik + angka (cth: dev492)
+        5. Base36 string 5-7 karakter (cth: z9b8c1)
+        """
+        mode = secrets.randbelow(5)
+        if mode == 0:
+            chars = string.ascii_lowercase + string.digits
+            return "".join(secrets.choice(chars) for _ in range(secrets.choice([4, 5, 6, 7])))
+        elif mode == 1:
+            hex_part = secrets.token_hex(secrets.choice([2, 3]))
+            digits = "".join(secrets.choice(string.digits) for _ in range(secrets.choice([2, 3])))
+            return f"{hex_part}{digits}"
+        elif mode == 2:
+            return "".join(secrets.choice(string.digits) for _ in range(secrets.choice([3, 4, 5, 6])))
+        elif mode == 3:
+            word = secrets.choice(cls.WORDS_SUFFIX)
+            digits = "".join(secrets.choice(string.digits) for _ in range(secrets.choice([2, 3, 4])))
+            return f"{word}{digits}"
+        else:
+            b36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+            return "".join(secrets.choice(b36) for _ in range(secrets.choice([5, 6, 7])))
+
+    @classmethod
     def generate_unique_hash(cls) -> str:
-        """
-        Menghasilkan komponen hash unik:
-        Kombinasi 4-6 karakter acak (hex/base36) + 2-3 digit angka acak.
-        Total variasi kombinasi > 1 Milyar kemungkinan.
-        """
-        hash_length = secrets.choice([4, 5, 6])
-        b36_chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-        rand_prefix = "".join(secrets.choice(b36_chars) for _ in range(hash_length))
-
-        num_digits = secrets.choice([2, 3])
-        rand_digits = "".join(secrets.choice(string.digits) for _ in range(num_digits))
-
-        return f"{rand_prefix}{rand_digits}"
+        """Kompatibilitas mundur: memanggil generate_entropy()."""
+        return cls.generate_entropy()
 
     @classmethod
     def generate_password(cls, length: int = 14) -> str:
@@ -307,12 +363,102 @@ class HighEntropyProfileGenerator:
         weights = [0.45, 0.45, 0.10]
         return random.choices(genders, weights=weights, k=1)[0]
 
-    def generate_profile(self, country_code: Optional[str] = None) -> AccountProfile:
-        """
-        Menghasilkan satu profil akun unik ber-entropi tinggi dari katalog 50 negara.
+    def _choose_email_domain(self, country_code: str) -> str:
+        """Memilih domain email dengan probabilitas cerdas antara penyedia global & lokal."""
+        # 25% kemungkinan menggunakan domain lokal jika tersedia untuk negara tersebut
+        if country_code in self.COUNTRY_SPECIFIC_DOMAINS and secrets.randbelow(100) < 25:
+            return secrets.choice(self.COUNTRY_SPECIFIC_DOMAINS[country_code])
 
-        :param country_code: Kode 2-huruf negara (cth: 'ID', 'JP', 'US').
-                             Jika None, 'RANDOM', atau 'ALL', dipilih secara acak dari 50 negara.
+        domains, weights = zip(*self.GLOBAL_EMAIL_DOMAINS)
+        return random.choices(domains, weights=weights, k=1)[0]
+
+    def generate_email_address(
+        self,
+        first_name_clean: str,
+        last_name_clean: str,
+        country_code: str,
+        birth_year: int,
+    ) -> str:
+        """
+        Menghasilkan alamat email ber-entropi tinggi dengan 12 pola kombinasi manusiawi
+        yang sangat variatif untuk mencegah tabrakan nama akun yang telah terdaftar.
+        """
+        f = first_name_clean
+        l = last_name_clean
+        fi = f[0] if f else "u"
+        li = l[0] if l else "r"
+        sep = secrets.choice(self.SEPARATORS)
+        sep2 = secrets.choice(self.SEPARATORS)
+        entropy = self.generate_entropy()
+        domain = self._choose_email_domain(country_code)
+
+        year_short = str(birth_year)[2:]
+        year_full = str(birth_year)
+        chosen_year = secrets.choice([year_short, year_full, ""])
+
+        # 12 Pola Struktur Email yang Berbeda
+        pattern_mode = secrets.randbelow(12)
+
+        if pattern_mode == 0:
+            # Pola standar: first.last_hash
+            local_part = f"{f}{sep}{l}{sep2}{entropy}"
+        elif pattern_mode == 1:
+            # Pola nama dibalik: last.first_hash
+            local_part = f"{l}{sep}{f}{sep2}{entropy}"
+        elif pattern_mode == 2:
+            # Inisial depan + nama belakang: j.smith_hash
+            local_part = f"{fi}{sep}{l}{sep2}{entropy}"
+        elif pattern_mode == 3:
+            # Nama depan + inisial belakang: john.s_hash
+            local_part = f"{f}{sep}{li}{sep2}{entropy}"
+        elif pattern_mode == 4:
+            # Mengandung tahun lahir + entropy singkat: maria.silva98_k3
+            local_part = f"{f}{sep}{l}{chosen_year}{sep2}{entropy[:4]}"
+        elif pattern_mode == 5:
+            # Prefix kata + nama depan: real.john_hash
+            pfx = secrets.choice(self.WORDS_PREFIX)
+            local_part = f"{pfx}{sep}{f}{sep2}{entropy}"
+        elif pattern_mode == 6:
+            # Suffix kata tematik: john.doe_dev42
+            sfx = secrets.choice(self.WORDS_SUFFIX)
+            local_part = f"{f}{sep}{l}{sep2}{sfx}{entropy[:3]}"
+        elif pattern_mode == 7:
+            # Nama depan + nomor unik 4 digit + entropy: kevin8492_x7
+            num = secrets.randbelow(9000) + 1000
+            local_part = f"{f}{num}{sep}{entropy[:4]}"
+        elif pattern_mode == 8:
+            # Nama depan + entropy panjang saja: sarah_9k2m4x8a
+            local_part = f"{f}{sep}{entropy}"
+        elif pattern_mode == 9:
+            # Nama belakang + entropy panjang: smith_7m4b2a9
+            local_part = f"{l}{sep}{entropy}"
+        elif pattern_mode == 10:
+            # Pasangan inisial + kata + angka: jd_web941a
+            w = secrets.choice(self.WORDS_SUFFIX)
+            local_part = f"{fi}{li}{sep}{w}{entropy[:4]}"
+        else:
+            # Triple segmen: first.box.last_82
+            mid = secrets.choice(self.WORDS_SUFFIX)
+            local_part = f"{f}{sep}{mid}{sep2}{l}{entropy[:3]}"
+
+        # Bersihkan jika ada tanda pemisah bertumpuk di awal/akhir
+        local_part = re.sub(r"[._\-]{2,}", "_", local_part).strip("._-")
+        if len(local_part) < 4:
+            local_part = f"user_{local_part}_{entropy[:4]}"
+
+        return f"{local_part}@{domain}"
+
+    def generate_profile(
+        self,
+        country_code: Optional[str] = None,
+        existing_emails: Optional[set] = None,
+    ) -> AccountProfile:
+        """
+        Menghasilkan satu profil akun unik ber-entropi tinggi dari katalog 50 negara,
+        dengan jaminan variasi email masif dan tidak bertabrakan dengan daftar lokal.
+
+        :param country_code: Kode 2-huruf negara (cth: 'ID', 'JP', 'US') atau 'RANDOM'.
+        :param existing_emails: Set email yang sudah terdaftar untuk dideduplikasi lokal.
         """
         all_countries = list(COUNTRY_CONFIG.keys())
 
@@ -342,22 +488,30 @@ class HighEntropyProfileGenerator:
             last_name, selected_country, is_first=False
         )
 
-        # Buat email dengan formula: {first_name_clean}{separator}{last_name_clean}_{unique_hash}@{domain}
-        separator = secrets.choice(self.SEPARATORS)
-        unique_hash = self.generate_unique_hash()
+        # Tanggal lahir & gender
+        birth_date = self.generate_birth_date()
+        gender = self.generate_gender()
+        birth_year = int(birth_date.split("-")[0])
 
-        domains, domain_weights = zip(*self.EMAIL_DOMAINS)
-        domain = random.choices(domains, weights=domain_weights, k=1)[0]
+        # Generate email dengan jaminan variasi dan deduplikasi terhadap daftar lokal
+        email = ""
+        for _ in range(15):
+            candidate_email = self.generate_email_address(
+                first_name_clean, last_name_clean, selected_country, birth_year
+            )
+            if not existing_emails or candidate_email.lower() not in existing_emails:
+                email = candidate_email
+                break
 
-        email = f"{first_name_clean}{separator}{last_name_clean}_{unique_hash}@{domain}"
+        if not email:
+            # Fallback darurat bila tabrakan ekstrem
+            fallback_hash = secrets.token_hex(6)
+            domain = self._choose_email_domain(selected_country)
+            email = f"{first_name_clean}_{fallback_hash}@{domain}"
 
         # Password 12-16 karakter
         pw_len = secrets.choice(range(12, 17))
         password = self.generate_password(length=pw_len)
-
-        # Tanggal lahir & gender
-        birth_date = self.generate_birth_date()
-        gender = self.generate_gender()
 
         return AccountProfile(
             email=email,
@@ -534,6 +688,23 @@ class RegistrationRunner:
         self.retry_delay_429: float = retry_delay_429
         self._file_lock = threading.Lock()
 
+        # Muat daftar email lokal yang telah tersimpan untuk menghindari tabrakan
+        self.existing_emails: set = set()
+        if self.accounts_file.exists():
+            try:
+                with open(self.accounts_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                d = json.loads(line)
+                                if "email" in d and d["email"]:
+                                    self.existing_emails.add(str(d["email"]).strip().lower())
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
     def _get_next_proxy(self, country_code: Optional[str] = None) -> Optional[str]:
         """Mengambil proxy berikutnya secara satu kali pakai (pop_proxy) dengan targeting negara."""
         if not self.proxy_manager.has_proxies:
@@ -558,7 +729,9 @@ class RegistrationRunner:
         :param country_code: Kode negara (contoh: 'ID', 'US', 'JP', dsb) atau 'RANDOM'.
         :return: Kamus data hasil registrasi akun.
         """
-        profile: AccountProfile = self.profile_gen.generate_profile(country_code=country_code)
+        profile: AccountProfile = self.profile_gen.generate_profile(
+            country_code=country_code, existing_emails=self.existing_emails
+        )
         user_agent: str = self.ua_gen.get_random_ua(mode=ua_mode)
         device_id: str = custom_device_id or IdentifierGenerator.generate_device_id()
         market_country: str = resolve_signup_market_country(profile.country)
@@ -613,7 +786,7 @@ class RegistrationRunner:
             device_id[:8],
         )
 
-        # Mekanisme retry cerdas jika terkena rate limit (HTTP 429)
+        # Mekanisme retry cerdas jika terkena rate limit (HTTP 429) atau tabrakan email (HTTP 400)
         last_error = ""
         max_attempts = max(self.max_retries_on_429, 8)
         for attempt in range(1, max_attempts + 1):
@@ -641,6 +814,29 @@ class RegistrationRunner:
                                 logger.warning("[429] Rate limit IP terdeteksi! Menunggu cooldown %.1fs sebelum retry...", cooldown)
                                 time.sleep(cooldown)
                             continue
+
+                    # Auto-recovery tabrakan email yang sudah terdaftar di backend
+                    resp_text_lower = response.text.lower()
+                    if response.status_code == 400 and (
+                        "already registered" in resp_text_lower
+                        or "already exists" in resp_text_lower
+                        or "registered" in resp_text_lower
+                    ):
+                        logger.warning(
+                            "[Email Tabrakan] Email '%s' sudah terdaftar di server. Membuat variasi baru dan mencoba lagi...",
+                            profile.email,
+                        )
+                        self.existing_emails.add(profile.email.lower())
+                        profile = self.profile_gen.generate_profile(
+                            country_code=country_code, existing_emails=self.existing_emails
+                        )
+                        payload["email"] = profile.email
+                        payload["password"] = profile.password
+                        payload["password_confirm"] = profile.password
+                        payload["birth_date"] = profile.birth_date
+                        payload["gender"] = profile.gender
+                        time.sleep(0.5)
+                        continue
 
                     response.raise_for_status()
                     data = response.json()
@@ -886,6 +1082,8 @@ class RegistrationRunner:
         with self._file_lock:
             with open(self.accounts_file, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            if "email" in account_record and account_record["email"]:
+                self.existing_emails.add(str(account_record["email"]).strip().lower())
 
     def register_batch_concurrent(
         self,
