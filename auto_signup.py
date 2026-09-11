@@ -786,7 +786,7 @@ class RegistrationRunner:
 
         # Mekanisme retry cerdas jika terkena rate limit (HTTP 429) atau tabrakan email (HTTP 400)
         last_error = ""
-        max_attempts = max(self.max_retries_on_429, 5)
+        max_attempts = max(self.max_retries_on_429, len(self.proxies) + 2, 8)
         for attempt in range(1, max_attempts + 1):
             proxy = self._get_next_proxy(country_code=profile.country)
             connect_to = min(3.5, self.timeout)
@@ -804,10 +804,14 @@ class RegistrationRunner:
 
                     if response.status_code == 429:
                         last_error = response.text
-                        if attempt < self.max_retries_on_429:
+                        if proxy:
+                            # Picu rotasi IP pada proxy yang terkena limit
+                            self.proxy_manager.mark_failed(proxy, "HTTP 429 Rate Limit")
+
+                        if attempt < max_attempts:
                             if self.proxies:
-                                logger.warning("[429] Rate limit terdeteksi, beralih ke proxy berikutnya...")
-                                time.sleep(1.0)
+                                logger.warning("[429] Rate limit IP terdeteksi, memutar proxy dan beralih ke slot berikutnya...")
+                                time.sleep(random.uniform(1.0, 2.2))
                             else:
                                 cooldown = self.retry_delay_429 * attempt
                                 logger.warning("[429] Rate limit IP terdeteksi! Menunggu cooldown %.1fs sebelum retry...", cooldown)
@@ -1034,11 +1038,18 @@ class RegistrationRunner:
         results: List[Dict[str, Any]] = []
 
         def _worker_task(idx: int) -> Dict[str, Any]:
+            # Jeda stagger awal acak agar thread tidak mengirim request di milidetik yang sama persis
+            time.sleep(random.uniform(0.1, 0.5))
             res = self.register_account(country_code=country_code, ua_mode=ua_mode)
-            # Smart retry jika terdeteksi 400 No IPs in selected country
+            # Smart retry jika terkena 429 (Rate Limit) atau 400 (No IPs)
             if res.get("status") != "success":
                 err_text = str(res.get("error", ""))
-                if "No IPs" in err_text or "400" in err_text:
+                if "429" in err_text or "Too many requests" in err_text:
+                    time.sleep(random.uniform(2.0, 4.0))
+                    retry_res = self.register_account(country_code=country_code, ua_mode=ua_mode)
+                    if retry_res.get("status") == "success":
+                        res = retry_res
+                elif "No IPs" in err_text or "400" in err_text:
                     retry_res = self.register_account(country_code="US", ua_mode=ua_mode)
                     if retry_res.get("status") == "success":
                         res = retry_res
