@@ -665,7 +665,7 @@ class RegistrationRunner:
         profile_generator: Optional[HighEntropyProfileGenerator] = None,
         ua_generator: Optional[UserAgentGenerator] = None,
         proxies: Optional[List[str]] = None,
-        timeout: float = 30.0,
+        timeout: float = 8.0,
         max_retries_on_429: int = 3,
         retry_delay_429: float = 12.0,
     ) -> None:
@@ -786,13 +786,14 @@ class RegistrationRunner:
 
         # Mekanisme retry cerdas jika terkena rate limit (HTTP 429) atau tabrakan email (HTTP 400)
         last_error = ""
-        max_attempts = max(self.max_retries_on_429, 8)
+        max_attempts = max(self.max_retries_on_429, 5)
         for attempt in range(1, max_attempts + 1):
             proxy = self._get_next_proxy(country_code=profile.country)
+            connect_to = min(3.5, self.timeout)
             client_kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
                 "http2": False if proxy else True,
-                "timeout": self.timeout,
+                "timeout": httpx.Timeout(self.timeout, connect=connect_to, read=self.timeout),
             }
             if proxy:
                 client_kwargs["proxy"] = proxy
@@ -979,85 +980,14 @@ class RegistrationRunner:
                         "profile": asdict(profile),
                     }
                 except Exception as exc:
-                    err_str = str(exc)
-                    # Jika terjadi error 400 No IPs in selected country, coba lagi menggunakan proxy negara lain
-                    if "No IPs" in err_str or "400" in err_str or "proxy" in err_str.lower():
-                        logger.warning(
-                            "[Proxy Warning] IP negara %s tidak tersedia di proxy (%s). Mencoba lagi menggunakan proxy negara lain...",
-                            profile.country,
-                            err_str.strip(),
-                        )
-                        for alt_cc in ["US", "ID", "GB", "DE", "JP", "FR"]:
-                            if alt_cc.upper() == profile.country.upper():
-                                continue
-                            alt_proxy = self.proxy_manager.get_proxy(country_code=alt_cc)
-                            alt_kwargs = {
-                                "base_url": self.BASE_URL,
-                                "http2": False if alt_proxy else True,
-                                "timeout": self.timeout,
-                            }
-                            if alt_proxy:
-                                alt_kwargs["proxy"] = alt_proxy
-
-                            try:
-                                with httpx.Client(**alt_kwargs) as alt_client:
-                                    alt_resp = alt_client.post(self.SIGNUP_ENDPOINT, headers=headers, json=payload)
-                                    if alt_resp.status_code == 200:
-                                        data = alt_resp.json()
-                                        access_token = data.get("access_token", "")
-                                        refresh_token = data.get("refresh_token", "")
-                                        user_info = data.get("user", {})
-                                        user_id = user_info.get("id")
-                                        desired_nickname = f"{profile.first_name} {profile.last_name}".strip()
-                                        if access_token and desired_nickname:
-                                            try:
-                                                patch_headers = dict(headers)
-                                                patch_headers["authorization"] = f"Bearer {access_token}"
-                                                patch_headers["content-type"] = "application/json"
-                                                alt_client.patch(
-                                                    "/api/auth/profile",
-                                                    headers=patch_headers,
-                                                    json={"nickname": desired_nickname},
-                                                )
-                                            except Exception:
-                                                pass
-
-                                        account_record = {
-                                            "email": profile.email,
-                                            "password": profile.password,
-                                            "nickname": desired_nickname,
-                                            "access_token": access_token,
-                                            "refresh_token": refresh_token,
-                                            "user_id": user_id,
-                                            "device_id": device_id,
-                                            "user_agent": user_agent,
-                                            "country": profile.country,
-                                            "created_at": datetime.now().isoformat(),
-                                        }
-                                        self._save_account_to_file(account_record)
-                                        if alt_proxy:
-                                            self.proxy_manager.mark_used(alt_proxy)
-                                        logger.info(
-                                            "Registrasi BERHASIL via proxy alternatif %s! User ID: %s | Email: %s",
-                                            alt_cc,
-                                            user_id,
-                                            profile.email,
-                                        )
-                                        return {
-                                            "status": "success",
-                                            "account": account_record,
-                                            "raw_response": data,
-                                        }
-                            except Exception as alt_exc:
-                                if alt_proxy and is_dead_or_proxy_error(alt_exc):
-                                    self.proxy_manager.mark_failed(alt_proxy, alt_exc)
-                                logger.debug("Proxy alternatif %s gagal: %s", alt_cc, alt_exc)
-                                continue
-
                     if proxy and is_dead_or_proxy_error(exc):
                         self.proxy_manager.mark_failed(proxy, exc)
-                        logger.warning("[Proxy Error] Proxy mati (%s). Mengambil proxy baru dan mencoba lagi...", exc)
-                        time.sleep(0.5)
+                        logger.warning(
+                            "[Proxy Error] Proxy %s tidak merespon (%s). Mencoba slot proxy berikutnya...",
+                            proxy,
+                            exc,
+                        )
+                        time.sleep(0.3)
                         continue
 
                     logger.error("Terjadi exception pada pendaftaran: %s", exc)

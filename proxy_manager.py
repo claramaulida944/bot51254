@@ -295,6 +295,7 @@ class HypeProxyClient:
     PROXY_HOST: str = "proxy.hypeproxy.site"
     DEFAULT_TIMEOUT: float = 12.0
     _cached_user_id: Optional[str] = None
+    _last_rotate_time: Dict[Union[int, str], float] = {}
 
     @classmethod
     def get_headers(cls) -> Dict[str, str]:
@@ -391,7 +392,18 @@ class HypeProxyClient:
 
     @classmethod
     def rotate_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
-        """[Endpoint 5/16] POST /api/proxies/:id/rotate — Melakukan rotasi IP proxy secara instan."""
+        """
+        [Endpoint 5/16] POST /api/proxies/:id/rotate — Melakukan rotasi IP proxy secara instan.
+        Dilengkapi cooldown 60 detik per slot agar tidak membebani server dan mencegah pemblokiran.
+        """
+        now = time.time()
+        last = cls._last_rotate_time.get(proxy_id, 0)
+        if now - last < 60:
+            remaining = int(60 - (now - last))
+            logger.debug(f"[HypeProxy] Slot #{proxy_id} masih dalam cooldown rotasi ({remaining}s tersisa). Lewati.")
+            return {"ok": True, "cooldown": True, "remaining": remaining}
+
+        cls._last_rotate_time[proxy_id] = now
         url = f"{cls.BASE_URL}/api/proxies/{proxy_id}/rotate"
         try:
             with httpx.Client(timeout=cls.DEFAULT_TIMEOUT) as client:
@@ -871,22 +883,20 @@ class ProxyManager:
 
             masked = p_found.get_masked_url()
 
-            # 1. Penanganan Khusus HypeProxy: ROTASI IP, JANGAN HAPUS SLOT
+            # 1. Penanganan Khusus HypeProxy: ROTASI IP HANYA SAAT GAGAL / RATE-LIMIT (BUKAN TIAP KALI USED)
             if p_found.is_hypeproxy:
-                if p_found.proxy_id:
-                    # Picu rotasi IP instan di thread terpisah agar pemanggil tidak terblokir
+                if reason == "failed" and p_found.proxy_id:
+                    # Picu rotasi IP instan di thread terpisah HANYA jika proxy gagal/kena limit
                     threading.Thread(
                         target=HypeProxyClient.rotate_proxy,
                         args=(p_found.proxy_id,),
                         daemon=True,
                     ).start()
-
-                if reason == "failed":
-                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id or masked} mengalami error/blokir -> Memicu ROTASI IP instan.")
+                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/blokir -> Memicu ROTASI IP instan.")
                     if self.verbose:
                         console.print(f"[dim yellow][HYPEPROXY-ROTATE] Slot #{p_found.proxy_id} otomatis dirotasi IP baru![/]")
                 elif reason == "used":
-                    logger.info(f"[HypeProxy] Slot #{p_found.proxy_id or masked} selesai digunakan.")
+                    logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan.")
                 return True
 
             # 2. Penanganan Bright Data
@@ -927,9 +937,9 @@ class ProxyManager:
         auto_replenish: bool = True,
     ) -> Optional[str]:
         """
-        Mengambil proxy untuk satu sesi kerja:
-        - Jika HypeProxy atau Bright Data: mengambil slot secara round-robin tanpa menghapus slot dari berkas.
-        - Jika negara diminta dan berbeda pada HypeProxy, region dapat disesuaikan otomatis.
+        Mengambil proxy untuk satu sesi kerja secara instan:
+        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar 8 slot.
+        - Langsung mengembalikan URL proxy tanpa latensi tambahan.
         """
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
@@ -946,16 +956,7 @@ class ProxyManager:
                 if proxy_info.is_brightdata:
                     return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
-                if proxy_info.is_hypeproxy and country_code and country_code.upper() not in ("RANDOM", "ALL", "AUTO"):
-                    # Sesuaikan region proxy jika diperlukan
-                    if proxy_info.proxy_id and proxy_info.current_country != country_code.upper():
-                        threading.Thread(
-                            target=HypeProxyClient.set_proxy_region,
-                            args=(proxy_info.proxy_id, country_code.upper()),
-                            daemon=True,
-                        ).start()
-                        proxy_info.current_country = country_code.upper()
-
+                # Untuk HypeProxy: Langsung return URL proxy tanpa beban API tambahan
                 return proxy_info.raw_url
 
             # Legacy free proxy (single-use)

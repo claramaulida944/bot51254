@@ -5,7 +5,7 @@
 # =============================================================================
 
 http://user41:zdlJawKk8Wnt@proxy.hypeproxy.site:1043
-socks5://user42:ILch8S392vH9@proxy.hypeproxy.site:1044
+http://user42:ILch8S392vH9@proxy.hypeproxy.site:1044
 http://user43:2p2DorNdNieF@proxy.hypeproxy.site:1045
 http://user44:DwtgLhgfxyO_@proxy.hypeproxy.site:1046
 http://user45:NBRHOTVGpHS0@proxy.hypeproxy.site:1047
