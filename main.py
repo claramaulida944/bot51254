@@ -251,126 +251,292 @@ def feature_auto_signup() -> None:
 # =============================================================================
 # FITUR 3: MANAJEMEN & VALIDASI AKUN
 # =============================================================================
+def parse_range_indices(input_str: str, max_val: int) -> List[int]:
+    """Mengurai input nomor/rentang seperti '1, 3, 5-8' menjadi indeks 0-indexed yang valid."""
+    indices = set()
+    parts = [p.strip() for p in input_str.replace(";", ",").split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            sub = part.split("-")
+            if len(sub) == 2 and sub[0].isdigit() and sub[1].isdigit():
+                start, end = int(sub[0]), int(sub[1])
+                for v in range(min(start, end), max(start, end) + 1):
+                    if 1 <= v <= max_val:
+                        indices.add(v - 1)
+        elif part.isdigit():
+            val = int(part)
+            if 1 <= val <= max_val:
+                indices.add(val - 1)
+    return sorted(list(indices))
+
+
+def save_accounts_to_file(accounts: List[Dict[str, Any]], filepath: str = "akun.txt") -> None:
+    """Menyimpan daftar akun ke berkas akun.txt dalam format JSON Lines."""
+    with open(filepath, "w", encoding="utf-8") as f:
+        for acc in accounts:
+            f.write(json.dumps(acc, ensure_ascii=False) + "\n")
+
+
 def feature_account_manager() -> None:
-    """Melihat daftar akun yang tersimpan dan memvalidasi keaktifan tokennya."""
-    console.print("\n[bold cyan]>>> Modul Manajemen & Validasi Akun[/]\n")
-    accounts = load_accounts_from_file("akun.txt")
+    """Melihat daftar akun yang tersimpan, menghapus akun tertentu/mati/semua, dan memvalidasi keaktifan tokennya."""
+    while True:
+        console.print("\n[bold cyan]>>> Modul Manajemen & Validasi Akun[/]\n")
+        accounts = load_accounts_from_file("akun.txt")
 
-    if not accounts:
-        console.print("[yellow]Belum ada akun tersimpan di 'akun.txt'. Gunakan Menu [2] untuk membuat akun baru.[/]")
-        wait_for_enter()
-        return
+        if not accounts:
+            console.print("[yellow]Belum ada akun tersimpan di 'akun.txt'. Gunakan Menu [2] untuk membuat akun baru.[/]")
+            wait_for_enter()
+            return
 
-    acc_table = Table(title=f"[bold green]Daftar Akun Terdaftar ({len(accounts)} Akun)[/]", border_style="cyan")
-    acc_table.add_column("No", style="dim", width=4)
-    acc_table.add_column("User ID", style="yellow")
-    acc_table.add_column("Nama / Nickname", style="bold yellow")
-    acc_table.add_column("Email", style="bold white")
-    acc_table.add_column("Negara", style="cyan")
-    acc_table.add_column("User Agent", style="dim")
-    acc_table.add_column("Created At", style="dim")
+        acc_table = Table(title=f"[bold green]Daftar Akun Terdaftar ({len(accounts)} Akun)[/]", border_style="cyan")
+        acc_table.add_column("No", style="dim", width=4)
+        acc_table.add_column("User ID", style="yellow")
+        acc_table.add_column("Nama / Nickname", style="bold yellow")
+        acc_table.add_column("Email", style="bold white")
+        acc_table.add_column("Negara", style="cyan")
+        acc_table.add_column("User Agent", style="dim")
+        acc_table.add_column("Created At", style="dim")
 
-    for idx, acc in enumerate(accounts, start=1):
-        created = acc.get("created_at", "-")[:16].replace("T", " ")
-        nickname = acc.get("nickname") or f"[dim]({clean_name_from_email(acc.get('email', ''))})[/]"
-        acc_table.add_row(
-            str(idx),
-            str(acc.get("user_id", "-")),
-            nickname,
-            acc.get("email", "-"),
-            acc.get("country", "-"),
-            acc.get("user_agent", "-")[:18] + "...",
-            created,
+        for idx, acc in enumerate(accounts, start=1):
+            created = acc.get("created_at", "-")[:16].replace("T", " ")
+            nickname = acc.get("nickname") or f"[dim]({clean_name_from_email(acc.get('email', ''))})[/]"
+            acc_table.add_row(
+                str(idx),
+                str(acc.get("user_id", "-")),
+                nickname,
+                acc.get("email", "-"),
+                acc.get("country", "-"),
+                acc.get("user_agent", "-")[:18] + "...",
+                created,
+            )
+
+        console.print(acc_table)
+        console.print()
+
+        console.print("[bold cyan]Pilihan Aksi Manajemen Akun:[/] ")
+        console.print(" [bold green][1][/] Hapus Akun Tertentu (Pilih Nomor / Rentang, cth: 1, 3, 5-10)")
+        console.print(" [bold green][2][/] Hapus Akun Berdasarkan Kata Kunci / Domain Email")
+        console.print(" [bold green][3][/] Hapus Semua Akun Kedaluwarsa / Mati (Auto-Detect & Clean)")
+        console.print(" [bold red][4][/] Kosongkan / Hapus SEMUA Akun dari 'akun.txt'")
+        console.print(" [bold green][5][/] Uji Keaktifan Token & Auto Re-Login")
+        console.print(" [bold green][6][/] Sinkronkan & Ubah Nickname Akun ke Server API")
+        console.print(" [bold yellow][0][/] Kembali ke Menu Utama")
+        console.print()
+
+        action = Prompt.ask(
+            "[bold green]?[/] Pilih tindakan manajemen akun [0-6]",
+            choices=["0", "1", "2", "3", "4", "5", "6"],
+            default="0",
         )
 
-    console.print(acc_table)
-    console.print()
+        if action == "0":
+            break
 
-    # Opsi sinkronisasi nama ke server
-    sync_names = Confirm.ask(
-        "[bold green]?[/] Sinkronkan & Ubah Nama Pengguna (Nickname) semua akun di server API sekarang?",
-        default=False,
-    )
-    if sync_names:
-        run_sync_nicknames_cli()
-        wait_for_enter()
-        return
+        elif action == "1":
+            del_str = Prompt.ask(
+                f"[bold green]?[/] Masukkan nomor akun yang ingin dihapus (1-{len(accounts)}, cth: 1, 3, 5-8 atau 'batal')",
+                default="batal",
+            ).strip()
+            if del_str.lower() in ("batal", "cancel", "0", ""):
+                continue
 
-    # Opsi uji token
-    check_tokens = Confirm.ask("[bold green]?[/] Uji keaktifan semua Bearer Token via API sekarang?", default=False)
-    if check_tokens:
-        console.print("\n[dim]Menguji keaktifan token ke endpoint resmi backend...[/]\n")
-        expired_accounts = []
-        with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
-            for idx, acc in enumerate(accounts, start=1):
-                headers = {
-                    "authorization": f"Bearer {acc.get('access_token', '')}",
-                    "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
-                    "x-device-id": acc.get("device_id", ""),
-                }
-                try:
-                    resp = client.get("/api/reading/progress", headers=headers)
-                    if resp.status_code != 401:
-                        status_str = "[bold green]AKTIF (Valid)[/]"
-                    else:
-                        status_str = "[bold red]KADALUARSA (Expired)[/]"
-                        expired_accounts.append(acc)
-                except Exception as exc:
-                    status_str = f"[yellow]Error: {exc}[/]"
+            indices = parse_range_indices(del_str, len(accounts))
+            if not indices:
+                console.print("[yellow]Tidak ada nomor akun valid yang dipilih.[/]")
+                continue
 
-                console.print(f"  [{idx:02d}] {acc.get('email')} -> {status_str}")
+            console.print(f"\n[bold yellow]Daftar akun yang akan dihapus ({len(indices)} akun):[/]")
+            for idx in indices:
+                acc = accounts[idx]
+                console.print(f"  - [red]#{idx + 1}[/] {acc.get('email')} (ID: {acc.get('user_id')})")
 
-        if expired_accounts:
-            console.print(f"\n[yellow]Terdeteksi {len(expired_accounts)} akun dengan token kadaluarsa.[/]")
-            do_relogin = Confirm.ask(
-                "[bold green]?[/] Lakukan Login Ulang otomatis (Re-Login) sekarang dengan email & password?",
-                default=True,
+            confirm_del = Confirm.ask(
+                f"\n[bold red]?[/] Yakin ingin menghapus {len(indices)} akun di atas secara permanen dari 'akun.txt'?",
+                default=False,
             )
-            if do_relogin:
-                console.print("\n[cyan]Memulai proses Login Ulang akun...[/]\n")
-                relogin_success = 0
-                lines = []
-                with open("akun.txt", "r", encoding="utf-8", errors="replace") as f:
-                    file_accounts = [json.loads(l.strip()) for l in f if l.strip()]
+            if confirm_del:
+                remaining = [acc for i, acc in enumerate(accounts) if i not in indices]
+                save_accounts_to_file(remaining)
+                console.print(f"\n[bold green][OK] Berhasil menghapus {len(indices)} akun! Sisa akun di list: {len(remaining)}.[/]")
+            else:
+                console.print("[dim]Penghapusan dibatalkan.[/]")
+            wait_for_enter()
 
-                with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=20.0) as relogin_client:
-                    for i, acc in enumerate(file_accounts, start=1):
+        elif action == "2":
+            keyword = Prompt.ask("[bold green]?[/] Masukkan kata kunci email yang ingin dihapus (cth: @yahoo.com atau nama)").strip()
+            if not keyword:
+                continue
+
+            matches = [i for i, acc in enumerate(accounts) if keyword.lower() in acc.get("email", "").lower()]
+            if not matches:
+                console.print(f"[yellow]Tidak ditemukan akun yang mengandung '{keyword}'.[/]")
+                wait_for_enter()
+                continue
+
+            console.print(f"\n[bold yellow]Ditemukan {len(matches)} akun yang cocok dengan '{keyword}':[/]")
+            for idx in matches[:15]:
+                console.print(f"  - [red]#{idx + 1}[/] {accounts[idx].get('email')}")
+            if len(matches) > 15:
+                console.print(f"  ... dan {len(matches) - 15} akun lainnya.")
+
+            confirm_del = Confirm.ask(
+                f"\n[bold red]?[/] Hapus seluruh {len(matches)} akun tersebut?",
+                default=False,
+            )
+            if confirm_del:
+                remaining = [acc for i, acc in enumerate(accounts) if i not in matches]
+                save_accounts_to_file(remaining)
+                console.print(f"\n[bold green][OK] Berhasil menghapus {len(matches)} akun! Sisa akun: {len(remaining)}.[/]")
+            wait_for_enter()
+
+        elif action == "3":
+            console.print("\n[dim]Memeriksa keaktifan token seluruh akun ke backend...[/]\n")
+            dead_indices = []
+            with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
+                for idx, acc in enumerate(accounts):
+                    headers = {
+                        "authorization": f"Bearer {acc.get('access_token', '')}",
+                        "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                        "x-device-id": acc.get("device_id", ""),
+                    }
+                    is_active = False
+                    try:
+                        resp = client.get("/api/reading/progress", headers=headers)
+                        if resp.status_code != 401:
+                            is_active = True
+                    except Exception:
+                        pass
+
+                    if not is_active:
                         email = acc.get("email")
-                        password = acc.get("password")
-                        if not email or not password:
-                            lines.append(json.dumps(acc, ensure_ascii=False))
-                            continue
+                        pw = acc.get("password")
+                        relogin_ok = False
+                        if email and pw:
+                            try:
+                                h = {
+                                    "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                                    "x-device-id": acc.get("device_id", ""),
+                                    "x-platform": "android",
+                                    "x-app-variant": "prod",
+                                    "x-app-version": "3.0.52",
+                                    "content-type": "application/json",
+                                    "accept": "application/json",
+                                }
+                                r = client.post("/api/auth/login", json={"login_id": email, "password": pw}, headers=h)
+                                if r.status_code == 200:
+                                    d = r.json()
+                                    acc["access_token"] = d.get("access_token", acc.get("access_token"))
+                                    if "refresh_token" in d:
+                                        acc["refresh_token"] = d.get("refresh_token")
+                                    relogin_ok = True
+                            except Exception:
+                                pass
 
-                        h = {
-                            "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
-                            "x-device-id": acc.get("device_id", ""),
-                            "x-platform": "android",
-                            "x-app-variant": "prod",
-                            "x-app-version": "3.0.52",
-                            "content-type": "application/json",
-                            "accept": "application/json",
-                        }
-                        try:
-                            r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
-                            if r.status_code == 200:
-                                d = r.json()
-                                acc["access_token"] = d.get("access_token", acc.get("access_token"))
-                                if "refresh_token" in d:
-                                    acc["refresh_token"] = d.get("refresh_token")
-                                relogin_success += 1
-                                console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru)[/]")
-                            else:
-                                console.print(f"  [{i:02d}] {email} -> [red]Gagal ({r.status_code})[/]")
-                        except Exception as err:
-                            console.print(f"  [{i:02d}] {email} -> [red]Error: {err}[/]")
+                        if not relogin_ok:
+                            dead_indices.append(idx)
+                            console.print(f"  [red]#{idx + 1:02d} {acc.get('email')} -> MATI / GAGAL LOGIN (Kandidat Hapus)[/]")
+                        else:
+                            console.print(f"  [green]#{idx + 1:02d} {acc.get('email')} -> RE-LOGIN SUKSES (Disimpan)[/]")
+                    else:
+                        console.print(f"  [cyan]#{idx + 1:02d} {acc.get('email')} -> AKTIF[/]")
 
-                        lines.append(json.dumps(acc, ensure_ascii=False))
+            save_accounts_to_file(accounts)
 
-                with open("akun.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
-                console.print(f"\n[bold green]Selesai! {relogin_success} akun berhasil diperbarui dan disimpan ke 'akun.txt'.[/]")
+            if not dead_indices:
+                console.print("\n[bold green]Semua akun masih aktif atau berhasil di-relogin. Tidak ada akun mati![/]")
+            else:
+                console.print(f"\n[yellow]Terdeteksi {len(dead_indices)} akun yang mati / tidak bisa dilogin.[/]")
+                do_del = Confirm.ask(
+                    f"[bold red]?[/] Hapus {len(dead_indices)} akun mati tersebut dari 'akun.txt' sekarang?",
+                    default=True,
+                )
+                if do_del:
+                    remaining = [acc for i, acc in enumerate(accounts) if i not in dead_indices]
+                    save_accounts_to_file(remaining)
+                    console.print(f"[bold green][OK] Berhasil membersihkan {len(dead_indices)} akun mati! Sisa akun: {len(remaining)}.[/]")
+            wait_for_enter()
 
-    wait_for_enter()
+        elif action == "4":
+            console.print(f"\n[bold red]PERINGATAN:[/] Anda akan menghapus SELURUH {len(accounts)} akun di 'akun.txt'!")
+            confirm_all = Confirm.ask("[bold red]?[/] Apakah Anda benar-benar yakin?", default=False)
+            if confirm_all:
+                backup_name = f"akun_backup_{int(time.time())}.txt"
+                save_accounts_to_file(accounts, filepath=backup_name)
+                save_accounts_to_file([], filepath="akun.txt")
+                console.print(f"[bold green][OK] Berkas 'akun.txt' telah dikosongkan.[/]")
+                console.print(f"[dim]Backup cadangan telah dibuat otomatis di '{backup_name}'.[/]")
+            else:
+                console.print("[dim]Aksi dibatalkan.[/]")
+            wait_for_enter()
+
+        elif action == "5":
+            console.print("\n[dim]Menguji keaktifan token ke endpoint resmi backend...[/]\n")
+            expired_accounts = []
+            with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
+                for idx, acc in enumerate(accounts, start=1):
+                    headers = {
+                        "authorization": f"Bearer {acc.get('access_token', '')}",
+                        "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                        "x-device-id": acc.get("device_id", ""),
+                    }
+                    try:
+                        resp = client.get("/api/reading/progress", headers=headers)
+                        if resp.status_code != 401:
+                            status_str = "[bold green]AKTIF (Valid)[/]"
+                        else:
+                            status_str = "[bold red]KADALUARSA (Expired)[/]"
+                            expired_accounts.append(acc)
+                    except Exception as exc:
+                        status_str = f"[yellow]Error: {exc}[/]"
+
+                    console.print(f"  [{idx:02d}] {acc.get('email')} -> {status_str}")
+
+            if expired_accounts:
+                console.print(f"\n[yellow]Terdeteksi {len(expired_accounts)} akun dengan token kadaluarsa.[/]")
+                do_relogin = Confirm.ask(
+                    "[bold green]?[/] Lakukan Login Ulang otomatis (Re-Login) sekarang dengan email & password?",
+                    default=True,
+                )
+                if do_relogin:
+                    console.print("\n[cyan]Memulai proses Login Ulang akun...[/]\n")
+                    relogin_success = 0
+                    with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=20.0) as relogin_client:
+                        for i, acc in enumerate(accounts, start=1):
+                            email = acc.get("email")
+                            password = acc.get("password")
+                            if not email or not password:
+                                continue
+
+                            h = {
+                                "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                                "x-device-id": acc.get("device_id", ""),
+                                "x-platform": "android",
+                                "x-app-variant": "prod",
+                                "x-app-version": "3.0.52",
+                                "content-type": "application/json",
+                                "accept": "application/json",
+                            }
+                            try:
+                                r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
+                                if r.status_code == 200:
+                                    d = r.json()
+                                    acc["access_token"] = d.get("access_token", acc.get("access_token"))
+                                    if "refresh_token" in d:
+                                        acc["refresh_token"] = d.get("refresh_token")
+                                    relogin_success += 1
+                                    console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru)[/]")
+                                else:
+                                    console.print(f"  [{i:02d}] {email} -> [red]Gagal ({r.status_code})[/]")
+                            except Exception as err:
+                                console.print(f"  [{i:02d}] {email} -> [red]Error: {err}[/]")
+
+                    save_accounts_to_file(accounts)
+                    console.print(f"\n[bold green]Selesai! {relogin_success} akun berhasil diperbarui dan disimpan ke 'akun.txt'.[/]")
+            wait_for_enter()
+
+        elif action == "6":
+            run_sync_nicknames_cli()
+            wait_for_enter()
 
 
 # =============================================================================
