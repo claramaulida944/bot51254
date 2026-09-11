@@ -696,20 +696,24 @@ class FullAutoOrchestrator:
             )
         )
 
+        # Pastikan proxy mencukupi jika menggunakan free proxy
+        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+            self.proxy_manager.ensure_proxies(
+                min_count=max(15, total_accounts // 2),
+                target_count=max(1000, total_accounts),
+            )
+        self.proxy_manager.verbose = False
+
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(no_wrap=True)),
-            TextColumn("{task.description}", justify="left", table_column=Column(no_wrap=True)),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(width=13, no_wrap=True)),
+            TextColumn("{task.description}", justify="left", table_column=Column(width=34, no_wrap=True)),
             BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=console,
             refresh_per_second=4,
         ) as progress:
-            # Pastikan proxy mencukupi jika menggunakan free proxy
-            if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
-                self.proxy_manager.ensure_proxies(min_count=max(3, total_accounts // 2), target_count=max(30, total_accounts))
-
             overall_task = progress.add_task(
                 description="[dim]Memproses antrean akun...[/]",
                 total=total_accounts,

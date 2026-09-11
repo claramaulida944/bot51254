@@ -205,6 +205,7 @@ class ProxyManager:
         proxy_file: str = "proxies.txt",
         auto_replenish: bool = True,
         min_replenish_threshold: int = 15,
+        verbose: bool = False,
     ):
         self.proxy_file = Path(proxy_file)
         self.raw_proxies: List[str] = []
@@ -213,6 +214,7 @@ class ProxyManager:
         self._lock = threading.RLock()
         self._auto_replenish: bool = auto_replenish
         self._min_replenish_threshold: int = min_replenish_threshold
+        self.verbose: bool = verbose
         self.load_proxies()
 
     def _write_to_file(self, proxy_list: List[str]) -> None:
@@ -287,18 +289,21 @@ class ProxyManager:
             if len(self.parsed_proxies) >= min_count:
                 return len(self.parsed_proxies)
 
-            console.print(
-                f"\n[bold magenta][AUTO-REPLENISH] Sisa proxy ({len(self.parsed_proxies)}) menipis / habis (min: {min_count}).[/] "
-                f"[yellow]Mengambil {target_count} proxy baru secara instan...[/]"
-            )
+            if self.verbose:
+                console.print(
+                    f"\n[bold magenta][AUTO-REPLENISH] Sisa proxy ({len(self.parsed_proxies)}) menipis / habis (min: {min_count}).[/] "
+                    f"[yellow]Mengambil {target_count} proxy baru secara instan...[/]"
+                )
             try:
                 FreeProxyScraper.scrape_fast(
                     target_count=target_count,
                     output_file=str(self.proxy_file),
                     append=True,
+                    verbose=self.verbose,
                 )
                 self.load_proxies()
-                console.print(f"[bold green][AUTO-REPLENISH] Selesai! {len(self.parsed_proxies)} proxy baru siap diantrekan.[/]\n")
+                if self.verbose:
+                    console.print(f"[bold green][AUTO-REPLENISH] Selesai! {len(self.parsed_proxies)} proxy baru siap diantrekan.[/]\n")
                 return len(self.parsed_proxies)
             except Exception as exc:
                 logger.error(f"[Auto-Replenish] Gagal scraping proxy otomatis: {exc}")
@@ -352,10 +357,12 @@ class ProxyManager:
             sisa = len(self.parsed_proxies)
             if reason == "failed":
                 logger.warning(f"[-] [ProxyManager] Proxy mati/gagal konek otomatis DIHAPUS: {masked} (Sisa: {sisa})")
-                console.print(f"[dim red][DEL] Proxy mati dihapus:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
+                if self.verbose:
+                    console.print(f"[dim red][DEL] Proxy mati dihapus:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
             elif reason == "used":
                 logger.info(f"[+] [ProxyManager] Proxy selesai dipakai & DIHAPUS dari antrean: {masked} (Sisa: {sisa})")
-                console.print(f"[dim yellow][USED] Proxy selesai digunakan & dilepas:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
+                if self.verbose:
+                    console.print(f"[dim yellow][USED] Proxy selesai digunakan & dilepas:[/] [dim]{masked}[/] [dim](Sisa {sisa} proxy)[/]")
 
             # Auto-replenish jika kuota habis/menipis
             if self._auto_replenish and not self.is_brightdata and sisa < self._min_replenish_threshold:
@@ -754,6 +761,7 @@ class FreeProxyScraper:
         target_count: int = 1000,
         output_file: str = "proxies.txt",
         append: bool = False,
+        verbose: bool = False,
     ) -> List[str]:
         """
         Pengambilan proxy instan super cepat TANPA validasi lambat sebelumnya.
@@ -761,16 +769,18 @@ class FreeProxyScraper:
         dan langsung menyimpannya ke berkas dalam 2-3 detik.
         Validasi dilakukan secara dinamis (on-the-fly) saat bot berjalan.
         """
-        console.print(f"\n[bold cyan]>>> Mengambil {target_count:,} Proxy secara Instan (Tanpa Validasi Awal)...[/]")
+        if verbose:
+            console.print(f"\n[bold cyan]>>> Mengambil {target_count:,} Proxy secara Instan (Tanpa Validasi Awal)...[/]")
         candidates = cls.scrape_candidates()
         if not candidates:
-            console.print("[red]Gagal mengambil daftar proxy dari sumber.[/]")
+            if verbose:
+                console.print("[red]Gagal mengambil daftar proxy dari sumber.[/]")
             return []
 
         random.shuffle(candidates)
         selected = candidates[:target_count]
 
-        mgr = ProxyManager(output_file, auto_replenish=False)
+        mgr = ProxyManager(output_file, auto_replenish=False, verbose=False)
         if append and mgr.has_proxies:
             existing = [p.raw_url for p in mgr.parsed_proxies]
             merged = existing + [p for p in selected if p not in existing]
@@ -778,10 +788,11 @@ class FreeProxyScraper:
         else:
             mgr.save_proxies(selected)
 
-        console.print(
-            f"[bold green][OK] Berhasil memuat {len(selected):,} proxy mentah ke '{output_file}' dalam sekejap![/]\n"
-            f"[dim]Proxy mati akan langsung dihapus dan diganti saat sesi berjalan.[/]\n"
-        )
+        if verbose:
+            console.print(
+                f"[bold green][OK] Berhasil memuat {len(selected):,} proxy mentah ke '{output_file}' dalam sekejap![/]\n"
+                f"[dim]Proxy mati akan langsung dihapus dan diganti saat sesi berjalan.[/]\n"
+            )
         return selected
 
     @classmethod
@@ -919,7 +930,7 @@ def test_proxy_cli() -> None:
                 target_n = IntPrompt.ask("[bold green]?[/] Berapa jumlah proxy yang ingin diambil instan?", default=1000)
             except Exception:
                 target_n = 1000
-            FreeProxyScraper.scrape_fast(target_count=target_n, output_file="proxies.txt")
+            FreeProxyScraper.scrape_fast(target_count=target_n, output_file="proxies.txt", verbose=True)
             default_proxy_manager.load_proxies()
 
         elif choice == "2":

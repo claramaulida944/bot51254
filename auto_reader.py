@@ -1269,11 +1269,18 @@ class ReadingSimulationOrchestrator:
                 border_style="cyan",
             )
         )
+        # Pastikan ketersediaan proxy mencukupi sebelum memulai UI Progress
+        if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
+            self.proxy_manager.ensure_proxies(
+                min_count=max(15, self.total_readers // 2),
+                target_count=max(1000, self.total_readers),
+            )
+        self.proxy_manager.verbose = False
 
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(no_wrap=True)),
-            TextColumn("{task.description}", justify="left", table_column=Column(no_wrap=True)),
+            TextColumn("[bold cyan]{task.fields[role]}[/]", justify="left", table_column=Column(width=13, no_wrap=True)),
+            TextColumn("{task.description}", justify="left", table_column=Column(width=34, no_wrap=True)),
             BarColumn(bar_width=16),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
@@ -1293,10 +1300,6 @@ class ReadingSimulationOrchestrator:
                     role=f"Slot-{s_idx:02d}",
                 )
                 slot_queue.put_nowait((s_idx, tid))
-
-            # Pastikan ketersediaan proxy mencukupi jika menggunakan proxy free
-            if self.proxy_manager.has_proxies and not self.proxy_manager.is_brightdata:
-                self.proxy_manager.ensure_proxies(min_count=max(15, self.total_readers // 2), target_count=max(1000, self.total_readers))
 
             tasks = []
             for idx, acc in enumerate(self.member_accounts, start=1):
