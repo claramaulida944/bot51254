@@ -217,10 +217,18 @@ class TokenManager:
         """Mengambil tarif aktif saat ini berdasarkan jenis aksi bot."""
         pricing = cls.get_pricing_config()
         rates = pricing.get("rates", {})
-        if item_type in ("valid_reader", "member_reader", "member_read"):
+        if item_type in ("valid_reader", "member_reader", "member_read", "full_auto"):
             return rates.get("valid_reader", RATE_VALID_READER)
         elif item_type in ("guest_reader", "guest_read"):
             return rates.get("guest_reader", RATE_GUEST_READER)
+        elif item_type in ("like", "like_only"):
+            return rates.get("like", rates.get("like_only", RATE_LIKE))
+        elif item_type in ("bookmark", "bookmark_only"):
+            return rates.get("bookmark", rates.get("bookmark_only", RATE_BOOKMARK))
+        elif item_type in ("follow", "follow_only"):
+            return rates.get("follow", rates.get("follow_only", RATE_FOLLOW))
+        elif item_type in ("account_generator", "generator"):
+            return rates.get("account_generator", RATE_ACCOUNT_GENERATOR)
         return rates.get(item_type, 50)
 
     @classmethod

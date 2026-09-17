@@ -458,6 +458,7 @@ function calculateEstimatedCost() {
 
   const vrRate = (globalPricing && globalPricing.rates && globalPricing.rates.valid_reader) ? globalPricing.rates.valid_reader : 500;
   const grRate = (globalPricing && globalPricing.rates && globalPricing.rates.guest_reader) ? globalPricing.rates.guest_reader : 50;
+  const likeRate = (globalPricing && globalPricing.rates && typeof globalPricing.rates.like !== "undefined") ? globalPricing.rates.like : 100;
   let formulaNote = "";
 
   if (activeMode === "full_auto" || activeMode === "member_read") {
@@ -466,9 +467,13 @@ function calculateEstimatedCost() {
   } else if (activeMode === "guest_read") {
     estimated = accCount * grRate;
     formulaNote = `${accCount.toLocaleString('id-ID')} Sesi Tamu × Rp ${grRate.toLocaleString('id-ID')}`;
-  } else if (activeMode === "like_only") {
-    estimated = 0;
-    formulaNote = "Mode Interaksi Sosial: Bebas biaya saldo";
+  } else if (activeMode === "like_only" || activeMode === "bookmark_only" || activeMode === "follow_only") {
+    estimated = accCount * likeRate;
+    if (likeRate > 0) {
+      formulaNote = `${accCount.toLocaleString('id-ID')} Sesi Interaksi × Rp ${likeRate.toLocaleString('id-ID')}`;
+    } else {
+      formulaNote = "Mode Interaksi Sosial: Bebas biaya saldo";
+    }
   }
 
   const costDisplay = document.getElementById("estimatedCostDisplay");
@@ -1686,6 +1691,17 @@ async function loadPricingConfig() {
       const grPriceEl = document.getElementById("modeGuestReaderPrice");
       if (grPriceEl) {
         grPriceEl.textContent = `Rp ${grRate.toLocaleString('id-ID')} / sesi`;
+      }
+      const likePriceEl = document.getElementById("modeLikePrice");
+      if (likePriceEl) {
+        const likeRate = (data.rates && typeof data.rates.like !== "undefined") ? data.rates.like : 100;
+        if (likeRate > 0) {
+          likePriceEl.textContent = `Rp ${likeRate.toLocaleString('id-ID')} / sesi`;
+          likePriceEl.style.color = "";
+        } else {
+          likePriceEl.textContent = "Tanpa Biaya";
+          likePriceEl.style.color = "var(--text-muted)";
+        }
       }
 
       // 3. Re-render public pricing cards on homepage if element exists

@@ -246,7 +246,13 @@ async def start_task(req: TaskStartRequest):
     rates = TokenManager.get_pricing_config().get("rates", {})
     vr_rate = rates.get("valid_reader", 500)
     gr_rate = rates.get("guest_reader", 50)
-    min_bal = vr_rate if req.mode in ("full_auto", "member_read") else gr_rate
+    like_rate = rates.get("like", 100)
+    if req.mode in ("full_auto", "member_read"):
+        min_bal = vr_rate
+    elif req.mode in ("like_only", "bookmark_only", "follow_only"):
+        min_bal = like_rate
+    else:
+        min_bal = gr_rate
     is_valid, msg, token = TokenManager.verify_token(token_code, min_required_balance=min_bal)
     if not is_valid:
         return JSONResponse(

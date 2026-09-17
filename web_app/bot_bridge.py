@@ -646,20 +646,20 @@ class BotBridge:
                     task.stats["accounts_done"] += 1
                     task.stats["chapters_read"] += 1
                     
-                    if task.stats["accounts_done"] % 10 == 0:
-                        gr_rate = TokenManager.get_rate("guest_reader") * 10
-                        deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
-                            task.token_code,
-                            item_type="guest_reader",
-                            quantity=10,
-                            note=f"Pemotongan 10 sesi pembaca tamu (Sesi #{task.stats['accounts_done']})"
-                        )
-                        if deduct_ok:
-                            task.stats["total_spent"] += gr_rate
-                            task.stats["current_balance"] = new_bal
-                            await task.emit_log(f"[{i}/{guest_count}] Paket 10 Pembaca Tamu berhasil (-Rp {gr_rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
+                    gr_rate = TokenManager.get_rate("guest_reader")
+                    deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
+                        task.token_code,
+                        item_type="guest_reader",
+                        quantity=1,
+                        note=f"Sesi pembaca tamu #{task.stats['accounts_done']}"
+                    )
+                    if deduct_ok:
+                        task.stats["total_spent"] += gr_rate
+                        task.stats["current_balance"] = new_bal
+                        await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} sukses (-Rp {gr_rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
                     else:
-                        await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} sukses mencatatkan view.", level="info")
+                        await task.emit_log(f"[{i}/{guest_count}] Saldo token tidak mencukupi untuk melanjutkan sesi tamu.", level="error")
+                        break
                     await task.emit_stats()
                 else:
                     await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} gagal: {msg}", level="warning")
@@ -744,7 +744,26 @@ class BotBridge:
                 if success:
                     successful_count += 1
                     task.stats["accounts_done"] = successful_count
-                    await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')})", level="info")
+                    rate_key = "like" if mode == "like_only" else ("bookmark" if mode == "bookmark_only" else "follow")
+                    interaction_rate = TokenManager.get_rate(rate_key)
+                    
+                    if interaction_rate > 0:
+                        deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
+                            task.token_code,
+                            item_type=rate_key,
+                            quantity=1,
+                            note=f"Kirim {item_name} via akun #{successful_count}"
+                        )
+                        if deduct_ok:
+                            task.stats["total_spent"] += interaction_rate
+                            task.stats["current_balance"] = new_bal
+                            await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')}) (-Rp {interaction_rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
+                        else:
+                            await task.emit_log(f"Saldo token tidak mencukupi untuk interaksi {item_name}.", level="error")
+                            break
+                    else:
+                        await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')})", level="info")
+                    
                     await task.emit_stats()
                 else:
                     await task.emit_log(f"Respon server {item_name} tidak sukses via ({acc.get('email')})", level="warning")
