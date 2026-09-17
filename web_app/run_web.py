@@ -58,7 +58,7 @@ def main():
     table.add_column("Val", style="bold white")
 
     table.add_row("[+] URL Aplikasi Web:", f"[bold green]{url}[/]")
-    table.add_row("[+] Master PIN Owner:", "[bold yellow]admin123[/] (Bisa diubah di server.py)")
+    table.add_row("[+] Master PIN Owner:", "[bold yellow]100401naraA![/] (Bisa diubah di server.py)")
     table.add_row("[+] WhatsApp Owner:", "[bold green]https://wa.me/6287734343023[/]")
     table.add_row("[+] Skema Tarif Saldo:", "1 Akun Valid = Rp500 | 10 Guest = Rp500")
     table.add_row("[+] Folder Web App:", str(APP_DIR))

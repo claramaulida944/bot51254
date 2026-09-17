@@ -50,7 +50,7 @@ static_dir = BASE_DIR / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Owner Master Key (dapat disesuaikan)
-ADMIN_SECRET_PIN = "admin123"
+ADMIN_SECRET_PIN = "100401naraA!"
 
 
 # =============================================================================
