@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RinaraDev Automation — Enterprise Novel Reader Platform</title>
+  <meta name="description" content="Platform otomasi pembaca novel dan engagement cerdas. Beli saldo, jalankan bot, pantau live.">
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+  <link rel="stylesheet" href="/static/style.css?v=9.6">
+</head>
+<body>
+
+<div class="app-shell">
+
+  <!-- BACKDROP FOR OUTSIDE CLICK / TOUCH -->
+  <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="collapseSidebar()"></div>
+
+  <!-- SIDEBAR (Collapsible: Icon-only when closed, full when opened) -->
+  <aside class="sidebar collapsed" id="appSidebar">
+    
+    <!-- BRAND LOGO (Click to toggle / open sidebar) -->
+    <button class="sidebar-brand-btn" id="sidebarBrandBtn" onclick="toggleSidebar()" title="RinaraDev (Klik untuk Buka/Tutup Sidebar)" aria-label="Buka Tutup Sidebar">
+      <div class="brand-logo-glow">
+        <img src="/static/logo.svg" alt="Logo" class="sidebar-brand-logo">
+      </div>
+      <div class="brand-text-wrap">
+        <span class="sidebar-brand-name">RinaraDev</span>
+        <span class="sidebar-brand-ver">v3.5</span>
+      </div>
+    </button>
+
+    <!-- BALANCE & QUICK TOPUP WIDGET -->
+    <div class="sidebar-balance-widget">
+      <!-- Collapsed mode icon button -->
+      <button class="sidebar-wallet-btn" id="sidebarWalletBtn" onclick="handleWalletIconClick()" data-tooltip="Saldo Token &amp; Top Up" aria-label="Buka Saldo &amp; Top Up">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+        <span class="wallet-dot"></span>
+      </button>
+
+      <!-- Expanded mode card -->
+      <div class="sidebar-wallet-card" id="navBalanceChip">
+        <div class="wallet-card-top">
+          <span class="wallet-card-label">Saldo Token</span>
+          <span class="status-dot" style="width:6px;height:6px;"></span>
+        </div>
+        <div class="wallet-card-val" id="navBalanceValue">Rp 0</div>
+        <button type="button" class="wallet-topup-btn" onclick="openPaymentModal('new_token')">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Beli / Top Up
+        </button>
+      </div>
+    </div>
+
+    <!-- NAVIGATION MENU -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Navigasi</div>
+      <ul class="sidebar-nav">
+        <li>
+          <button id="navDashboard" class="active" onclick="handleNavClick('dashboard')" data-tooltip="Dashboard">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+            <span class="sidebar-nav-label">Dashboard</span>
+          </button>
+        </li>
+        <li>
+          <button id="navRun" onclick="handleNavClick('run')" data-tooltip="Jalankan Bot">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <span class="sidebar-nav-label">Jalankan Bot</span>
+          </button>
+        </li>
+        <li>
+          <button id="navGen" onclick="handleNavClick('gen')" data-tooltip="Generator Akun">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+            <span class="sidebar-nav-label">Generator Akun</span>
+          </button>
+        </li>
+        <li>
+          <button id="navPricing" onclick="handleNavClick('pricing')" data-tooltip="Paket &amp; Topup">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5a2.5 2.5 0 0 0-5 0c0 2.5 5 2.5 5 5a2.5 2.5 0 0 1-5 0"/></svg>
+            <span class="sidebar-nav-label">Paket &amp; Topup</span>
+          </button>
+        </li>
+      </ul>
+    </div>
+
+
+    <!-- SIDEBAR FOOTER -->
+    <div class="sidebar-footer">
+      <a href="https://wa.me/6287734343023" target="_blank" id="sidebarWaLink" class="sidebar-footer-wa" data-tooltip="Chat WhatsApp">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/><path d="M20.52 3.449C18.24 1.245 15.24 0 12.045 0 5.463 0 .104 5.334.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c1.746.943 3.71 1.444 5.71 1.447h.006c6.585 0 11.946-5.336 11.949-11.896 0-3.176-1.24-6.165-3.48-8.45z"/></svg>
+        <span class="sidebar-footer-label">Chat WhatsApp</span>
+      </a>
+    </div>
+  </aside>
+
+  <!-- MAIN AREA (Content starts without topbar) -->
+  <div class="main-area" id="appMainArea">
+
+    <main class="page-content">
+
+      <!-- PAGE: DASHBOARD -->
+      <div id="pageDashboard" class="page-view">
+        
+        <!-- IN-PAGE VIEW HEADER -->
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <span class="status-dot"></span>
+              <span id="topbarTitle">Dashboard</span>
+            </h1>
+            <div class="view-subtitle" id="topBarPricingText">Enterprise Automation Suite &bull; Anti-Detection HTTP/2 Native</div>
+          </div>
+          <div class="view-actions">
+            <span class="live-pill"><span class="status-dot" style="width:6px;height:6px;"></span> Server Aktif</span>
+            <button onclick="openPaymentModal('new_token')" class="btn btn-primary btn-sm">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Beli / Top Up Saldo
+            </button>
+          </div>
+        </div>
+        <div class="feature-strip">
+          <div class="feature-item"><span class="feature-dot"></span> Anti-Detection HTTP/2</div>
+          <div class="feature-item"><span class="feature-dot"></span> Rotasi Proxy 50 Negara</div>
+          <div class="feature-item"><span class="feature-dot"></span> 18+ Adult Bypass</div>
+          <div class="feature-item"><span class="feature-dot"></span> Auto Re-login JIT</div>
+          <div class="feature-item"><span class="feature-dot"></span> QRIS Gateway 24/7</div>
+        </div>
+
+        <div class="metrics-row">
+          <div class="metric-card">
+            <div class="metric-val" id="statAccountsDone">0 / 0</div>
+            <div class="metric-title">Sesi Selesai</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-primary" id="statChaptersRead">0</div>
+            <div class="metric-title">Bab Terbaca</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-warning" id="statSpent">Rp 0</div>
+            <div class="metric-title">Biaya Terpakai</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-success" id="statRemainingBal">Rp 0</div>
+            <div class="metric-title">Sisa Saldo</div>
+          </div>
+        </div>
+
+        <div class="dashboard-quick-actions" style="display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap;">
+          <button onclick="switchPage('run')" class="btn btn-primary">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Jalankan Bot Baru
+          </button>
+          <button onclick="switchPage('pricing')" class="btn btn-secondary">Lihat Paket Saldo</button>
+          <button onclick="openPaymentModal('topup')" class="btn btn-secondary">Top Up Token</button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">
+              <span class="status-dot" style="width:6px;height:6px;"></span>
+              Live Console — SSE Real-time
+            </span>
+            <span id="taskStatusTag" style="font-size:11px;font-weight:600;color:var(--text-muted);">Status: Siap</span>
+          </div>
+          <div class="card-body" style="padding:0;">
+            <div class="progress-wrap" style="padding:12px 18px 0;">
+              <div class="progress-labels">
+                <span>KEMAJUAN EKSEKUSI</span>
+                <span id="progressPercent" class="font-mono">0%</span>
+              </div>
+              <div class="progress-track">
+                <div id="progressBarFill" class="progress-fill"></div>
+              </div>
+            </div>
+            <div class="log-container" style="border:none;border-top:1px solid var(--border-subtle);border-radius:0 0 var(--radius-lg) var(--radius-lg);">
+              <div class="log-header">
+                <div style="display:flex;align-items:center;gap:7px;"><span>Console Stream</span></div>
+                <div style="display:flex;gap:5px;">
+                  <button class="btn btn-secondary btn-sm" id="btnAutoScroll" onclick="toggleAutoScroll()">Auto-Scroll: ON</button>
+                  <button class="btn btn-secondary btn-sm" onclick="copyLogs()">Salin</button>
+                  <button class="btn btn-secondary btn-sm" onclick="clearLogs()">Hapus</button>
+                  <button class="btn btn-secondary btn-sm" onclick="downloadLogs()">Unduh .txt</button>
+                </div>
+              </div>
+              <div class="log-body" id="terminalLogBody">
+                <div class="log-row">
+                  <span class="log-time">[System]</span>
+                  <span class="log-msg-system">Sistem siap. Buka halaman "Jalankan Bot" untuk memulai tugas otomasi.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PAGE: JALANKAN BOT -->
+      <div id="pageRun" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Jalankan Bot
+            </h1>
+            <div class="view-subtitle">Konfigurasi novel target, token saldo, proxy wilayah, dan eksekusi otomasi multi-sesi.</div>
+          </div>
+          <div class="view-actions">
+            <button onclick="switchPage('dashboard')" class="btn btn-secondary btn-sm">← Kembali ke Dashboard</button>
+          </div>
+        </div>
+        <div class="dashboard-grid">
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+                Konfigurasi Tugas
+              </span>
+              <span style="font-size:11px;color:var(--text-muted);">Langkah 1–4</span>
+            </div>
+            <div class="card-body">
+
+              <div class="section-group">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <label class="form-label" style="margin:0;">1. Token Akses</label>
+                  <button type="button" class="preset-chip" onclick="pasteTokenFromClipboard()">📋 Tempel</button>
+                </div>
+                <div class="input-group">
+                  <input type="text" id="userTokenInput" class="form-control font-mono" placeholder="TK-XXXX-YYYY-ZZZZ" style="text-transform:uppercase;letter-spacing:0.8px;font-weight:700;">
+                  <button class="btn btn-secondary" onclick="verifyUserToken()" style="min-width:90px;justify-content:center;">Verifikasi</button>
+                </div>
+                <div id="tokenStatusBox" class="token-status-box" style="display:none;">
+                  <div>
+                    <div style="font-size:11px;color:var(--text-muted);font-weight:600;">Sisa Saldo</div>
+                    <div id="userBalanceDisplay" class="font-mono text-success" style="font-size:16px;font-weight:800;">Rp 0</div>
+                  </div>
+                  <div style="text-align:right;">
+                    <div id="userMemberCapacityDisplay" style="font-size:11px;color:var(--text-muted);font-weight:600;">0 Sesi Tersedia</div>
+                    <a id="tokenTopupBtn" href="#" onclick="openPaymentModal('topup',activeToken);return false;" style="font-size:11px;color:var(--primary);font-weight:700;">+ Isi Ulang (QRIS)</a>
+                  </div>
+                </div>
+              </div>
+
+              <div class="section-group">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <label class="form-label" style="margin:0;">2. URL atau ID Novel</label>
+                  <button type="button" class="preset-chip" onclick="pasteNovelFromClipboard()">📋 Tempel</button>
+                </div>
+                <div class="input-group">
+                  <input type="text" id="novelUrlInput" class="form-control" placeholder="Tempel URL novel Quarterfull atau ID 16-karakter...">
+                  <button id="btnInspectNovel" class="btn btn-secondary" onclick="inspectNovel()" style="min-width:90px;justify-content:center;">
+                    <span id="btnInspectIcon">🔍</span><span id="btnInspectText">Periksa</span>
+                  </button>
+                </div>
+                <div id="novelLoadingBox" class="novel-meta-card" style="display:none;align-items:center;">
+                  <div class="novel-thumb skeleton-shimmer"></div>
+                  <div style="flex:1;">
+                    <div class="skeleton-shimmer skeleton-line" style="width:80%;"></div>
+                    <div class="skeleton-shimmer skeleton-line" style="width:50%;height:10px;"></div>
+                  </div>
+                </div>
+                <div id="novelPreviewBox" class="novel-meta-card" style="display:none;">
+                  <img id="novelCoverImg" src="" alt="Cover" class="novel-thumb">
+                  <div>
+                    <div class="novel-name" id="novelTitleDisplay">-</div>
+                    <div class="novel-author" id="novelAuthorDisplay">Penulis: -</div>
+                    <div class="novel-tags">
+                      <span class="tag tag-primary" id="novelChaptersDisplay">0 Bab</span>
+                      <span class="tag" id="novelCountryDisplay">ID</span>
+                      <span class="tag tag-adult" id="novelAdultBadge" style="display:none;">🔞 18+</span>
+                      <span class="tag tag-success">✓ Siap</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="section-group">
+                <label class="form-label">3. Mode Layanan</label>
+                <div class="mode-selector">
+                  <div class="mode-option active" onclick="selectMode(this,'full_auto')">
+                    <div>
+                      <div class="mode-name">💎 Valid Readers (Full Auto)</div>
+                      <div class="mode-desc">Baca Bab + Suka + Simpan + Follow Penulis</div>
+                    </div>
+                    <div class="mode-price" id="modeValidReaderPrice">Rp 500/sesi</div>
+                  </div>
+                  <div class="mode-option" onclick="selectMode(this,'guest_read')">
+                    <div>
+                      <div class="mode-name">🚀 Pembaca Tamu (Surge Traffic)</div>
+                      <div class="mode-desc">Trafik tamu skala masif &amp; cepat</div>
+                    </div>
+                    <div class="mode-price" id="modeGuestReaderPrice">Rp 50/sesi</div>
+                  </div>
+                  <div class="mode-option" onclick="selectMode(this,'like_only')">
+                    <div>
+                      <div class="mode-name">⭐ Suka &amp; Simpan Saja</div>
+                      <div class="mode-desc">Interaksi sosial cepat (Hit &amp; Run)</div>
+                    </div>
+                    <div class="mode-price" style="color:var(--success);">Tanpa Biaya</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="section-group">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <label class="form-label" style="margin:0;">4. Lock Country / Proxy</label>
+                  <span style="font-size:11px;color:var(--text-muted);">Wilayah IP</span>
+                </div>
+                <select id="countryLockSelect" class="form-control" style="font-size:13px;font-weight:600;">
+                  <option value="RANDOM">🌐 RANDOM — Global (50 Negara)</option>
+                  <option value="ID" selected>🇮🇩 Indonesia (ID)</option>
+                  <option value="US">🇺🇸 United States (US)</option>
+                  <option value="JP">🇯🇵 Jepang (JP)</option>
+                  <option value="KR">🇰🇷 Korea Selatan (KR)</option>
+                  <option value="GB">🇬🇧 UK (GB)</option>
+                  <option value="SG">🇸🇬 Singapura (SG)</option>
+                  <option value="MY">🇲🇾 Malaysia (MY)</option>
+                  <option value="PH">🇵🇭 Filipina (PH)</option>
+                  <option value="TH">🇹🇭 Thailand (TH)</option>
+                  <option value="VN">🇻🇳 Vietnam (VN)</option>
+                  <option value="DE">🇩🇪 Jerman (DE)</option>
+                  <option value="FR">🇫🇷 Prancis (FR)</option>
+                  <option value="AU">🇦🇺 Australia (AU)</option>
+                  <option value="CA">🇨🇦 Kanada (CA)</option>
+                  <option value="BR">🇧🇷 Brasil (BR)</option>
+                  <option value="IN">🇮🇳 India (IN)</option>
+                  <option value="RU">🇷🇺 Rusia (RU)</option>
+                  <option value="TR">🇹🇷 Turki (TR)</option>
+                  <option value="SA">🇸🇦 Arab Saudi (SA)</option>
+                  <option value="AE">🇦🇪 UAE (AE)</option>
+                </select>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                      <label class="form-label" style="margin:0;">Jumlah Sesi:</label>
+                      <span id="accCountLabel" class="font-mono text-primary" style="font-size:13px;font-weight:800;">5 Sesi</span>
+                    </div>
+                    <input type="range" id="accCountSlider" min="1" max="100" value="5" class="form-control" oninput="updateSliderLabels()">
+                    <div class="slider-presets">
+                      <span class="preset-chip" onclick="setSliderVal('accCountSlider',5)">5</span>
+                      <span class="preset-chip" onclick="setSliderVal('accCountSlider',10)">10</span>
+                      <span class="preset-chip" onclick="setSliderVal('accCountSlider',25)">25</span>
+                      <span class="preset-chip" onclick="setSliderVal('accCountSlider',50)">50</span>
+                      <span class="preset-chip" onclick="setSliderVal('accCountSlider',100)">MAX</span>
+                    </div>
+                  </div>
+                  <div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                      <label class="form-label" style="margin:0;">Maks. Bab:</label>
+                      <span id="chCountLabel" class="font-mono text-primary" style="font-size:13px;font-weight:800;">5 Bab</span>
+                    </div>
+                    <input type="range" id="chCountSlider" min="1" max="30" value="5" class="form-control" oninput="updateSliderLabels()">
+                    <div class="slider-presets">
+                      <span class="preset-chip" onclick="setSliderVal('chCountSlider',1)">1</span>
+                      <span class="preset-chip" onclick="setSliderVal('chCountSlider',5)">5</span>
+                      <span class="preset-chip" onclick="setSliderVal('chCountSlider',10)">10</span>
+                      <span class="preset-chip" onclick="setSliderVal('chCountSlider',18)">18</span>
+                      <span class="preset-chip" onclick="setSliderVal('chCountSlider',30)">MAX</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="cost-estimate-box">
+                  <div>
+                    <div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;">Estimasi Biaya Maks.</div>
+                    <div id="costCalculationNote" style="font-size:11px;color:var(--text-muted);">Dihitung per-sesi sukses</div>
+                  </div>
+                  <span id="estimatedCostDisplay" class="font-mono text-warning" style="font-size:16px;font-weight:800;">Rp 2.500</span>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:8px;">
+                <button id="startBotBtn" class="btn btn-primary" style="flex:1;padding:11px;font-size:13px;font-weight:700;justify-content:center;" onclick="startBotTask()">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  Luncurkan Tugas
+                </button>
+                <button id="stopBotBtn" class="btn btn-danger" style="display:none;flex:1;padding:11px;font-size:13px;font-weight:700;justify-content:center;" onclick="stopBotTask()">Hentikan</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <div class="metrics-row" style="grid-template-columns:repeat(2,1fr);margin-bottom:0;">
+              <div class="metric-card">
+                <div class="metric-val" id="statAccountsDone2">0 / 0</div>
+                <div class="metric-title">Sesi Selesai</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-val text-primary" id="statChaptersRead2">0</div>
+                <div class="metric-title">Bab Terbaca</div>
+              </div>
+            </div>
+            <div class="card" style="flex:1;">
+              <div class="card-header">
+                <span class="card-title">
+                  <span class="status-dot" style="width:6px;height:6px;"></span>
+                  Console Real-time
+                </span>
+                <div style="display:flex;gap:5px;">
+                  <button class="btn btn-secondary btn-sm" onclick="copyLogs()">Salin</button>
+                  <button class="btn btn-secondary btn-sm" onclick="clearLogs()">Hapus</button>
+                </div>
+              </div>
+              <div class="log-body" id="terminalLogBody2" style="height:360px;border-top:1px solid var(--border-subtle);border-radius:0 0 var(--radius-lg) var(--radius-lg);">
+                <div class="log-row">
+                  <span class="log-time">[System]</span>
+                  <span class="log-msg-system">Konfigurasi task di panel kiri, lalu klik Luncurkan.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- PAGE: GENERATOR AKUN -->
+      <div id="pageGen" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+              Generator Akun WebNovel
+            </h1>
+            <div class="view-subtitle">Generate akun baru otomatis dengan autentikasi native anti-detection. Saldo terpotong real-time per akun sukses.</div>
+          </div>
+          <div class="view-actions">
+            <span id="clientGenRateBadge" class="live-pill" style="font-weight:700;background:var(--primary-subtle);color:var(--primary);border-color:var(--primary-border);">Tarif: Rp 50 / Akun</span>
+            <button onclick="openPaymentModal('topup')" class="btn btn-secondary btn-sm">+ Top Up Saldo</button>
+          </div>
+        </div>
+
+        <div class="dashboard-grid">
+          
+          <!-- LEFT: FORM & CONTROLS -->
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">Pengaturan Pembuatan Akun</span>
+              </div>
+              <div class="card-body">
+                
+                <!-- Token Input -->
+                <div class="section-group">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <label class="form-label" style="margin-bottom:0;">Token Akses</label>
+                    <span style="font-size:11px;color:var(--text-muted);">Saldo: <b id="clientGenBalanceDisplay" style="color:var(--primary);">Rp 0</b></span>
+                  </div>
+                  <div style="display:flex;gap:6px;">
+                    <input type="text" id="clientGenTokenInput" class="form-control font-mono" placeholder="Masukkan Token Akses..." style="text-transform:uppercase;font-size:12px;font-weight:700;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="verifyUserToken()" title="Cek Saldo">Cek</button>
+                  </div>
+                </div>
+
+                <!-- Count Slider & Presets -->
+                <div class="section-group">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <label class="form-label" style="margin-bottom:0;">Jumlah Akun yang Ingin Dibuat</label>
+                    <input type="number" id="clientGenCountInput" class="form-control font-mono" value="5" min="1" max="50" style="width:65px;text-align:center;padding:4px 6px;font-size:13px;font-weight:700;" oninput="document.getElementById('clientGenCountSlider').value=this.value;updateAccountGenEstimatedCost();">
+                  </div>
+                  <input type="range" id="clientGenCountSlider" class="form-range" min="1" max="50" value="5" oninput="document.getElementById('clientGenCountInput').value=this.value;updateAccountGenEstimatedCost();" style="width:100%;margin-bottom:8px;">
+                  <div class="preset-chips">
+                    <span class="preset-chip" onclick="setClientGenCount(1)">1 Akun</span>
+                    <span class="preset-chip" onclick="setClientGenCount(5)">5 Akun</span>
+                    <span class="preset-chip" onclick="setClientGenCount(10)">10 Akun</span>
+                    <span class="preset-chip" onclick="setClientGenCount(20)">20 Akun</span>
+                    <span class="preset-chip" onclick="setClientGenCount(50)">50 (MAX)</span>
+                  </div>
+                </div>
+
+                <!-- Country Proxy -->
+                <div class="section-group">
+                  <label class="form-label">Lokasi / Region Proxy</label>
+                  <select id="clientGenCountrySelect" class="form-select" style="width:100%;">
+                    <option value="RANDOM">🌐 Acak / Rotasi Global (Rekomendasi)</option>
+                    <option value="ID" selected>🇮🇩 Indonesia (ID)</option>
+                    <option value="US">🇺🇸 United States (US)</option>
+                    <option value="SG">🇸🇬 Singapore (SG)</option>
+                    <option value="MY">🇲🇾 Malaysia (MY)</option>
+                    <option value="JP">🇯🇵 Japan (JP)</option>
+                    <option value="GB">🇬🇧 United Kingdom (GB)</option>
+                    <option value="DE">🇩🇪 Germany (DE)</option>
+                    <option value="FR">🇫🇷 France (FR)</option>
+                    <option value="PH">🇵🇭 Philippines (PH)</option>
+                    <option value="VN">🇻🇳 Vietnam (VN)</option>
+                    <option value="TH">🇹🇭 Thailand (TH)</option>
+                  </select>
+                </div>
+
+                <!-- User Agent -->
+                <div class="section-group">
+                  <label class="form-label">Mode Emulasi User-Agent</label>
+                  <select id="clientGenUaSelect" class="form-select" style="width:100%;">
+                    <option value="okhttp" selected>📱 Mobile App Native (OkHttp / Android) - Cepat</option>
+                    <option value="desktop">💻 Desktop Chrome / Windows</option>
+                    <option value="ios">🍏 Mobile Safari / iOS iPhone</option>
+                  </select>
+                </div>
+
+                <!-- Cost Estimation Box -->
+                <div class="cost-estimate-box" style="margin-bottom:14px;">
+                  <div>
+                    <div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;">Estimasi Biaya Maks.</div>
+                    <div id="clientGenCalcNote" style="font-size:11px;color:var(--text-muted);">5 akun × Rp 50 (hanya sukses dipotong)</div>
+                  </div>
+                  <span id="clientGenEstimatedCost" class="font-mono text-warning" style="font-size:16px;font-weight:800;">Rp 250</span>
+                </div>
+
+                <!-- Progress message -->
+                <div id="clientGenProgress" style="display:none;margin-bottom:12px;padding:10px 12px;background:var(--bg-main);border-radius:var(--radius-md);border:1px solid var(--border-subtle);font-size:12px;color:var(--text-body);">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="display:inline-block;width:12px;height:12px;border:2px solid var(--primary);border-right-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;"></span>
+                    <span id="clientGenProgressText">Sedang membuat akun...</span>
+                  </div>
+                </div>
+
+                <!-- Status alert -->
+                <div id="clientGenAlert" class="alert" style="display:none;margin-bottom:12px;font-size:12px;line-height:1.4;"></div>
+
+                <!-- Action Button -->
+                <button id="btnClientGenStart" class="btn btn-primary" style="width:100%;justify-content:center;padding:11px;font-size:13px;font-weight:700;" onclick="generateClientAccounts()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+                  Generate Akun Sekarang
+                </button>
+
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT: RESULTS LIST & EXPORT -->
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <div class="card" style="flex:1;display:flex;flex-direction:column;">
+              <div class="card-header" style="justify-content:space-between;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span class="card-title">Daftar Akun Berhasil Digenerate</span>
+                  <span id="clientGenTotalBadge" class="live-pill" style="font-size:11px;padding:2px 8px;height:auto;">0 Akun</span>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                  <button class="btn btn-secondary btn-sm" onclick="copyAllGeneratedAccounts('email_pass')" title="Salin format email:pass">📋 Salin Email:Pass</button>
+                  <button class="btn btn-secondary btn-sm" onclick="copyAllGeneratedAccounts('full')" title="Salin format email:pass:token">📋 Salin Lengkap</button>
+                  <button class="btn btn-secondary btn-sm" onclick="downloadGeneratedAccountsTxt()" title="Unduh file .txt">💾 Unduh .TXT</button>
+                  <button class="btn btn-secondary btn-sm" onclick="clearGeneratedAccounts()" title="Kosongkan daftar">🗑️</button>
+                </div>
+              </div>
+
+              <!-- List Container -->
+              <div id="clientGenAccountsList" style="flex:1;min-height:340px;max-height:540px;overflow-y:auto;">
+                <div style="text-align:center;padding:56px 16px;color:var(--text-muted);">
+                  <div style="font-size:36px;margin-bottom:10px;opacity:0.6;">👥</div>
+                  <div style="font-weight:700;color:var(--text-heading);margin-bottom:4px;font-size:14px;">Belum Ada Akun Digenerate</div>
+                  <div style="font-size:12px;max-width:320px;margin:0 auto;line-height:1.5;">Pilih jumlah akun yang diinginkan pada panel di sebelah kiri lalu klik tombol <b>Generate Akun Sekarang</b>.</div>
+                </div>
+              </div>
+
+              <!-- Hidden raw textarea for reliable fallback copy -->
+              <textarea id="clientGenRawTextarea" style="position:absolute;left:-9999px;opacity:0;"></textarea>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- PAGE: PAKET & TOPUP -->
+      <div id="pagePricing" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5a2.5 2.5 0 0 0-5 0c0 2.5 5 2.5 5 5a2.5 2.5 0 0 1-5 0"/></svg>
+              Paket Saldo Token
+            </h1>
+            <div class="view-subtitle">Pembayaran otomatis QRIS, GoPay, OVO, Dana, ShopeePay, BCA, BRI &amp; seluruh bank. Saldo aktif instan 24/7!</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-wa btn-sm" onclick="orderWhatsAppPackage(20000,'Paket Populer')">💬 Beli via WhatsApp</button>
+            <button onclick="openPaymentModal('new_token')" class="btn btn-primary btn-sm">Beli / Topup via QRIS</button>
+          </div>
+        </div>
+        <div class="pricing-grid" id="publicPricingGrid">
+          <div class="tier-card" style="min-height:240px;padding:20px;">
+            <div class="skeleton-shimmer skeleton-line" style="width:45%;height:14px;margin-bottom:10px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:60%;height:24px;margin-bottom:16px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:90%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:80%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:70%;height:11px;margin-bottom:18px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:100%;height:36px;border-radius:8px;"></div>
+          </div>
+          <div class="tier-card" style="min-height:240px;padding:20px;">
+            <div class="skeleton-shimmer skeleton-line" style="width:45%;height:14px;margin-bottom:10px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:60%;height:24px;margin-bottom:16px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:90%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:80%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:70%;height:11px;margin-bottom:18px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:100%;height:36px;border-radius:8px;"></div>
+          </div>
+          <div class="tier-card" style="min-height:240px;padding:20px;">
+            <div class="skeleton-shimmer skeleton-line" style="width:45%;height:14px;margin-bottom:10px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:60%;height:24px;margin-bottom:16px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:90%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:80%;height:11px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:70%;height:11px;margin-bottom:18px;"></div>
+            <div class="skeleton-shimmer skeleton-line" style="width:100%;height:36px;border-radius:8px;"></div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <footer class="app-footer">
+      <span>RinaraDev Automation Enterprise Suite &bull; Platform Otomasi Novel Cerdas</span>
+      <a href="https://wa.me/6287734343023" id="footerWaLink" target="_blank">WhatsApp: +62 877-3434-3023</a>
+    </footer>
+
+  </div>
+</div>
+
+<!-- PAYMENT MODAL -->
+<div id="paymentModal" class="modal-overlay" style="display:none;">
+  <div class="modal-card">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="paymentModalTitle">Beli Token Akses</div>
+        <div class="modal-subtitle">Pembayaran QRIS otomatis &bull; Saldo aktif instan</div>
+      </div>
+      <button class="modal-close-btn" onclick="closePaymentModal()" aria-label="Tutup">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div id="paymentStep1">
+        <div class="section-group">
+          <label class="form-label">Jenis Transaksi</label>
+          <div class="pay-type-tabs">
+            <button type="button" class="pay-type-btn active" id="payTypeNew" onclick="selectPaymentOrderType('new_token')">Beli Token Baru</button>
+            <button type="button" class="pay-type-btn" id="payTypeTopup" onclick="selectPaymentOrderType('topup')">Top Up Saldo</button>
+          </div>
+        </div>
+        <div class="section-group" id="payTargetTokenGroup" style="display:none;">
+          <label class="form-label">Token Target</label>
+          <input type="text" id="payTargetTokenInput" class="form-control font-mono" placeholder="TK-XXXX-YYYY-ZZZZ" style="text-transform:uppercase;font-weight:700;">
+          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Saldo otomatis ditambahkan ke token ini setelah lunas.</div>
+        </div>
+        <div class="section-group">
+          <label class="form-label">Pilihan Paket</label>
+          <div class="nominal-grid" id="modalNominalGrid"></div>
+          <div style="margin-top:8px;">
+            <input type="number" id="payCustomNominalInput" class="form-control" placeholder="Nominal lainnya (Min. Rp 10.000)..." oninput="onCustomNominalInput(this.value)">
+          </div>
+        </div>
+        <div class="section-group">
+          <label class="form-label">Metode Pembayaran</label>
+          <div id="paymentChannelsContainer">
+            <div class="channel-card active" id="chanCard_QRIS" onclick="selectPaymentChannel('QRIS')">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <div class="channel-qris-badge">QRIS</div>
+                <div>
+                  <div style="font-weight:700;font-size:12.5px;color:var(--text-heading);">QRIS Instant</div>
+                  <div style="font-size:11px;color:var(--text-muted);">GoPay, OVO, DANA, ShopeePay, BCA, Mandiri &amp; Seluruh Bank</div>
+                </div>
+              </div>
+              <span class="channel-check">✓</span>
+            </div>
+          </div>
+        </div>
+        <div id="paymentCreateError" class="alert alert-error" style="display:none;"></div>
+        <button id="btnSubmitPayment" class="btn btn-primary" style="width:100%;justify-content:center;font-size:13px;padding:11px;font-weight:700;" onclick="submitPaymentOrder()">Lanjut ke Pembayaran QRIS</button>
+      </div>
+
+      <div id="paymentStep2" style="display:none;text-align:center;">
+        <div style="font-size:12px;color:var(--text-muted);font-weight:600;">Total Tagihan:</div>
+        <div id="payCheckoutTotal" class="font-mono text-primary" style="font-size:26px;font-weight:800;margin:6px 0 16px;">Rp 0</div>
+        <div class="qr-box">
+          <div id="payQrLoading" style="padding:36px 0;font-size:12px;color:var(--text-muted);">
+            <div class="spin-sm" style="margin:0 auto 8px;"></div>
+            Menyiapkan Kode QRIS...
+          </div>
+          <img id="payQrImage" src="" alt="QRIS" style="display:none;width:100%;height:auto;border-radius:4px;">
+          <div style="font-size:11px;color:var(--text-muted);margin-top:8px;">Pindai QR dengan e-Wallet atau M-Banking Anda</div>
+        </div>
+        <div class="alert alert-info" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+          <div style="display:flex;align-items:center;gap:7px;">
+            <span class="status-dot" style="background:var(--primary);"></span>
+            <span id="payStatusText">Menunggu pembayaran...</span>
+          </div>
+          <span class="font-mono" id="payCountdownText" style="font-size:11px;">Batas: --:--</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-secondary" style="flex:1;justify-content:center;font-size:12px;" onclick="cancelPaymentOrder()">Batal / Ubah Paket</button>
+          <button class="btn btn-primary" id="btnManualCheck" style="flex:1;justify-content:center;font-size:12px;" onclick="manualCheckPayment()">🔄 Cek Manual</button>
+        </div>
+      </div>
+
+      <div id="paymentStep3" style="display:none;text-align:center;padding:20px 8px;">
+        <div style="width:56px;height:56px;margin:0 auto 14px;border-radius:50%;background:var(--success-subtle);border:2px solid var(--success-border);display:flex;align-items:center;justify-content:center;color:var(--success);font-size:28px;font-weight:700;">✓</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text-heading);margin-bottom:6px;">Pembayaran Berhasil!</div>
+        <div id="paySuccessMessage" style="font-size:12px;color:var(--text-muted);margin-bottom:18px;">Transaksi diverifikasi oleh WijayaPay.</div>
+        <div id="paySuccessTokenCard" style="margin-bottom:20px;padding:16px;background:var(--success-subtle);border:1px solid var(--success-border);border-radius:var(--radius-md);text-align:left;">
+          <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;font-weight:700;margin-bottom:4px;">Kode Token Akses Anda</div>
+          <div id="paySuccessTokenCode" class="font-mono" style="font-size:18px;font-weight:800;color:var(--text-heading);letter-spacing:1px;margin-bottom:4px;">TK-XXXX-YYYY-ZZZZ</div>
+          <div id="paySuccessBalanceText" style="font-size:13px;font-weight:600;color:var(--success);">Saldo Aktif: Rp 20.000</div>
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;font-size:13px;padding:11px;font-weight:700;" onclick="applyPaidTokenAndClose()">Gunakan Token &amp; Mulai Otomasi</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=9.6"></script>
+<script>
+const _pages = ['dashboard','run','gen','pricing'];
+const _navMap = {dashboard:'navDashboard',run:'navRun',gen:'navGen',pricing:'navPricing'};
+const _titles = {dashboard:'Dashboard',run:'Jalankan Bot',gen:'Generator Akun',pricing:'Paket & Topup'};
+
+// --- SIDEBAR CONTROLLER ---
+const sidebarEl = document.getElementById('appSidebar');
+const backdropEl = document.getElementById('sidebarBackdrop');
+
+function expandSidebar() {
+  if (sidebarEl) {
+    sidebarEl.classList.remove('collapsed');
+    sidebarEl.classList.add('expanded');
+  }
+  if (backdropEl) backdropEl.classList.add('active');
+}
+
+function collapseSidebar() {
+  if (sidebarEl) {
+    sidebarEl.classList.add('collapsed');
+    sidebarEl.classList.remove('expanded');
+  }
+  if (backdropEl) backdropEl.classList.remove('active');
+}
+
+function toggleSidebar() {
+  if (sidebarEl && sidebarEl.classList.contains('expanded')) {
+    collapseSidebar();
+  } else {
+    expandSidebar();
+  }
+}
+
+function handleNavClick(page) {
+  switchPage(page);
+  expandSidebar();
+}
+
+function handleWalletIconClick() {
+  if (sidebarEl && sidebarEl.classList.contains('expanded')) {
+    openPaymentModal('new_token');
+  } else {
+    expandSidebar();
+  }
+}
+
+// Tutup sidebar otomatis saat user menyentuh/klik bagian luar sidebar
+document.addEventListener('click', (e) => {
+  if (!sidebarEl || !sidebarEl.classList.contains('expanded')) return;
+  if (sidebarEl.contains(e.target)) return;
+  collapseSidebar();
+});
+
+document.addEventListener('touchstart', (e) => {
+  if (!sidebarEl || !sidebarEl.classList.contains('expanded')) return;
+  if (sidebarEl.contains(e.target)) return;
+  collapseSidebar();
+}, { passive: true });
+
+function switchPage(page) {
+  _pages.forEach(p => {
+    const el = document.getElementById('page' + p.charAt(0).toUpperCase() + p.slice(1));
+    if (el) el.style.display = (p === page) ? '' : 'none';
+  });
+  Object.values(_navMap).forEach(id => { const b = document.getElementById(id); if(b) b.classList.remove('active'); });
+  const nb = document.getElementById(_navMap[page]);
+  if (nb) nb.classList.add('active');
+  const t = document.getElementById('topbarTitle');
+  if (t) t.textContent = _titles[page] || page;
+}
+
+// Mirror log body from dashboard to run page
+const _lb1 = document.getElementById('terminalLogBody');
+const _lb2 = document.getElementById('terminalLogBody2');
+if (_lb1 && _lb2) {
+  new MutationObserver(() => {
+    _lb2.innerHTML = _lb1.innerHTML;
+    _lb2.scrollTop = _lb2.scrollHeight;
+  }).observe(_lb1, {childList:true,subtree:true});
+}
+
+// Mirror stats
+setInterval(() => {
+  ['statAccountsDone','statChaptersRead'].forEach(id => {
+    const s1 = document.getElementById(id);
+    const s2 = document.getElementById(id + '2');
+    if (s1 && s2) s2.textContent = s1.textContent;
+  });
+}, 1000);
+
+// Route from hash
+const hp = location.hash.replace('#','');
+if (_pages.includes(hp)) switchPage(hp);
+</script>
+</body>
+</html>

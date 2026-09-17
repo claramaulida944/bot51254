@@ -83,34 +83,33 @@ BRIGHTDATA_SUPPORTED_COUNTRIES = set(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
 
 def get_weighted_royalty_country(candidate_countries: Optional[List[str]] = None) -> str:
     """
-    Memilih kode negara dengan pembobotan dinamis:
-    - US (Amerika Serikat): 30%
-    - KR (Korea Selatan): 30%
-    - ID (Indonesia): 5%
-    - Sisanya (35%): didistribusikan merata ke negara-negara lain (JP, GB, DE, SG, MY, CA, FR, AU, dll).
+    Memilih kode negara dengan pembobotan prioritas royalti tinggi (Tier 1):
+    - US (Amerika Serikat): ~20% - 25% (2 dari 10 sesi)
+    - KR (Korea Selatan): ~15% (1-2 dari 10 sesi)
+    - JP (Jepang): ~15% (1-2 dari 10 sesi)
+    - Sisanya (~45% - 50%): didistribusikan merata ke negara-negara lain.
     """
     if candidate_countries:
         pool = list(candidate_countries)
     else:
         pool = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
 
-    target_weights = {
-        "US": 30.0,
-        "KR": 30.0,
-        "ID": 5.0,
+    tier1_weights = {
+        "US": 25.0,
+        "KR": 15.0,
+        "JP": 15.0,
     }
-    present_targets = [c for c in target_weights if c in pool]
-    sum_targets = sum(target_weights[c] for c in present_targets)
-    remaining_pool = [c for c in pool if c not in target_weights]
+    present_tier1 = [c for c in tier1_weights if c in pool]
+    sum_tier1 = sum(tier1_weights[c] for c in present_tier1)
+    remaining_pool = [c for c in pool if c not in tier1_weights]
 
     if not remaining_pool:
-        weights = [target_weights.get(c, 1.0) for c in pool]
+        weights = [tier1_weights.get(c, 1.0) for c in pool]
     else:
-        rem_weight = max(0.01, (100.0 - sum_targets) / len(remaining_pool))
-        weights = [target_weights.get(c, rem_weight) for c in pool]
+        rem_weight = max(0.1, (100.0 - sum_tier1) / len(remaining_pool))
+        weights = [tier1_weights.get(c, rem_weight) for c in pool]
 
     return random.choices(pool, weights=weights, k=1)[0]
-
 
 
 def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
@@ -262,23 +261,8 @@ class ProxyInfo:
         Jika ini adalah proxy Bright Data, parameter `-country-xx` akan disesuaikan.
         Jika ini adalah proxy HypeProxy, region dapat disesuaikan melalui API HypeProxy.
         """
-        if self.is_hypeproxy and self.proxy_id and country_code:
-            target_country = str(country_code).upper().strip()
-            if target_country and target_country not in ("RANDOM", "ALL", "AUTO"):
-                if getattr(self, "_current_hype_country", None) != target_country:
-                    try:
-                        # Panggil API HypeProxy PATCH /api/proxies/:id/region
-                        res = HypeProxyClient.set_proxy_region(self.proxy_id, target_country)
-                        if res and (res.get("ok") or res.get("message") == "Slot updated" or "updated" in str(res).lower()):
-                            self._current_hype_country = target_country
-                            logger.info(f"[HypeProxy] Slot #{self.proxy_id} berhasil dialihkan ke region {target_country}")
-                    except Exception as e:
-                        logger.debug(f"[HypeProxy] Gagal ubah region slot #{self.proxy_id}: {e}")
-            return self.raw_url
-
         if not self.is_brightdata:
             return self.raw_url
-
 
         new_username = self.username
 
@@ -1117,9 +1101,10 @@ class ProxyManager:
                 proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
                 self._current_index += 1
 
-                if proxy_info.is_brightdata or proxy_info.is_hypeproxy:
+                if proxy_info.is_brightdata:
                     return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
+                # Untuk HypeProxy: Langsung return URL proxy tanpa beban API tambahan
                 return proxy_info.raw_url
 
             # Legacy free proxy (single-use)
@@ -1151,11 +1136,10 @@ class ProxyManager:
             proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
             self._current_index += 1
 
-            if proxy_info.is_brightdata or proxy_info.is_hypeproxy:
+            if proxy_info.is_brightdata:
                 return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
             return proxy_info.raw_url
-
 
     def get_base_fallback_proxy(self) -> Optional[str]:
         """Mengambil base proxy tanpa targeting negara spesifik."""
@@ -1311,11 +1295,6 @@ def is_dead_or_proxy_error(exc: Optional[Any]) -> bool:
         "proxy",
         "407",
         "socks",
-        "10054",
-        "forcibly closed",
-        "remote host",
-        "winerror",
-        "reset by peer",
         "connection reset",
         "connection refused",
         "actively refused",

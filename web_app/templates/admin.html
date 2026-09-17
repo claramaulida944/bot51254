@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Portal — RinaraDev Automation</title>
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+  <link rel="stylesheet" href="/static/style.css?v=9.6">
+</head>
+<body>
+
+<!-- LOGIN SCREEN (shown until PIN verified) -->
+<div id="loginScreen" class="login-center">
+  <div class="login-card">
+    <div class="login-card-logo">
+      <img src="/static/logo.svg" alt="Logo">
+      <div>
+        <div class="login-card-title">Admin Portal</div>
+        <div class="login-card-subtitle">RinaraDev Automation — Akses Terbatas</div>
+      </div>
+    </div>
+    <div class="section-group">
+      <label class="form-label">Master PIN</label>
+      <div class="input-group">
+        <input type="password" id="adminPinInput" class="form-control" placeholder="Masukkan PIN..." style="text-align:center;letter-spacing:4px;" onkeydown="if(event.key==='Enter')adminLogin()">
+        <button class="btn btn-primary" onclick="adminLogin()">Masuk</button>
+      </div>
+    </div>
+    <div id="loginError" class="alert alert-error" style="display:none;margin-top:10px;"></div>
+    <div style="margin-top:14px;text-align:center;">
+      <a href="/" style="font-size:12px;color:var(--text-muted);">← Kembali ke Tampilan Klien</a>
+    </div>
+  </div>
+</div>
+
+<!-- ADMIN DASHBOARD (hidden until logged in) -->
+<div id="adminShell" class="app-shell" style="display:none;">
+
+  <!-- BACKDROP FOR OUTSIDE CLICK / TOUCH -->
+  <div class="sidebar-backdrop" id="adminSidebarBackdrop" onclick="collapseAdminSidebar()"></div>
+
+  <!-- SIDEBAR (Collapsible: Icon-only when closed, full when opened) -->
+  <aside class="sidebar collapsed" id="adminSidebar">
+    
+    <!-- BRAND LOGO (Click to toggle) -->
+    <button class="sidebar-brand-btn" id="adminBrandBtn" onclick="toggleAdminSidebar()" title="RinaraDev Admin (Klik untuk Buka/Tutup Sidebar)" aria-label="Buka Tutup Sidebar Admin">
+      <div class="brand-logo-glow" style="border-color:rgba(239, 68, 68, 0.4);background:rgba(239, 68, 68, 0.15);">
+        <img src="/static/logo.svg" alt="Logo" class="sidebar-brand-logo">
+      </div>
+      <div class="brand-text-wrap">
+        <span class="sidebar-brand-name">RinaraDev</span>
+        <span class="sidebar-brand-ver" style="background:#FEF2F2;border-color:#FECACA;color:#991B1B;">Admin</span>
+      </div>
+    </button>
+
+    <!-- ADMIN NAV -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Admin Menu</div>
+      <ul class="sidebar-nav">
+        <li>
+          <button id="tnOverview" class="active" onclick="handleAdminNavClick('overview')" data-tooltip="Overview">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+            <span class="sidebar-nav-label">Overview</span>
+          </button>
+        </li>
+        <li>
+          <button id="tnTokens" onclick="handleAdminNavClick('tokens')" data-tooltip="Token Klien">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+            <span class="sidebar-nav-label">Token Klien</span>
+          </button>
+        </li>
+        <li>
+          <button id="tnAccounts" onclick="handleAdminNavClick('accounts')" data-tooltip="Akun &amp; Node">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span class="sidebar-nav-label">Akun &amp; Node</span>
+            <span class="tab-badge" id="accountCountBadge">0</span>
+          </button>
+        </li>
+        <li>
+          <button id="tnPayments" onclick="handleAdminNavClick('payments')" data-tooltip="Transaksi">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+            <span class="sidebar-nav-label">Transaksi</span>
+            <span class="tab-badge tab-badge-success" id="paymentCountBadge">0</span>
+          </button>
+        </li>
+        <li>
+          <button id="tnPricing" onclick="handleAdminNavClick('pricing')" data-tooltip="Tarif &amp; Paket">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5a2.5 2.5 0 0 0-5 0c0 2.5 5 2.5 5 5a2.5 2.5 0 0 1-5 0"/></svg>
+            <span class="sidebar-nav-label">Tarif &amp; Paket</span>
+          </button>
+        </li>
+      </ul>
+    </div>
+
+    <!-- SYSTEM SHORTCUTS -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Sistem</div>
+      <ul class="sidebar-nav">
+        <li>
+          <button id="btnSyncProxies" onclick="syncAdminProxies()" data-tooltip="Sync Proxy">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            <span class="sidebar-nav-label">Sync Proxy</span>
+          </button>
+        </li>
+        <li>
+          <a href="/" data-tooltip="Tampilan Klien">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+            <span class="sidebar-nav-label">Tampilan Klien</span>
+          </a>
+        </li>
+      </ul>
+    </div>
+
+    <!-- SIDEBAR FOOTER (Clean Admin Logout Only) -->
+    <div class="sidebar-footer">
+      <button onclick="adminLogout()" class="sidebar-logout-btn" data-tooltip="Keluar Admin">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span class="sidebar-footer-label">Keluar Admin</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN AREA (No topbar) -->
+  <div class="main-area">
+
+    <main class="page-content">
+
+      <!-- PAGE: OVERVIEW -->
+      <div id="adminPageOverview" class="page-view">
+        
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <span class="status-dot" style="background:#DC2626;"></span>
+              <span id="adminTopbarTitle">Overview</span>
+            </h1>
+            <div class="view-subtitle">Portal Pengawasan Admin &bull; Monitoring Token, Transaksi, dan Node Bot</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-secondary btn-sm" onclick="syncAdminProxies()">⚡ Sync Proxy</button>
+            <button class="btn btn-danger btn-sm" onclick="adminLogout()">Keluar</button>
+          </div>
+        </div>
+        <div class="metrics-row metrics-5">
+          <div class="metric-card">
+            <div class="metric-val" id="adminTotalTokens">-</div>
+            <div class="metric-title">Total Token</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-success" id="adminActiveBalance">-</div>
+            <div class="metric-title">Saldo Beredar</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-warning" id="adminTotalSpent">-</div>
+            <div class="metric-title">Total Pemakaian</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val text-primary" id="adminAccountsAvail">-</div>
+            <div class="metric-title">Node Tersedia</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val" id="adminProxiesActive">-</div>
+            <div class="metric-title">Proxy Aktif</div>
+          </div>
+        </div>
+
+        <div class="admin-overview-grid">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Aksi Cepat</span>
+            </div>
+            <div class="card-body" style="display:flex;flex-direction:column;gap:8px;">
+              <button class="btn btn-primary" onclick="switchAdminPage('tokens')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+                Buat Token Klien Baru
+              </button>
+              <button class="btn btn-secondary" onclick="switchAdminPage('accounts')">Generate Akun Baru</button>
+              <button class="btn btn-secondary" onclick="switchAdminPage('pricing')">Edit Tarif &amp; Paket</button>
+              <button class="btn btn-secondary" onclick="syncAdminProxies()">⚡ Sync Proxy HypeProxy</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Info Sistem</span>
+              <button class="btn btn-secondary btn-sm" onclick="loadAdminStats()">Refresh</button>
+            </div>
+            <div class="card-body">
+              <div style="display:flex;flex-direction:column;gap:10px;font-size:12px;">
+                <div style="display:flex;justify-content:space-between;">
+                  <span style="color:var(--text-muted);">Status Server</span>
+                  <span class="badge badge-success">Operasional</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;">
+                  <span style="color:var(--text-muted);">Mode Pembayaran</span>
+                  <span class="badge badge-primary">WijayaPay QRIS</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;">
+                  <span style="color:var(--text-muted);">Gateway</span>
+                  <span style="font-weight:600;color:var(--text-heading);">24/7 Aktif</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PAGE: TOKEN KLIEN -->
+      <div id="adminPageTokens" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+              Manajemen Token Klien
+            </h1>
+            <div class="view-subtitle">Terbitkan token baru, atur saldo limit, masa aktif, dan monitor pemakaian klien.</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadAdminTokens()">🔄 Refresh Data</button>
+          </div>
+        </div>
+        <div class="dashboard-grid" style="grid-template-columns:340px 1fr;">
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Buat Token Baru</span>
+            </div>
+            <div class="card-body">
+              <div class="section-group">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                  <label class="form-label" style="margin-bottom:0;">Preset Paket Cepat</label>
+                  <button type="button" class="btn btn-ghost btn-sm" onclick="showAddPresetModal()" style="font-size:11px;padding:2px 8px;color:var(--primary);font-weight:600;">
+                    + Tambah Preset
+                  </button>
+                </div>
+                <div id="adminPresetButtonsContainer" class="admin-preset-chips-wrap">
+                  <button type="button" class="preset-chip" onclick="setPresetPackage(10000,'Paket Starter',this)">10K <span class="preset-chip-sub">Starter</span></button>
+                  <button type="button" class="preset-chip active" onclick="setPresetPackage(20000,'Paket Populer',this)">20K <span class="preset-chip-sub">Populer</span></button>
+                  <button type="button" class="preset-chip" onclick="setPresetPackage(50000,'Paket Pro',this)">50K <span class="preset-chip-sub">Pro</span></button>
+                  <button type="button" class="preset-chip preset-chip-add" onclick="showAddPresetModal()" title="Tambah Preset Baru">+ Tambah</button>
+                </div>
+              </div>
+              <div class="section-group">
+                <label class="form-label">Nominal Saldo (Rupiah)</label>
+                <div class="admin-currency-input-wrap">
+                  <span class="admin-currency-prefix">Rp</span>
+                  <input type="number" id="tokenAmountInput" class="form-control" value="20000" min="1000" step="1000">
+                </div>
+              </div>
+              <div class="section-group">
+                <label class="form-label">Label / Nama Klien</label>
+                <input type="text" id="tokenLabelInput" class="form-control" placeholder="Contoh: Klien WA - Budi">
+              </div>
+              <div class="section-group">
+                <label class="form-label">Masa Berlaku (Hari) — Opsional</label>
+                <input type="number" id="tokenExpiryInput" class="form-control" placeholder="Kosongkan = tanpa batas">
+              </div>
+              <button class="btn btn-primary" style="width:100%;justify-content:center;" onclick="adminCreateToken()">Terbitkan Token</button>
+
+              <div id="newTokenResultCard" class="result-card success" style="display:none;margin-top:14px;text-align:center;">
+                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;font-weight:700;">Token Berhasil Dibuat</div>
+                <div id="generatedTokenCode" class="font-mono" style="font-size:16px;font-weight:800;color:var(--text-heading);margin:6px 0;">-</div>
+                <div id="generatedTokenMeta" style="font-size:12px;color:var(--success);font-weight:600;">-</div>
+                <div style="display:flex;gap:8px;margin-top:10px;">
+                  <button class="btn btn-secondary btn-sm" style="flex:1;justify-content:center;" onclick="copyGeneratedToken()">Salin Kode</button>
+                  <a id="shareWaBtn" href="#" target="_blank" class="btn btn-wa btn-sm" style="flex:1;justify-content:center;">Kirim WA</a>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Daftar Token Terdaftar</span>
+              <button class="btn btn-secondary btn-sm" onclick="loadAdminTokens()">Refresh</button>
+            </div>
+            <div class="table-wrap" style="border:none;border-top:1px solid var(--border-subtle);border-radius:0 0 var(--radius-lg) var(--radius-lg);">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Kode Token</th>
+                    <th>Label</th>
+                    <th>Saldo Awal</th>
+                    <th>Sisa Saldo</th>
+                    <th>Terpakai</th>
+                    <th>Status</th>
+                    <th>Tanggal</th>
+                    <th>Aksi</th>
+                  </tr>
+                </thead>
+                <tbody id="tokenTableBody">
+                  <tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:24px;">Memuat data...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- PAGE: AKUN & NODE -->
+      <div id="adminPageAccounts" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              Manajemen Node &amp; Akun
+            </h1>
+            <div class="view-subtitle">Kelola pool akun bot 50 negara, generator akun otomatis, dan status keaktifan node.</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadAdminAccounts()">🔄 Refresh Akun</button>
+          </div>
+        </div>
+        <div class="dashboard-grid" style="grid-template-columns:340px 1fr;">
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Generator Akun Baru</span>
+            </div>
+            <div class="card-body">
+              <div class="section-group">
+                <label class="form-label">Jumlah Cepat</label>
+                <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:5px;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="setPresetAccountCount(1)">1</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="setPresetAccountCount(3)">3</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="setPresetAccountCount(5)">5</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="setPresetAccountCount(10)">10</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="setPresetAccountCount(20)">20</button>
+                </div>
+              </div>
+              <div class="section-group">
+                <label class="form-label">Jumlah Akun</label>
+                <input type="number" id="genAccountCountInput" class="form-control" value="1" min="1" max="50">
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Estimasi: ~8 detik per akun</div>
+              </div>
+              <div class="section-group">
+                <label class="form-label">Target Negara</label>
+                <select id="genAccountCountrySelect" class="form-control">
+                  <option value="RANDOM">RANDOM (Campuran 50 Negara)</option>
+                  <option value="ID" selected>Indonesia (ID)</option>
+                  <option value="US">Amerika Serikat (US)</option>
+                  <option value="JP">Jepang (JP)</option>
+                  <option value="KR">Korea Selatan (KR)</option>
+                  <option value="GB">Inggris / UK (GB)</option>
+                  <option value="SG">Singapura (SG)</option>
+                  <option value="MY">Malaysia (MY)</option>
+                  <option value="PH">Filipina (PH)</option>
+                  <option value="TH">Thailand (TH)</option>
+                  <option value="VN">Vietnam (VN)</option>
+                  <option value="DE">Jerman (DE)</option>
+                  <option value="FR">Prancis (FR)</option>
+                  <option value="AU">Australia (AU)</option>
+                  <option value="CA">Kanada (CA)</option>
+                  <option value="BR">Brasil (BR)</option>
+                  <option value="IN">India (IN)</option>
+                  <option value="RU">Rusia (RU)</option>
+                  <option value="TR">Turki (TR)</option>
+                  <option value="SA">Arab Saudi (SA)</option>
+                  <option value="AE">Uni Emirat Arab (AE)</option>
+                </select>
+              </div>
+              <div class="section-group">
+                <label class="form-label">Mode User-Agent</label>
+                <select id="genAccountUaSelect" class="form-control">
+                  <option value="okhttp" selected>OkHttp Native Android (Rekomendasi)</option>
+                  <option value="dalvik">Android Dalvik VM (Device Nyata)</option>
+                  <option value="webview">Mobile WebView (Chrome/Android)</option>
+                </select>
+              </div>
+              <button id="btnGenerateAccounts" class="btn btn-primary" style="width:100%;justify-content:center;" onclick="adminGenerateAccounts()">Mulai Generate Akun</button>
+
+              <div id="genAccountLoading" style="display:none;margin-top:14px;text-align:center;padding:14px;background:var(--bg-subtle);border:1px solid var(--border-color);border-radius:var(--radius-md);">
+                <div class="spin-sm" style="margin:0 auto 8px;"></div>
+                <div id="genAccountStatusText" style="font-size:13px;font-weight:600;color:var(--text-heading);">Mendaftarkan akun...</div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Mohon tunggu, menggunakan enkripsi &amp; rotasi jalur.</div>
+              </div>
+
+              <div id="genAccountResultCard" class="result-card success" style="display:none;margin-top:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <span style="font-size:12px;font-weight:700;color:var(--success);" id="genResultSummary">Selesai</span>
+                  <span style="font-size:11px;color:var(--text-muted);" id="genResultTime">-</span>
+                </div>
+                <div id="genResultList" style="font-size:12px;max-height:180px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Inventaris Node Akun</span>
+              <div style="display:flex;gap:6px;align-items:center;">
+                <input type="search" id="accountSearchInput" name="node_search_field" autocomplete="off" class="form-control form-control-sm" placeholder="Cari email / ID / negara..." style="width:200px;" oninput="filterAdminAccounts()">
+                <button class="btn btn-secondary btn-sm" onclick="loadAdminAccounts()">Refresh</button>
+                <button class="btn btn-secondary btn-sm" onclick="adminDownloadAccounts()" title="Download akun.txt">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/></svg>
+                  .txt
+                </button>
+              </div>
+            </div>
+            <div class="table-wrap" style="border:none;border-top:1px solid var(--border-subtle);max-height:520px;overflow-y:auto;border-radius:0 0 var(--radius-lg) var(--radius-lg);">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:40px;">No</th>
+                    <th>Email</th>
+                    <th>User ID</th>
+                    <th>Negara</th>
+                    <th>Nickname</th>
+                    <th>Password</th>
+                    <th>Status</th>
+                    <th>Terdaftar</th>
+                  </tr>
+                </thead>
+                <tbody id="accountTableBody">
+                  <tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:24px;">Memuat data akun...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- PAGE: TRANSAKSI -->
+      <div id="adminPagePayments" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+              Riwayat Pembayaran &amp; Transaksi
+            </h1>
+            <div class="view-subtitle">Pantau seluruh order QRIS via WijayaPay, verifikasi otomatis, dan penerbitan saldo instan.</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadAdminPayments()">🔄 Refresh Transaksi</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Riwayat Pembayaran &amp; Transaksi WijayaPay</span>
+            <button class="btn btn-secondary btn-sm" onclick="loadAdminPayments()">🔄 Refresh</button>
+          </div>
+          <div class="table-wrap" style="border:none;border-top:1px solid var(--border-subtle);max-height:560px;overflow-y:auto;border-radius:0 0 var(--radius-lg) var(--radius-lg);">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ref ID</th>
+                  <th>Tipe</th>
+                  <th>Metode</th>
+                  <th>Nominal</th>
+                  <th>Status</th>
+                  <th>Token Terbit / Topup</th>
+                  <th>Dibuat</th>
+                  <th>Lunas</th>
+                  <th>Trx Gateway</th>
+                </tr>
+              </thead>
+              <tbody id="paymentTableBody">
+                <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;">Memuat riwayat transaksi...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- PAGE: TARIF & PAKET -->
+      <div id="adminPagePricing" class="page-view" style="display:none;">
+        <div class="view-header">
+          <div class="view-title-wrap">
+            <h1 class="view-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5a2.5 2.5 0 0 0-5 0c0 2.5 5 2.5 5 5a2.5 2.5 0 0 1-5 0"/></svg>
+              Konfigurasi Tarif &amp; Paket Saldo
+            </h1>
+            <div class="view-subtitle">Sesuaikan skema pemotongan saldo per-sesi bot dan paket yang ditampilkan di halaman klien.</div>
+          </div>
+          <div class="view-actions">
+            <button class="btn btn-secondary btn-sm" onclick="loadAdminPricing()">🔄 Reset Form</button>
+            <button class="btn btn-primary btn-sm" onclick="saveAdminPricing()">💾 Simpan Perubahan</button>
+          </div>
+        </div>
+        <div class="dashboard-grid" style="grid-template-columns:320px 1fr;gap:16px;">
+
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">Tarif Pemotongan Bot</span>
+              </div>
+              <div class="card-body">
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px;line-height:1.5;">Saldo token pengguna dipotong real-time saat bot membaca bab atau menjalankan tugas.</p>
+                <div class="section-group">
+                  <label class="form-label" style="font-size:12px;">Valid Reader / Akun Resmi</label>
+                  <div class="admin-currency-input-wrap">
+                    <span class="admin-currency-prefix">Rp</span>
+                    <input type="number" id="priceValidReaderInput" class="form-control" value="500" min="10" step="10">
+                  </div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Per sesi akun member (login, baca, like, follow, simpan).</div>
+                </div>
+                <div class="section-group">
+                  <label class="form-label" style="font-size:12px;">Guest Reader / Tamu</label>
+                  <div class="admin-currency-input-wrap">
+                    <span class="admin-currency-prefix">Rp</span>
+                    <input type="number" id="priceGuestReaderInput" class="form-control" value="50" min="1" step="5">
+                  </div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Per sesi tamu tanpa login (10 tamu = Rp 500).</div>
+                </div>
+                <div class="section-group">
+                  <label class="form-label" style="font-size:12px;">Engagement Interaksi Saja</label>
+                  <div class="admin-currency-input-wrap">
+                    <span class="admin-currency-prefix">Rp</span>
+                    <input type="number" id="priceLikeInput" class="form-control" value="100" min="0" step="10">
+                  </div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Per sesi suka/simpan murni tanpa baca panjang.</div>
+                </div>
+                <div class="section-group">
+                  <label class="form-label" style="font-size:12px;">Akun Generator (Per Akun)</label>
+                  <div class="admin-currency-input-wrap">
+                    <span class="admin-currency-prefix">Rp</span>
+                    <input type="number" id="priceAccountGeneratorInput" class="form-control" value="50" min="1" step="5">
+                  </div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Tarif pemotongan saldo per pembuatan akun baru (default Rp 50).</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">Kontak WhatsApp Owner</span>
+              </div>
+              <div class="card-body">
+                <div class="section-group">
+                  <label class="form-label" style="font-size:12px;">Nomor WhatsApp (Format 62xxx)</label>
+                  <input type="text" id="priceOwnerWaInput" class="form-control font-mono" value="6287734343023" style="font-weight:700;">
+                  <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Tujuan link chat langsung &amp; konfirmasi transfer.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header" style="align-items:flex-start;flex-direction:column;gap:4px;">
+              <div style="display:flex;width:100%;justify-content:space-between;align-items:center;">
+                <span class="card-title">Daftar Paket Saldo Klien</span>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="adminAddNewPackageCard()">+ Tambah Paket</button>
+              </div>
+              <div style="font-size:11px;color:var(--text-muted);">Tampil di beranda klien &amp; kasir checkout secara otomatis.</div>
+            </div>
+            <div class="card-body">
+              <div id="adminPackagesContainer">
+                <div style="text-align:center;color:var(--text-muted);padding:20px;">Memuat daftar paket...</div>
+              </div>
+              <div id="adminPricingAlert" style="display:none;margin-bottom:12px;"></div>
+              <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px;">
+                <button type="button" class="btn btn-secondary" onclick="loadAdminPricing()">🔄 Muat Ulang</button>
+                <button id="btnSavePricing" type="button" class="btn btn-primary" onclick="saveAdminPricing()" style="font-weight:700;">Simpan Tarif &amp; Paket</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </main>
+
+    <footer class="app-footer">
+      <span>RinaraDev Admin Portal &bull; Akses Terbatas &bull; TLS Secured</span>
+      <span>WhatsApp: +62 877-3434-3023</span>
+    </footer>
+  </div>
+
+</div><!-- /adminShell -->
+
+<!-- MODAL: TAMBAH PRESET BARU -->
+<div id="adminAddPresetModal" class="modal-overlay" style="display:none;" onclick="if(event.target===this)closeAddPresetModal()">
+  <div class="modal-card" style="max-width:420px;">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Tambah Preset Paket Baru</div>
+        <div class="modal-subtitle">Tambahkan nominal cepat untuk mempermudah penerbitan token.</div>
+      </div>
+      <button type="button" class="modal-close-btn" onclick="closeAddPresetModal()">&times;</button>
+    </div>
+    <div class="modal-body" style="padding:18px 20px;">
+      <div class="section-group">
+        <label class="form-label">Nominal Saldo (Rp)</label>
+        <div class="admin-currency-input-wrap">
+          <span class="admin-currency-prefix">Rp</span>
+          <input type="number" id="newPresetPriceInput" class="form-control" value="75000" min="1000" step="1000" oninput="onNewPresetPriceInput(this.value)">
+        </div>
+        <!-- Quick suggestions -->
+        <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;">
+          <button type="button" class="preset-chip" style="font-size:11px;padding:3px 8px;" onclick="setNewPresetPrice(25000)">25K</button>
+          <button type="button" class="preset-chip" style="font-size:11px;padding:3px 8px;" onclick="setNewPresetPrice(75000)">75K</button>
+          <button type="button" class="preset-chip" style="font-size:11px;padding:3px 8px;" onclick="setNewPresetPrice(100000)">100K</button>
+          <button type="button" class="preset-chip" style="font-size:11px;padding:3px 8px;" onclick="setNewPresetPrice(150000)">150K</button>
+          <button type="button" class="preset-chip" style="font-size:11px;padding:3px 8px;" onclick="setNewPresetPrice(200000)">200K</button>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <label class="form-label">Nama / Label Paket</label>
+        <input type="text" id="newPresetNameInput" class="form-control" value="Paket Spesial (75K)" placeholder="Contoh: Paket VIP (100K)">
+      </div>
+
+      <div class="section-group" style="margin-bottom:0;">
+        <label class="form-label">Tampilkan di Halaman Klien</label>
+        <label class="modern-toggle-label" style="font-size:12px;margin:0;">
+          <div class="modern-toggle-switch">
+            <input type="checkbox" id="newPresetPublicToggle" checked>
+            <span class="modern-toggle-slider"></span>
+          </div>
+          <span style="color:var(--text-body);">Aktifkan agar klien juga bisa membeli paket ini via checkout QRIS</span>
+        </label>
+      </div>
+
+      <div id="addPresetError" class="alert alert-error" style="display:none;margin-top:12px;font-size:12px;"></div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;padding:12px 20px;background:#F8FAFC;border-top:1px solid #F1F5F9;border-radius:0 0 16px 16px;">
+      <button type="button" class="btn btn-secondary btn-sm" onclick="closeAddPresetModal()">Batal</button>
+      <button type="button" id="btnSubmitNewPreset" class="btn btn-primary btn-sm" onclick="submitNewPresetPackage()">Simpan &amp; Terapkan</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=9.6"></script>
+<script>
+const _adminPages = ['overview','tokens','accounts','payments','pricing'];
+const _adminNavMap = {overview:'tnOverview',tokens:'tnTokens',accounts:'tnAccounts',payments:'tnPayments',pricing:'tnPricing'};
+const _adminPageMap = {overview:'adminPageOverview',tokens:'adminPageTokens',accounts:'adminPageAccounts',payments:'adminPagePayments',pricing:'adminPagePricing'};
+const _adminTitles  = {overview:'Overview',tokens:'Token Klien',accounts:'Akun & Node',payments:'Riwayat Transaksi',pricing:'Tarif & Paket'};
+
+// --- ADMIN SIDEBAR CONTROLLER ---
+const adminSidebarEl = document.getElementById('adminSidebar');
+const adminBackdropEl = document.getElementById('adminSidebarBackdrop');
+
+function expandAdminSidebar() {
+  if (adminSidebarEl) {
+    adminSidebarEl.classList.remove('collapsed');
+    adminSidebarEl.classList.add('expanded');
+  }
+  if (adminBackdropEl) adminBackdropEl.classList.add('active');
+}
+
+function collapseAdminSidebar() {
+  if (adminSidebarEl) {
+    adminSidebarEl.classList.add('collapsed');
+    adminSidebarEl.classList.remove('expanded');
+  }
+  if (adminBackdropEl) adminBackdropEl.classList.remove('active');
+}
+
+function toggleAdminSidebar() {
+  if (adminSidebarEl && adminSidebarEl.classList.contains('expanded')) {
+    collapseAdminSidebar();
+  } else {
+    expandAdminSidebar();
+  }
+}
+
+function handleAdminNavClick(page) {
+  switchAdminPage(page);
+  expandAdminSidebar();
+}
+
+// Tutup sidebar admin saat user menyentuh/klik bagian luar
+document.addEventListener('click', (e) => {
+  if (!adminSidebarEl || !adminSidebarEl.classList.contains('expanded')) return;
+  if (adminSidebarEl.contains(e.target)) return;
+  collapseAdminSidebar();
+});
+
+document.addEventListener('touchstart', (e) => {
+  if (!adminSidebarEl || !adminSidebarEl.classList.contains('expanded')) return;
+  if (adminSidebarEl.contains(e.target)) return;
+  collapseAdminSidebar();
+}, { passive: true });
+
+function switchAdminPage(page) {
+  _adminPages.forEach(p => {
+    const el = document.getElementById(_adminPageMap[p]);
+    if (el) el.style.display = (p === page) ? '' : 'none';
+  });
+  Object.values(_adminNavMap).forEach(id => { const b = document.getElementById(id); if(b) b.classList.remove('active'); });
+  const nb = document.getElementById(_adminNavMap[page]);
+  if (nb) nb.classList.add('active');
+  const t = document.getElementById('adminTopbarTitle');
+  if (t) t.textContent = _adminTitles[page] || page;
+}
+
+// Legacy tab switcher alias (used by app.js)
+function switchAdminTab(tab) { switchAdminPage(tab); }
+
+// Admin login UI
+function adminShowDashboard() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('adminShell').style.display = 'flex';
+}
+
+// Logout
+function adminLogout() {
+  sessionStorage.removeItem('rinaradev_admin_pin');
+  sessionStorage.removeItem('toodat_admin_pin');
+  location.reload();
+}
+
+// Preset helpers
+function setPresetPackage(amount, pkgName, btnEl) {
+  const a = document.getElementById('tokenAmountInput');
+  const l = document.getElementById('tokenLabelInput');
+  if (a) a.value = amount;
+  if (l) l.value = (pkgName || 'Paket Saldo') + ' - Klien';
+
+  const container = document.getElementById('adminPresetButtonsContainer');
+  if (container) {
+    container.querySelectorAll('.preset-chip').forEach(c => c.classList.remove('active'));
+    if (btnEl) {
+      btnEl.classList.add('active');
+    } else {
+      const chip = document.getElementById('presetChip_' + amount);
+      if (chip) chip.classList.add('active');
+    }
+  }
+}
+
+function showAddPresetModal() {
+  const m = document.getElementById('adminAddPresetModal');
+  if (m) {
+    m.style.display = 'flex';
+    const p = document.getElementById('newPresetPriceInput');
+    if (p) { p.focus(); p.select(); }
+  }
+}
+
+function closeAddPresetModal() {
+  const m = document.getElementById('adminAddPresetModal');
+  if (m) m.style.display = 'none';
+  const err = document.getElementById('addPresetError');
+  if (err) err.style.display = 'none';
+}
+
+function setNewPresetPrice(val) {
+  const p = document.getElementById('newPresetPriceInput');
+  if (p) {
+    p.value = val;
+    onNewPresetPriceInput(val);
+  }
+}
+
+function onNewPresetPriceInput(val) {
+  const n = document.getElementById('newPresetNameInput');
+  const num = parseInt(val) || 0;
+  if (n && num > 0) {
+    const k = (num >= 1000) ? Math.round(num / 1000) + 'K' : num;
+    n.value = `Paket Saldo (${k})`;
+  }
+}
+
+async function submitNewPresetPackage() {
+  const priceInput = document.getElementById('newPresetPriceInput');
+  const nameInput = document.getElementById('newPresetNameInput');
+  const publicToggle = document.getElementById('newPresetPublicToggle');
+  const btn = document.getElementById('btnSubmitNewPreset');
+  const errEl = document.getElementById('addPresetError');
+
+  const price = parseInt(priceInput ? priceInput.value : 0) || 0;
+  const name = nameInput ? nameInput.value.trim() : '';
+  const isPublic = publicToggle ? publicToggle.checked : true;
+
+  if (price < 1000) {
+    if (errEl) {
+      errEl.textContent = 'Nominal minimal adalah Rp 1.000.';
+      errEl.style.display = 'block';
+    }
+    return;
+  }
+  if (!name) {
+    if (errEl) {
+      errEl.textContent = 'Nama paket tidak boleh kosong.';
+      errEl.style.display = 'block';
+    }
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  if (errEl) errEl.style.display = 'none';
+
+  try {
+    const curResp = await fetch('/api/pricing');
+    const curData = await curResp.json();
+    let currentPackages = curData.packages || [];
+
+    const newPkg = {
+      id: `pkg_${price}`,
+      name: name,
+      price: price,
+      features: [
+        `${Math.floor(price / 300)} sesi akun member resmi`,
+        `${Math.floor(price / 50)} sesi pembaca tamu`,
+        "Otomatis suka & simpan novel",
+        "Saldo utuh tanpa masa kadaluarsa"
+      ],
+      popular: false,
+      is_featured: isPublic
+    };
+
+    currentPackages = currentPackages.filter(p => p.price !== price);
+    currentPackages.push(newPkg);
+    currentPackages.sort((a, b) => (a.price || 0) - (b.price || 0));
+
+    const pin = (typeof adminPin !== 'undefined' && adminPin) ? adminPin : (sessionStorage.getItem('rinaradev_admin_pin') || '');
+    const saveResp = await fetch('/api/admin/pricing', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Pin': pin
+      },
+      body: JSON.stringify({
+        packages: currentPackages
+      })
+    });
+    const saveData = await saveResp.json();
+    if (!saveData.ok) {
+      throw new Error(saveData.detail || saveData.error || 'Gagal menyimpan preset');
+    }
+
+    if (typeof loadPricingConfig === 'function') {
+      await loadPricingConfig();
+    }
+    if (typeof loadAdminPricing === 'function') {
+      await loadAdminPricing();
+    }
+
+    setPresetPackage(price, name);
+    closeAddPresetModal();
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = 'Gagal menyimpan: ' + err.message;
+      errEl.style.display = 'block';
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+function setPresetAccountCount(val) {
+  const el = document.getElementById('genAccountCountInput');
+  if (el) el.value = val;
+}
+
+// Override adminLogin to show new UI
+const _origAdminLogin = typeof adminLogin === 'function' ? adminLogin : null;
+function adminLogin() {
+  const pin = document.getElementById('adminPinInput').value.trim();
+  fetch('/api/admin/login', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({pin})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.ok) {
+      sessionStorage.setItem('rinaradev_admin_pin', pin);
+      adminPin = pin;
+      adminShowDashboard();
+      loadAdminStats();
+      loadAdminTokens();
+      loadAdminAccounts();
+      loadAdminPayments();
+      loadAdminPricing();
+    } else {
+      const errEl = document.getElementById('loginError');
+      errEl.textContent = d.error || 'PIN salah.';
+      errEl.style.display = 'block';
+    }
+  })
+  .catch(() => {
+    const errEl = document.getElementById('loginError');
+    errEl.textContent = 'Gagal terhubung ke server.';
+    errEl.style.display = 'block';
+  });
+}
+
+// On load: check stored PIN
+document.addEventListener('DOMContentLoaded', () => {
+  const storedPin = sessionStorage.getItem('rinaradev_admin_pin') || sessionStorage.getItem('toodat_admin_pin') || '';
+  if (storedPin) {
+    window.adminPin = storedPin;
+    adminShowDashboard();
+    loadAdminStats();
+    loadAdminTokens();
+    loadAdminAccounts();
+    loadAdminPayments();
+    loadAdminPricing();
+  }
+});
+</script>
+</body>
+</html>

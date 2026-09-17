@@ -3,3 +3,8 @@ __pycache__/
 *$py.class
 .env
 .pytest_cache/
+*.har
+gaaasss.har
+scratch/
+akun_backup_*.txt
+

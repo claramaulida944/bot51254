@@ -214,13 +214,11 @@ class FullAutoWorker:
 
     async def refresh_access_token(self, client: Optional[httpx.AsyncClient] = None) -> bool:
         refresh_token = self.account.get("refresh_token")
-        if not refresh_token or not self.proxy:
+        if not refresh_token:
             return False
         try:
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "http2": False,
-                "proxy": self.proxy,
                 "timeout": httpx.Timeout(20.0),
                 "headers": {
                     "user-agent": self.user_agent,
@@ -229,6 +227,8 @@ class FullAutoWorker:
                     "accept": "application/json",
                 },
             }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
 
             async with httpx.AsyncClient(**kwargs) as refresh_client:
                 resp = await refresh_client.post("/api/auth/token/refresh", json={"refresh_token": refresh_token})
@@ -253,15 +253,11 @@ class FullAutoWorker:
         password = self.account.get("password")
         if not self.email or not password:
             return False
-        if not self.proxy:
-            logger.warning("[%s] Login dibatalkan: Proxy WAJIB digunakan untuk akun ini!", self.worker_id)
-            return False
 
         for attempt in range(1, max_retries + 1):
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "http2": False,
-                "proxy": self.proxy,
+                "http2": False if self.proxy else True,
                 "timeout": httpx.Timeout(15.0),
                 "headers": {
                     "user-agent": self.user_agent,
@@ -273,6 +269,8 @@ class FullAutoWorker:
                     "accept": "application/json",
                 },
             }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
 
             try:
                 async with httpx.AsyncClient(**kwargs) as login_client:
@@ -336,21 +334,17 @@ class FullAutoWorker:
         return relogged
 
     async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
-        if not self.proxy:
-            self.status = "[red]Ditolak (Wajib Proxy)[/]"
-            progress.update(task_id, description="[bold red]Gagal: Wajib Proxy![/]")
-            return self._build_summary()
-
         short_email = self.email.split("@")[0][:12]
         headers = self.build_headers()
 
         client_kwargs: Dict[str, Any] = {
             "base_url": self.BASE_URL,
-            "http2": False,
-            "proxy": self.proxy,
+            "http2": False if self.proxy else True,
             "headers": headers,
             "timeout": httpx.Timeout(25.0),
         }
+        if self.proxy:
+            client_kwargs["proxy"] = self.proxy
 
         try:
             async with httpx.AsyncClient(**client_kwargs) as client:
@@ -693,30 +687,7 @@ class FullAutoOrchestrator:
             try:
                 acc_country = account.get("country", "ID")
                 sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
-                acc_proxy = account.get("proxy")
-                if acc_proxy:
-                    proxy = acc_proxy
-                else:
-                    proxy = self.proxy_manager.pop_proxy(country_code=acc_country, session_id=sess_id)
-
-                if not proxy:
-                    progress.reset(tid, total=total_steps)
-                    progress.update(
-                        tid,
-                        role=f"[red]Akun-{worker_idx:02d}[/]",
-                        description="[bold red]Gagal (Wajib Proxy)[/]",
-                    )
-                    return {
-                        "worker_id": f"Akun-{worker_idx:02d}",
-                        "email": account.get("email", "-"),
-                        "country": acc_country,
-                        "like": "[red]NO PROXY[/]",
-                        "bookmark": "[red]NO PROXY[/]",
-                        "follow": "[red]NO PROXY[/]",
-                        "chapters_read": 0,
-                        "status": "[red]Gagal (Wajib Proxy)[/]",
-                    }
-
+                proxy = self.proxy_manager.pop_proxy(country_code=acc_country, session_id=sess_id)
                 progress.reset(tid, total=total_steps)
                 progress.update(
                     tid,
@@ -900,13 +871,6 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
     if not accounts:
         console.print("[bold red][ERROR] Belum ada akun terdaftar di 'akun.txt'![/]")
         console.print("[yellow]Silakan buat akun terlebih dahulu menggunakan Menu [2] Auto Signup Generator.[/]")
-        return
-
-    default_proxy_manager.load_proxies()
-    if not default_proxy_manager.has_proxies:
-        console.print("[bold red][ERROR] PROXY TIDAK DITEMUKAN / KOSONG DI 'proxies.txt'![/]")
-        console.print("[yellow]Sesuai aturan keamanan, setiap akun memiliki negara/proxy berbeda dan WAJIB menggunakan proxy.[/]")
-        console.print("[yellow]Koneksi langsung tanpa proxy (Direct IP) DILARANG KERAS.[/]")
         return
 
     # 1. Input Target URL / Novel ID

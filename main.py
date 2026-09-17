@@ -61,9 +61,11 @@ from interaction_manager import (
     run_auto_bookmark_cli,
     run_auto_followers_cli,
     run_auto_like_cli,
+    run_auto_remix_cli,
+    run_auto_report_cli,
     run_sync_nicknames_cli,
 )
-from proxy_manager import ProxyManager, default_proxy_manager, test_proxy_cli
+from proxy_manager import ProxyManager, default_proxy_manager, test_proxy_cli, is_dead_or_proxy_error
 from full_auto_runner import run_full_auto_cli
 
 # Konfigurasi console & logging
@@ -87,7 +89,9 @@ def render_dashboard_stats() -> None:
     """Menampilkan ringkasan status sumber daya terkini sistem."""
     accounts = load_accounts_from_file("akun.txt")
     mgr = default_proxy_manager
-    mgr.load_proxies()
+    mgr.reload_if_modified()
+    if mgr.is_hypeproxy:
+        mgr.sync_from_hypeproxy()
 
     stats_table = Table(box=None, show_header=False, padding=(0, 2))
     stats_table.add_column("Key", style="bold white")
@@ -392,29 +396,55 @@ def feature_account_manager() -> None:
             wait_for_enter()
 
         elif action == "3":
-            console.print("\n[dim]Memeriksa keaktifan token seluruh akun ke backend...[/]\n")
-            dead_indices = []
-            with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
-                for idx, acc in enumerate(accounts):
-                    headers = {
-                        "authorization": f"Bearer {acc.get('access_token', '')}",
-                        "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
-                        "x-device-id": acc.get("device_id", ""),
-                    }
-                    is_active = False
-                    try:
-                        resp = client.get("/api/reading/progress", headers=headers)
-                        if resp.status_code != 401:
-                            is_active = True
-                    except Exception:
-                        pass
+            if not default_proxy_manager.has_proxies:
+                console.print(
+                    "\n[bold red][PERINGATAN KESELAMATAN] Proxy WAJIB aktif![/]\n"
+                    "[red]Pengecekan akun dibatalkan karena tidak ada proxy aktif di proxies.txt demi melindungi IP lokal.[/]\n"
+                )
+                wait_for_enter()
+                continue
 
-                    if not is_active:
-                        email = acc.get("email")
-                        pw = acc.get("password")
-                        relogin_ok = False
-                        if email and pw:
+            console.print("\n[dim]Memeriksa keaktifan token seluruh akun ke backend via proxy terisolasi...[/]\n")
+            dead_indices = []
+            for idx, acc in enumerate(accounts):
+                email = acc.get("email", "-")
+                pw = acc.get("password")
+                country = acc.get("country", "ID")
+
+                is_active = False
+                relogin_ok = False
+                last_err = None
+
+                for attempt in range(1, 5):
+                    if attempt == 1 and acc.get("proxy"):
+                        acc_proxy = acc.get("proxy")
+                    else:
+                        acc_proxy = default_proxy_manager.pop_proxy(country_code=country)
+
+                    if not acc_proxy:
+                        last_err = "Tidak ada proxy tersedia"
+                        break
+
+                    try:
+                        with httpx.Client(http2=False, proxy=acc_proxy, base_url="https://api.quarterfull.io", timeout=15.0) as client:
+                            headers = {
+                                "authorization": f"Bearer {acc.get('access_token', '')}",
+                                "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                                "x-device-id": acc.get("device_id", ""),
+                            }
                             try:
+                                resp = client.get("/api/reading/progress", headers=headers)
+                                if resp.status_code != 401:
+                                    is_active = True
+                                    default_proxy_manager.mark_used(acc_proxy)
+                                    break
+                            except Exception as chk_err:
+                                if is_dead_or_proxy_error(chk_err) or "10054" in str(chk_err) or "timeout" in str(chk_err).lower():
+                                    default_proxy_manager.mark_failed(acc_proxy, chk_err)
+                                    time.sleep(0.4)
+                                    continue
+
+                            if email and pw:
                                 h = {
                                     "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
                                     "x-device-id": acc.get("device_id", ""),
@@ -431,16 +461,31 @@ def feature_account_manager() -> None:
                                     if "refresh_token" in d:
                                         acc["refresh_token"] = d.get("refresh_token")
                                     relogin_ok = True
-                            except Exception:
-                                pass
+                                    default_proxy_manager.mark_used(acc_proxy)
+                                    break
+                                elif r.status_code in (400, 401, 403, 404, 422):
+                                    last_err = f"HTTP {r.status_code}"
+                                    break
+                                else:
+                                    last_err = f"HTTP {r.status_code}"
+                                    time.sleep(0.4)
+                                    continue
+                            else:
+                                break
+                    except Exception as net_err:
+                        last_err = str(net_err)
+                        if is_dead_or_proxy_error(net_err) or "10054" in str(net_err) or "timeout" in str(net_err).lower():
+                            default_proxy_manager.mark_failed(acc_proxy, net_err)
+                        time.sleep(0.4)
+                        continue
 
-                        if not relogin_ok:
-                            dead_indices.append(idx)
-                            console.print(f"  [red]#{idx + 1:02d} {acc.get('email')} -> MATI / GAGAL LOGIN (Kandidat Hapus)[/]")
-                        else:
-                            console.print(f"  [green]#{idx + 1:02d} {acc.get('email')} -> RE-LOGIN SUKSES (Disimpan)[/]")
-                    else:
-                        console.print(f"  [cyan]#{idx + 1:02d} {acc.get('email')} -> AKTIF[/]")
+                if is_active:
+                    console.print(f"  [cyan]#{idx + 1:02d} {email} -> AKTIF[/]")
+                elif relogin_ok:
+                    console.print(f"  [green]#{idx + 1:02d} {email} -> RE-LOGIN SUKSES (Token Baru Disimpan)[/]")
+                else:
+                    dead_indices.append(idx)
+                    console.print(f"  [red]#{idx + 1:02d} {email} -> MATI / GAGAL ({last_err or 'Expired'})[/]")
 
             save_accounts_to_file(accounts)
 
@@ -472,26 +517,60 @@ def feature_account_manager() -> None:
             wait_for_enter()
 
         elif action == "5":
-            console.print("\n[dim]Menguji keaktifan token ke endpoint resmi backend...[/]\n")
+            if not default_proxy_manager.has_proxies:
+                console.print(
+                    "\n[bold red][PERINGATAN KESELAMATAN] Proxy WAJIB aktif![/]\n"
+                    "[red]Uji token dibatalkan karena tidak ada proxy aktif di proxies.txt demi melindungi IP lokal.[/]\n"
+                )
+                wait_for_enter()
+                continue
+
+            console.print("\n[dim]Menguji keaktifan token ke endpoint resmi backend via proxy terisolasi...[/]\n")
             expired_accounts = []
-            with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=15.0) as client:
-                for idx, acc in enumerate(accounts, start=1):
+            for idx, acc in enumerate(accounts, start=1):
+                email = acc.get("email", "-")
+                country = acc.get("country", "ID")
+
+                status_str = "[bold red]KADALUARSA (Expired)[/]"
+                is_valid = False
+
+                for chk_attempt in range(1, 4):
+                    if chk_attempt == 1 and acc.get("proxy"):
+                        chk_proxy = acc.get("proxy")
+                    else:
+                        chk_proxy = default_proxy_manager.pop_proxy(country_code=country)
+
+                    if not chk_proxy:
+                        status_str = "[red]Error: Tidak ada proxy[/]"
+                        break
+
                     headers = {
                         "authorization": f"Bearer {acc.get('access_token', '')}",
                         "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
                         "x-device-id": acc.get("device_id", ""),
                     }
                     try:
-                        resp = client.get("/api/reading/progress", headers=headers)
-                        if resp.status_code != 401:
-                            status_str = "[bold green]AKTIF (Valid)[/]"
-                        else:
-                            status_str = "[bold red]KADALUARSA (Expired)[/]"
-                            expired_accounts.append(acc)
+                        with httpx.Client(http2=False, proxy=chk_proxy, base_url="https://api.quarterfull.io", timeout=12.0) as client:
+                            resp = client.get("/api/reading/progress", headers=headers)
+                            if resp.status_code != 401:
+                                status_str = "[bold green]AKTIF (Valid)[/]"
+                                is_valid = True
+                                default_proxy_manager.mark_used(chk_proxy)
+                                break
+                            else:
+                                status_str = "[bold red]KADALUARSA (Expired)[/]"
+                                break
                     except Exception as exc:
-                        status_str = f"[yellow]Error: {exc}[/]"
+                        status_str = f"[yellow]Error ({exc})[/]"
+                        if is_dead_or_proxy_error(exc) or "10054" in str(exc) or "timeout" in str(exc).lower():
+                            default_proxy_manager.mark_failed(chk_proxy, exc)
+                        time.sleep(0.3)
+                        continue
 
-                    console.print(f"  [{idx:02d}] {acc.get('email')} -> {status_str}")
+                if not is_valid:
+                    expired_accounts.append(acc)
+
+                console.print(f"  [{idx:02d}] {email} -> {status_str}")
 
             if expired_accounts:
                 console.print(f"\n[yellow]Terdeteksi {len(expired_accounts)} akun dengan token kadaluarsa.[/]")
@@ -500,37 +579,70 @@ def feature_account_manager() -> None:
                     default=True,
                 )
                 if do_relogin:
-                    console.print("\n[cyan]Memulai proses Login Ulang akun...[/]\n")
+                    console.print("\n[cyan]Memulai proses Login Ulang akun via proxy (dengan Auto-Retry & Rotasi Proxy)...[/]\n")
                     relogin_success = 0
-                    with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=20.0) as relogin_client:
-                        for i, acc in enumerate(accounts, start=1):
-                            email = acc.get("email")
-                            password = acc.get("password")
-                            if not email or not password:
+                    max_retries = 5
+
+                    for i, acc in enumerate(expired_accounts, start=1):
+                        email = acc.get("email")
+                        password = acc.get("password")
+                        country = acc.get("country", "ID")
+                        if not email or not password:
+                            continue
+
+                        h = {
+                            "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                            "x-device-id": acc.get("device_id", ""),
+                            "x-platform": "android",
+                            "x-app-variant": "prod",
+                            "x-app-version": "3.0.52",
+                            "content-type": "application/json",
+                            "accept": "application/json",
+                        }
+
+                        relogin_ok = False
+                        last_err = None
+
+                        for attempt in range(1, max_retries + 1):
+                            if attempt == 1 and acc.get("proxy"):
+                                current_proxy = acc.get("proxy")
+                            else:
+                                current_proxy = default_proxy_manager.pop_proxy(country_code=country)
+
+                            if not current_proxy:
+                                last_err = "Tidak ada proxy tersedia di pool"
+                                break
+
+                            try:
+                                with httpx.Client(http2=False, proxy=current_proxy, base_url="https://api.quarterfull.io", timeout=18.0) as relogin_client:
+                                    r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
+                                    if r.status_code == 200:
+                                        d = r.json()
+                                        acc["access_token"] = d.get("access_token", acc.get("access_token"))
+                                        if "refresh_token" in d:
+                                            acc["refresh_token"] = d.get("refresh_token")
+                                        relogin_success += 1
+                                        relogin_ok = True
+                                        default_proxy_manager.mark_used(current_proxy)
+                                        retry_tag = f" (Percobaan ke-{attempt})" if attempt > 1 else ""
+                                        console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru){retry_tag}[/]")
+                                        break
+                                    elif r.status_code in (400, 401, 403, 404, 422):
+                                        last_err = f"HTTP {r.status_code}"
+                                        break
+                                    else:
+                                        last_err = f"HTTP {r.status_code}"
+                                        time.sleep(0.5)
+                                        continue
+                            except Exception as err:
+                                last_err = str(err)
+                                if is_dead_or_proxy_error(err) or "10054" in str(err) or "timeout" in str(err).lower() or "reset" in str(err).lower():
+                                    default_proxy_manager.mark_failed(current_proxy, err)
+                                time.sleep(0.5)
                                 continue
 
-                            h = {
-                                "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
-                                "x-device-id": acc.get("device_id", ""),
-                                "x-platform": "android",
-                                "x-app-variant": "prod",
-                                "x-app-version": "3.0.52",
-                                "content-type": "application/json",
-                                "accept": "application/json",
-                            }
-                            try:
-                                r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
-                                if r.status_code == 200:
-                                    d = r.json()
-                                    acc["access_token"] = d.get("access_token", acc.get("access_token"))
-                                    if "refresh_token" in d:
-                                        acc["refresh_token"] = d.get("refresh_token")
-                                    relogin_success += 1
-                                    console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru)[/]")
-                                else:
-                                    console.print(f"  [{i:02d}] {email} -> [red]Gagal ({r.status_code})[/]")
-                            except Exception as err:
-                                console.print(f"  [{i:02d}] {email} -> [red]Error: {err}[/]")
+                        if not relogin_ok:
+                            console.print(f"  [{i:02d}] {email} -> [red]Gagal ({last_err})[/]")
 
                     save_accounts_to_file(accounts)
                     console.print(f"\n[bold green]Selesai! {relogin_success} akun berhasil diperbarui dan disimpan ke 'akun.txt'.[/]")
@@ -556,7 +668,8 @@ def feature_search_novels() -> None:
 
     with console.status(f"[bold cyan]Mencari novel dengan kata kunci '{query}'...[/]"):
         try:
-            with httpx.Client(http2=True, base_url="https://api.quarterfull.io", timeout=20.0) as client:
+            active_p = default_proxy_manager.get_proxy() if default_proxy_manager.has_proxies else None
+            with httpx.Client(http2=False if active_p else True, proxy=active_p, base_url="https://api.quarterfull.io", timeout=20.0) as client:
                 resp = client.get(f"/api/v1/search?q={query}&limit=10", headers={"user-agent": "okhttp/4.12.0"})
                 resp.raise_for_status()
                 data = resp.json()
@@ -729,6 +842,34 @@ def feature_full_auto(preset_novel_id: Optional[str] = None) -> None:
 
 
 # =============================================================================
+# FITUR 12: AUTO REMIX CERITA NOVEL (HIT & RUN + MULTI-MODE)
+# =============================================================================
+def feature_auto_remix(preset_novel_id: Optional[str] = None) -> None:
+    """Menjalankan modul Auto Remix Cerita Bab Novel secara Hit & Run."""
+    try:
+        run_auto_remix_cli(preset_novel_id=preset_novel_id)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Sesi Auto Remix dibatalkan oleh pengguna.[/]")
+    except Exception as exc:
+        console.print(f"\n[bold red]Terjadi kesalahan pada Auto Remix:[/] {exc}")
+    wait_for_enter()
+
+
+# =============================================================================
+# FITUR 13: AUTO REPORT NOVEL (MASS CONTENT MODERATION)
+# =============================================================================
+def feature_auto_report(preset_novel_id: Optional[str] = None) -> None:
+    """Menjalankan modul Report Konten Novel Massal."""
+    try:
+        run_auto_report_cli(preset_novel_id=preset_novel_id)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Sesi Report Konten dibatalkan oleh pengguna.[/]")
+    except Exception as exc:
+        console.print(f"\n[bold red]Terjadi kesalahan pada Report Konten:[/] {exc}")
+    wait_for_enter()
+
+
+# =============================================================================
 # MENU UTAMA (MAIN EVENT LOOP)
 # =============================================================================
 def main_menu() -> None:
@@ -753,6 +894,8 @@ def main_menu() -> None:
         menu_table.add_row("[9]", "Auto Followers Akun [bold green](Mass Follow Akun Penulis / Kreator)[/]")
         menu_table.add_row("[10]", "Ubah Nama Pengguna Akun [bold cyan](Sinkronkan Nickname Sesuai akun.txt)[/]")
         menu_table.add_row("[11]", "★ FULL AUTO BOT ★ [bold magenta](Baca Novel + Like + Simpan + Follow + Auto Skip)[/]")
+        menu_table.add_row("[12]", "Auto Remix Cerita Bab Novel [bold bright_magenta](Hit & Run + Variasi Multi-Mode)[/]")
+        menu_table.add_row("[13]", "Auto Report Konten Novel [bold red](Mass Report Novel Pelanggar Aturan)[/]")
         menu_table.add_row("[0]", "[bold red]Keluar / Exit[/]")
 
         console.print(menu_table)
@@ -760,8 +903,8 @@ def main_menu() -> None:
 
         try:
             choice = Prompt.ask(
-                "[bold green]?[/] Pilih menu [0-11]",
-                choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
+                "[bold green]?[/] Pilih menu [0-13]",
+                choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"],
                 default="11",
             )
         except (KeyboardInterrupt, EOFError):
@@ -790,6 +933,10 @@ def main_menu() -> None:
             feature_sync_nicknames()
         elif choice == "11":
             feature_full_auto()
+        elif choice == "12":
+            feature_auto_remix()
+        elif choice == "13":
+            feature_auto_report()
         elif choice == "0":
             console.print("\n[bold yellow]Terima kasih telah menggunakan Toodat Bot Suite. Sampai jumpa![/]\n")
             break

@@ -234,55 +234,34 @@ class NovelTargetResolver:
 
     @classmethod
     async def fetch_novel_details(cls, novel_id: str, proxy: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
-        """Mengambil metadata novel (judul, deskripsi, penulis) via proxy dengan auto-retry, rotasi instan, dan otentikasi otomatis untuk novel 18+."""
+        """Mengambil metadata novel (judul, deskripsi, penulis) dengan dukungan origin detection dan otentikasi otomatis untuk novel 18+."""
         url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}"
-        data = None
-        last_exc = None
         active_token = auth_token or cls._cached_auth_token
+        headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
+        if active_token:
+            headers["authorization"] = f"Bearer {active_token}"
 
-        for attempt in range(1, 5):
-            current_proxy = proxy or (default_proxy_manager.pop_proxy() if default_proxy_manager and default_proxy_manager.has_proxies else None)
-            headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
-            if active_token:
-                headers["authorization"] = f"Bearer {active_token}"
+        client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 20.0}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+            client_kwargs["http2"] = False
+        else:
+            client_kwargs["http2"] = True
 
-            client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 10.0}
-            if current_proxy:
-                client_kwargs["proxy"] = current_proxy
-                client_kwargs["http2"] = False
-            else:
-                client_kwargs["http2"] = True
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404 and "adult_access_required" in resp.text:
+                active_token = cls.get_auth_token(force_refresh=False)
+                if active_token:
+                    resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+            elif resp.status_code == 401 and active_token:
+                active_token = cls.get_auth_token(force_refresh=True)
+                if active_token:
+                    resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
 
-            try:
-                async with httpx.AsyncClient(**client_kwargs) as client:
-                    resp = await client.get(url)
-                    # Deteksi konten dewasa jika belum berotentikasi
-                    if resp.status_code == 404 and "adult_access_required" in resp.text:
-                        active_token = cls.get_auth_token(force_refresh=False)
-                        if active_token:
-                            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
-                    elif resp.status_code == 401 and active_token:
-                        active_token = cls.get_auth_token(force_refresh=True)
-                        if active_token:
-                            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+            resp.raise_for_status()
+            data = resp.json()
 
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if current_proxy and default_proxy_manager:
-                        default_proxy_manager.mark_used(current_proxy)
-                    break
-            except Exception as exc:
-                last_exc = exc
-                if current_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_failed(current_proxy, exc)
-                continue
-
-        if not data:
-            if last_exc:
-                raise last_exc
-            raise RuntimeError(f"Gagal mengambil metadata novel {novel_id}")
-
-        # Deteksi jika novel aslinya berasal dari luar negeri (misal EN) atau berstatus terjemahan (is_translated=True)
         origin = str(data.get("origin_country", "ID")).upper()
         if (origin == "EN" or data.get("is_translated")) and not proxy and default_proxy_manager and default_proxy_manager.has_proxies:
             en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
@@ -293,7 +272,7 @@ class NovelTargetResolver:
                     p_headers = {"user-agent": "okhttp/4.12.0"}
                     if active_token:
                         p_headers["authorization"] = f"Bearer {active_token}"
-                    async with httpx.AsyncClient(proxy=origin_proxy, http2=False, timeout=10.0, headers=p_headers) as p_client:
+                    async with httpx.AsyncClient(proxy=origin_proxy, http2=False, timeout=20.0, headers=p_headers) as p_client:
                         p_resp = await p_client.get(url)
                         if p_resp.status_code == 200:
                             p_data = p_resp.json()
@@ -317,26 +296,32 @@ class NovelTargetResolver:
         """
         Mengambil daftar bab novel secara dinamis dengan dukungan paginasi kursor (cursor),
         memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
-        Dilengkapi auto-retry, rotasi proxy, dan otentikasi otomatis jika novel butuh akses 18+.
+        Mendukung rotasi proxy negara asal dan otentikasi otomatis jika konten butuh akses 18+.
         """
+        target_proxy = proxy
         active_token = auth_token or cls._cached_auth_token
+        if not target_proxy and default_proxy_manager and default_proxy_manager.has_proxies:
+            if origin_country and origin_country.upper() == "EN":
+                en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
+                target_proxy = default_proxy_manager.get_proxy(country_code=random.choice(en_countries))
+            elif origin_country and origin_country.upper() != "ID":
+                target_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
 
-        async def _query_chapters(target_proxy: Optional[str]) -> List[Dict[str, Any]]:
+        async def _query_chapters(target_p: Optional[str]) -> List[Dict[str, Any]]:
             nonlocal active_token
-            readable_list = []
-            cur = None
-            headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
+            headers = {"user-agent": "okhttp/4.12.0"}
             if active_token:
                 headers["authorization"] = f"Bearer {active_token}"
-
-            client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 15.0}
-            if target_proxy:
-                client_kwargs["proxy"] = target_proxy
-                client_kwargs["http2"] = False
+            kwargs_map: Dict[str, Any] = {"headers": headers, "timeout": 25.0}
+            if target_p:
+                kwargs_map["proxy"] = target_p
+                kwargs_map["http2"] = False
             else:
-                client_kwargs["http2"] = True
+                kwargs_map["http2"] = True
 
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            readable_list = []
+            cur = None
+            async with httpx.AsyncClient(**kwargs_map) as client:
                 while True:
                     url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=false"
                     if cur:
@@ -367,35 +352,13 @@ class NovelTargetResolver:
             readable_list.sort(key=lambda x: x.get("chapter_num", 0))
             return readable_list
 
-        last_exc = None
-        for attempt in range(1, 5):
-            if attempt == 1 and proxy:
-                curr_proxy = proxy
-            elif default_proxy_manager and default_proxy_manager.has_proxies:
-                if origin_country and origin_country.upper() == "EN":
-                    en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
-                    curr_proxy = default_proxy_manager.get_proxy(country_code=random.choice(en_countries))
-                elif origin_country and origin_country.upper() != "ID":
-                    curr_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
-                else:
-                    curr_proxy = default_proxy_manager.pop_proxy()
-            else:
-                curr_proxy = None
-
-            try:
-                res = await _query_chapters(curr_proxy)
-                if curr_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_used(curr_proxy)
-                return res
-            except Exception as exc:
-                last_exc = exc
-                if curr_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_failed(curr_proxy, exc)
-                continue
-
-        if last_exc:
-            raise last_exc
-        return []
+        try:
+            return await _query_chapters(target_proxy)
+        except Exception as exc:
+            if target_proxy:
+                logger.warning("Fetch bab via proxy gagal (%s). Otomatis beralih ke Direct Connection...", exc)
+                return await _query_chapters(None)
+            raise
 
 
 class BaseReaderSession:
@@ -1053,25 +1016,11 @@ class MemberReaderSession(BaseReaderSession):
                 refreshed = await self.refresh_access_token() or await self.login_with_password()
                 if refreshed:
                     post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
+            post_resp.raise_for_status()
             AccountHistoryManager.record_interaction(self.account, novel_id, read=True, chapter_num=ch_num)
-            if getattr(self, "do_remix", False):
-                await self.remix_chapter(novel_id, ch_id)
             return True, "200 OK (Heartbeat Dwell & Post-View)"
         except Exception as exc:
             return False, f"Post-View Log Gagal: {exc}"
-
-    async def remix_chapter(self, novel_id: str, chapter_id: str, mode: Optional[str] = None) -> bool:
-        """Menjalankan auto remix bab cerita secara Hit & Run jika novel mendukung fitur remix."""
-        try:
-            from interaction_manager import SocialInteractionBot
-            bot = SocialInteractionBot([self.account], proxies=[self.proxy] if self.proxy else None)
-            res = bot.remix_novel_chapter(novel_id, chapter_id, self.account, mode=mode)
-            if res.get("status") == "success":
-                logger.info("[%s] Auto Remix bab berhasil didaftarkan (H&R): %s", self.worker_id, res.get("mode_title"))
-                return True
-        except Exception as exc:
-            logger.debug("[%s] Auto remix bab dilewati: %s", self.worker_id, exc)
-        return False
 
 
 class ReadingSimulationOrchestrator:
@@ -1384,24 +1333,12 @@ class ReadingSimulationOrchestrator:
         acc_country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
 
         sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
-        acc_proxy = account.get("proxy") or self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
-        if not acc_proxy:
-            logger.error("[%s] Ditolak: Tidak ada proxy aktif untuk akun %s (%s). Proxy wajib aktif!", worker_id, email, acc_country)
-            self.results.append({
-                "worker_id": worker_id,
-                "type": "Member",
-                "ident": short_email,
-                "country": acc_country,
-                "chapters_read": 0,
-                "status": "[bold red]Gagal (Wajib Proxy)[/]",
-            })
-            return
-
+        proxy = self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
         session = MemberReaderSession(
             worker_id=worker_id,
             account_data=account,
             novel_title=self.novel_title,
-            proxy=acc_proxy,
+            proxy=proxy,
             proxy_manager=self.proxy_manager,
         )
 
@@ -1891,15 +1828,6 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
     console.print(status_table)
     console.print()
 
-    if not proxies and not default_proxy_manager.has_proxies:
-        console.print(
-            "\n[bold red][PERINGATAN KESELAMATAN] Proxy WAJIB aktif![/]\n"
-            "[red]Setiap akun di akun.txt memiliki negara dan identitas jaringan tersendiri.\n"
-            "Berkas 'proxies.txt' kosong atau tidak ada proxy aktif yang terkonfigurasi.\n"
-            "Auto Reader dibatalkan demi keselamatan akun untuk mencegah kebocoran IP lokal.[/]\n"
-        )
-        return
-
     # 2. Interaksi Input Pengguna
     novel_id = NovelTargetResolver.extract_novel_id(preset_novel_id) if preset_novel_id else None
     while not novel_id:
@@ -1923,9 +1851,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
             console.print(f"[bold red]Gagal mengambil informasi novel:[/] {exc}")
             return
 
-    is_adult = novel_info.get("is_adult_only", False)
-    category_str = " | [bold red]🔞 18+ Dewasa[/]" if is_adult else ""
-    console.print(f"[bold green][OK][/] Novel Ditemukan: [bold yellow]{novel_title}[/] (Total Bab: [bold cyan]{len(chapters)}[/] | Origin: [bold magenta]{origin_country}[/]{category_str})")
+    console.print(f"[bold green][OK][/] Novel Ditemukan: [bold yellow]{novel_title}[/] (Total Bab: [bold cyan]{len(chapters)}[/] | Origin: [bold magenta]{origin_country}[/])")
 
     if len(chapters) == 0:
         console.print("[red]Novel ini tidak memiliki bab gratis untuk dibaca.[/]")
@@ -1950,14 +1876,10 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         console.print("[dim]Seluruh akun sudah pernah membaca novel ini atau belum ada data di akun.txt.[/]")
 
     # Input jumlah reader tamu
-    if is_adult:
-        console.print("[bold yellow][Info 18+][/] Novel ini berkategori 18+ (Dewasa). Server Quarterfull mewajibkan otentikasi akun, Guest Reader dinonaktifkan.")
-        guest_count = 0
-    else:
-        guest_count = IntPrompt.ask(
-            "[bold green]?[/] Jumlah Guest Reader yang diinginkan",
-            default=2,
-        )
+    guest_count = IntPrompt.ask(
+        "[bold green]?[/] Jumlah Guest Reader yang diinginkan",
+        default=2,
+    )
 
     if member_count == 0 and guest_count == 0:
         console.print("[yellow]Jumlah reader adalah 0. Tugas dibatalkan.[/]")
