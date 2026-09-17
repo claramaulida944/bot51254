@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 # Tambahkan web_app/core ke sys.path
 CORE_DIR = Path(__file__).parent / "core"
@@ -22,7 +22,7 @@ if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
 from token_manager import TokenManager, OWNER_WHATSAPP
-from proxy_manager import ProxyManager, default_proxy_manager, HypeProxyClient
+from proxy_manager import ProxyManager, default_proxy_manager, HypeProxyClient, get_weighted_royalty_country
 from auto_reader import NovelTargetResolver, MemberReaderSession, GuestReaderSession
 from full_auto_runner import FullAutoWorker
 from interaction_manager import SocialInteractionBot
@@ -614,7 +614,10 @@ class BotBridge:
             if is_locked:
                 proxy_cc = target_country
             else:
-                proxy_cc = get_weighted_royalty_country()
+                try:
+                    proxy_cc = get_weighted_royalty_country()
+                except Exception:
+                    proxy_cc = "ID"
 
             proxy_url = proxy_mgr.get_proxy(country_code=proxy_cc) if proxy_mgr.has_proxies else None
 
