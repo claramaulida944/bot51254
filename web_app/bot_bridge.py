@@ -665,6 +665,11 @@ class BotBridge:
                     await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} gagal: {msg}", level="warning")
             except Exception as e:
                 await task.emit_log(f"[{i}/{guest_count}] Exception sesi tamu #{i}: {e}", level="warning")
+            finally:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
 
             await asyncio.sleep(0.5)
 

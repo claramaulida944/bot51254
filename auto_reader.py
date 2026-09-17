@@ -504,9 +504,11 @@ class GuestReaderSession(BaseReaderSession):
         self,
         worker_id: str,
         country: str = "ID",
+        novel_title: str = "Novel",
         proxy: Optional[str] = None,
         timeout: float = 30.0,
         proxy_manager: Optional[ProxyManager] = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             worker_id=worker_id,
@@ -516,6 +518,7 @@ class GuestReaderSession(BaseReaderSession):
             proxy=proxy,
             timeout=timeout,
         )
+        self.novel_title = novel_title
         self.guest_id: Optional[str] = None
         self.guest_token: Optional[str] = None
         self.proxy_manager: ProxyManager = proxy_manager or default_proxy_manager
@@ -651,6 +654,18 @@ class GuestReaderSession(BaseReaderSession):
                     return False, f"PUT Progress Gagal: {exc}"
 
         return True, "200 OK (Heartbeat Berkala Selesai)"
+
+    async def read_guest_session(
+        self,
+        novel_id: str,
+        chapter: Dict[str, Any],
+        dwell_seconds: float = 4.0,
+    ) -> Tuple[bool, str]:
+        """Inisialisasi sesi tamu dan baca bab dengan heartbeat dwell."""
+        init_ok = await self.init_guest_session()
+        if not init_ok:
+            return False, "Gagal inisialisasi guest session (Proxy/Network)"
+        return await self.read_chapter(novel_id, chapter, reading_delay_sec=dwell_seconds)
 
 
 class MemberReaderSession(BaseReaderSession):
