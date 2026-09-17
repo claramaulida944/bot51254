@@ -10,11 +10,14 @@ Menyediakan REST API & Server-Sent Events (SSE) untuk:
 
 import asyncio
 import json
+import logging
 import secrets
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("RinaraDevServer")
 
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,10 +114,19 @@ class PaymentCreateRequest(BaseModel):
     customer_phone: Optional[str] = None
 
 
+TRIAL_IP_TIMESTAMPS: Dict[str, float] = {}
+TRIAL_NOVEL_TIMESTAMPS: Dict[str, float] = {}
+
+
+class FreeTrialStartRequest(BaseModel):
+    novel_url: str
+
+
 class AdminUpdatePricingRequest(BaseModel):
-    rates: Dict[str, Any]
+    rates: Optional[Dict[str, Any]] = None
     packages: Optional[List[Dict[str, Any]]] = None
     owner_wa: Optional[str] = None
+    free_trial: Optional[Dict[str, Any]] = None
 
 
 # =============================================================================
@@ -185,6 +197,7 @@ async def get_pricing():
         },
         "packages": enriched_packages,
         "presets": enriched_packages,
+        "free_trial": cfg.get("free_trial", {}),
     }
 
 
@@ -584,15 +597,117 @@ async def admin_get_pricing(x_admin_pin: Optional[str] = Header(None)):
 
 @app.post("/api/admin/pricing")
 async def admin_update_pricing(req: AdminUpdatePricingRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Admin memperbarui konfigurasi tarif bot, paket harga, atau nomor kontak WhatsApp."""
+    """Admin memperbarui konfigurasi tarif bot, paket harga, atau nomor kontak WhatsApp, termasuk pengaturan free trial."""
     if x_admin_pin != ADMIN_SECRET_PIN:
         raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
     new_cfg = TokenManager.update_pricing_config(
         rates=req.rates,
         packages=req.packages,
-        owner_wa=req.owner_wa
+        owner_wa=req.owner_wa,
+        free_trial=req.free_trial,
     )
     return {"ok": True, "message": "Konfigurasi tarif dan paket harga berhasil diperbarui!", "config": new_cfg}
+
+
+# =============================================================================
+# FREE TRIAL ENDPOINT (Tanpa Token)
+# =============================================================================
+@app.post("/api/free-trial/start")
+async def start_free_trial(req: FreeTrialStartRequest, request: Request):
+    """
+    Menjalankan free trial terbatas tanpa token.
+    IP-based cooldown sesuai konfigurasi admin (default 24 jam).
+    Jumlah akun & fitur yang digunakan dikonfigurasi oleh admin.
+    """
+    cfg = TokenManager.get_pricing_config()
+    trial_cfg = cfg.get("free_trial", {})
+
+    # Cek apakah fitur free trial diaktifkan admin
+    if not trial_cfg.get("enabled", True):
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": "Free trial sedang tidak tersedia. Silakan beli paket saldo untuk menggunakan layanan ini."},
+        )
+
+    # Deteksi IP pengguna
+    forwarded_for = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP")
+    client_ip = (forwarded_for.split(",")[0].strip() if forwarded_for else None) or str(request.client.host)
+
+    # Cooldown check berdasarkan IP
+    cooldown_hours = int(trial_cfg.get("cooldown_hours", 24))
+    cooldown_seconds = cooldown_hours * 3600
+    now_ts = time.time()
+
+    last_ts = TRIAL_IP_TIMESTAMPS.get(client_ip, 0)
+    elapsed = now_ts - last_ts
+    if elapsed < cooldown_seconds:
+        remaining_h = int((cooldown_seconds - elapsed) // 3600)
+        remaining_m = int(((cooldown_seconds - elapsed) % 3600) // 60)
+        return JSONResponse(
+            status_code=429,
+            content={
+                "ok": False,
+                "error": f"Free trial Anda sudah digunakan. Tunggu {remaining_h} jam {remaining_m} menit lagi, atau beli paket saldo untuk akses tanpa batas!",
+                "cooldown_remaining_seconds": int(cooldown_seconds - elapsed),
+                "can_buy": True,
+            },
+        )
+
+    # Resolusi novel ID
+    novel_url = req.novel_url.strip()
+    import re
+    novel_id = novel_url
+    query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", novel_id)
+    if query_hash:
+        novel_id = query_hash.group(1)
+    else:
+        match = re.search(r"([a-zA-Z0-9]{16})", novel_id)
+        if match:
+            novel_id = match.group(1)
+
+    # Catat timestamp IP sebelum tugas dimulai (agar tidak bisa double-click)
+    TRIAL_IP_TIMESTAMPS[client_ip] = now_ts
+
+    # Buat task ID khusus trial
+    task_id = f"trial_{int(time.time()*1000)}_{secrets.token_hex(3)}"
+
+    # Konfigurasi dari setting admin
+    accounts_count = int(trial_cfg.get("accounts_count", 5))
+    do_like = bool(trial_cfg.get("do_like", True))
+    do_follow = bool(trial_cfg.get("do_follow", True))
+
+    # Mode otomatis: jika like & follow aktif → full_auto, else guest_read
+    mode = "full_auto" if (do_like or do_follow) else "guest_read"
+
+    config = {
+        "accounts_count": accounts_count,
+        "guest_count": accounts_count,
+        "max_chapters": 3,
+        "reading_delay": 6.0,
+        "country": "RANDOM",
+        "is_free_trial": True,
+        "do_like": do_like,
+        "do_follow": do_follow,
+    }
+
+    task = WebTask(
+        task_id=task_id,
+        token_code="FREE_TRIAL",
+        novel_id=novel_id,
+        mode=mode,
+        config=config,
+    )
+
+    asyncio.create_task(BotBridge.run_task_lifecycle(task))
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "is_trial": True,
+        "trial_accounts": accounts_count,
+        "cooldown_hours": cooldown_hours,
+        "message": f"Free trial dimulai! Menggunakan {accounts_count} akun tamu. Sambungkan ke SSE stream untuk melihat log.",
+    }
 
 
 

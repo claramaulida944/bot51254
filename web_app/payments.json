@@ -1,3 +1,22 @@
 {
-  "payments": {}
+  "payments": {
+    "ORD-1789660146-727E1C": {
+      "ref_id": "ORD-1789660146-727E1C",
+      "order_type": "new_token",
+      "nominal": 20000,
+      "payment_code": "QRIS",
+      "target_token": "",
+      "generated_token": null,
+      "status": "pending",
+      "trx_reference": "WP2609172249065159",
+      "total_bayar": 20240,
+      "qr_link": "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=00020101021226650013ID.BATPAY.WWW011893600841000000281802150000000000028180303UMI51370014ID.CO.QRIS.WWW0215ID20265632367395204581853033605405202405802ID5909WijayaPay6006Bekasi61051761062425025202609171789663746215257507096996889546304A664",
+      "qr_string": "00020101021226650013ID.BATPAY.WWW011893600841000000281802150000000000028180303UMI51370014ID.CO.QRIS.WWW0215ID20265632367395204581853033605405202405802ID5909WijayaPay6006Bekasi61051761062425025202609171789663746215257507096996889546304A664",
+      "nomor_va": null,
+      "expired": "2026-09-17 23:49:06",
+      "tutorial": "Buka aplikasi yang mendukung pembayaran dengan QRIS\nPilih fitur QRIS / Bayar\nPindai kode QR yang diberikan oleh Merchant\nPastikan tagihan yang ditagihkan sesuai\nKlik tombol Konfirmasi\nMasukkan PIN untuk menyelesaikan pembayaran\nSetelah pembayaran berhasil, kamu akan dialihkan ke Halaman Hasil Pembayaran",
+      "created_at": "2026-09-17T15:49:06.784851+00:00",
+      "paid_at": null
+    }
+  }
 }

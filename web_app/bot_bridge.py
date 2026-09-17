@@ -246,12 +246,14 @@ class BotBridge:
                 chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=None)
             
             author_data = details.get("author", {})
+            author_pid = author_data.get("profile_id") or author_data.get("hash_id") or author_data.get("id") or details.get("author_id")
             return {
                 "ok": True,
                 "novel_id": novel_id,
                 "title": details.get("title", f"Novel #{novel_id}"),
                 "author": author_data.get("pen_name") or author_data.get("name") or author_data.get("nickname") or "Penulis",
                 "author_id": author_data.get("hash_id") or author_data.get("id"),
+                "author_profile_id": author_pid,
                 "cover_url": details.get("cover_url") or details.get("cover") or details.get("thumbnail"),
                 "total_chapters": len(chapters),
                 "synopsis": str(details.get("synopsis", details.get("description", "")))[:250],
@@ -270,17 +272,23 @@ class BotBridge:
         token_code = task.token_code
         mode = task.mode
         cfg = task.config
+        is_free_trial = (mode == "free_trial" or token_code == "FREE_TRIAL")
 
         try:
-            # 1. Verifikasi saldo awal
-            token = TokenManager.get_token(token_code)
-            if not token:
-                await task.emit_log("Token akses tidak valid atau tidak ditemukan!", level="error")
-                return
+            # 1. Verifikasi saldo awal jika bukan free trial
+            if not is_free_trial:
+                token = TokenManager.get_token(token_code)
+                if not token:
+                    await task.emit_log("Token akses tidak valid atau tidak ditemukan!", level="error")
+                    return
 
-            task.stats["current_balance"] = token.get("current_balance", 0)
-            await task.emit_log(f"Token terverifikasi: {token_code} (Saldo: Rp {task.stats['current_balance']:,})", level="info")
-            await task.emit_stats()
+                task.stats["current_balance"] = token.get("current_balance", 0)
+                await task.emit_log(f"Token terverifikasi: {token_code} (Saldo: Rp {task.stats['current_balance']:,})", level="info")
+                await task.emit_stats()
+            else:
+                task.stats["current_balance"] = 0
+                await task.emit_log("🎁 Memulai sesi Free Trial Gratis (Tanpa Token Akses)...", level="info")
+                await task.emit_stats()
 
             # Pastikan proxy ter-update jika owner baru saja menambah/membeli proxy baru
             if default_proxy_manager:
@@ -303,7 +311,9 @@ class BotBridge:
             )
 
             # 3. Eksekusi Berdasarkan Mode
-            if mode in ("full_auto", "member_read"):
+            if is_free_trial:
+                await cls._execute_free_trial(task)
+            elif mode in ("full_auto", "member_read"):
                 await cls._execute_member_readers(task)
             elif mode == "guest_read":
                 await cls._execute_guest_readers(task)
@@ -318,15 +328,23 @@ class BotBridge:
             await task.emit_log(f"Terjadi kesalahan internal: {exc}", level="error")
         finally:
             task.is_running = False
-            token = TokenManager.get_token(token_code)
-            final_balance = token.get("current_balance", 0) if token else 0
-            task.stats["current_balance"] = final_balance
-            await task.emit_log(
-                f"Tugas selesai. Total sesi sukses: {task.stats['accounts_done']} | "
-                f"Total bab dibaca: {task.stats['chapters_read']} | Sisa saldo: Rp {final_balance:,}",
-                level="success"
-            )
-            await task.emit_done(TokenManager.get_whatsapp_url(token_code, 20000))
+            if not is_free_trial:
+                token = TokenManager.get_token(token_code)
+                final_balance = token.get("current_balance", 0) if token else 0
+                task.stats["current_balance"] = final_balance
+                await task.emit_log(
+                    f"Tugas selesai. Total sesi sukses: {task.stats['accounts_done']} | "
+                    f"Total bab dibaca: {task.stats['chapters_read']} | Sisa saldo: Rp {final_balance:,}",
+                    level="success"
+                )
+                await task.emit_done(TokenManager.get_whatsapp_url(token_code, 20000))
+            else:
+                await task.emit_log(
+                    f"🎉 Free Trial Selesai! Sesi sukses: {task.stats['accounts_done']} akun | "
+                    f"Like: {task.stats['likes']} | Follow: {task.stats['follows']}",
+                    level="success"
+                )
+                await task.emit_done(TokenManager.get_whatsapp_url("FREE_TRIAL", 20000))
             if task.task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task.task_id]["status"] = "completed"
             asyncio.create_task(cls._cleanup_task_later(task.task_id, delay=300))
@@ -726,3 +744,116 @@ class BotBridge:
                 await task.emit_log(f"Gagal kirim {item_name}: {e}", level="warning")
 
             await asyncio.sleep(1.0)
+
+    @classmethod
+    async def _execute_free_trial(cls, task: WebTask) -> None:
+        """
+        Menjalankan sesi Free Trial tanpa token:
+        - Login N akun resmi (dinamis dari owner config)
+        - Like novel
+        - Follow profil penulis
+        - Emisi progress real-time ke Live Console client
+        """
+        novel_id = task.novel_id
+        trial_cfg = TokenManager.get_pricing_config().get("free_trial", {})
+        target_accounts = int(task.config.get("accounts_count") or trial_cfg.get("accounts_count", 5))
+        do_like = bool(task.config.get("do_like", trial_cfg.get("do_like", True)))
+        do_follow = bool(task.config.get("do_follow", trial_cfg.get("do_follow", True)))
+
+        all_candidates = cls.get_token_account_allocation("FREE_TRIAL", count=9999)
+        if not all_candidates:
+            all_candidates = cls.load_accounts()
+
+        fresh_accounts, _ = AccountHistoryManager.filter_fresh_accounts(all_candidates, novel_id)
+        if not fresh_accounts:
+            fresh_accounts = all_candidates
+
+        if not fresh_accounts:
+            await task.emit_log("Pool akun server sedang tidak tersedia untuk Free Trial. Hubungi Admin.", level="error")
+            return
+
+        task.stats["accounts_total"] = min(target_accounts, len(fresh_accounts))
+        await task.emit_log(
+            f"🎁 Menjalankan Free Trial: Target {target_accounts} Akun Resmi | "
+            f"Suka (Like): {'Ya' if do_like else 'Tidak'} | Ikuti (Follow): {'Ya' if do_follow else 'Tidak'}",
+            level="info"
+        )
+
+        proxy_mgr = default_proxy_manager
+        author_pid = (task.novel_info or {}).get("author_profile_id") or (task.novel_info or {}).get("author_id")
+
+        successful_count = 0
+        for idx, acc in enumerate(fresh_accounts, 1):
+            if task.is_cancelled or successful_count >= target_accounts:
+                break
+
+            curr_worker = successful_count + 1
+            acc_data = dict(acc)
+            proxy_url = proxy_mgr.get_proxy() if (proxy_mgr and proxy_mgr.has_proxies) else None
+
+            session = MemberReaderSession(
+                worker_id=f"TRIAL-{curr_worker:02d}",
+                account_data=acc_data,
+                novel_title=task.novel_info.get("title", "Novel"),
+                proxy=proxy_url,
+                proxy_manager=proxy_mgr,
+            )
+
+            try:
+                client = await session.get_client()
+                email_raw = acc.get("email", f"akun_{idx}")
+                if "@" in email_raw:
+                    name_p, dom_p = email_raw.split("@", 1)
+                    email_masked = f"{name_p[:3]}***@{dom_p}"
+                else:
+                    email_masked = f"{email_raw[:5]}***"
+
+                await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil Login.", level="info")
+
+                # Like Novel
+                if do_like:
+                    try:
+                        r_like = await client.post(f"/api/v1/novels/{novel_id}/like")
+                        if r_like.status_code == 200:
+                            task.stats["likes"] += 1
+                            AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
+                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil menyukai (Like) novel.", level="info")
+                        else:
+                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Respon Like server: HTTP {r_like.status_code}", level="warning")
+                    except Exception as e_lk:
+                        await task.emit_log(f"[{curr_worker}/{target_accounts}] Catatan Like: {e_lk}", level="warning")
+
+                await asyncio.sleep(0.5)
+
+                # Follow Author
+                if do_follow and author_pid:
+                    try:
+                        r_fol = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
+                        if r_fol.status_code in (200, 204):
+                            task.stats["follows"] += 1
+                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil mengikuti (Follow) penulis.", level="info")
+                        else:
+                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Respon Follow server: HTTP {r_fol.status_code}", level="warning")
+                    except Exception as e_fl:
+                        await task.emit_log(f"[{curr_worker}/{target_accounts}] Catatan Follow: {e_fl}", level="warning")
+
+                successful_count += 1
+                task.stats["accounts_done"] = successful_count
+                await task.emit_stats()
+
+            except Exception as exc:
+                await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun gagal menjalankan sesi trial: {exc}", level="warning")
+
+            await asyncio.sleep(1.0)
+
+        if successful_count >= target_accounts:
+            await task.emit_log(
+                f"🎉 Free Trial Berhasil! {successful_count} Akun telah selesai Login, Memberi Like, & Follow Penulis.",
+                level="success"
+            )
+        else:
+            await task.emit_log(
+                f"Free Trial selesai: {successful_count}/{target_accounts} akun berhasil diproses.",
+                level="info"
+            )
+

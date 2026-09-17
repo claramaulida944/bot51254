@@ -319,7 +319,7 @@ async function inspectNovel() {
       btnInspect.style.opacity = "";
     }
     if (btnInspectIcon) {
-      btnInspectIcon.innerHTML = `🔍`;
+      btnInspectIcon.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
     }
     if (btnInspectText) {
       btnInspectText.textContent = "Periksa";
@@ -337,23 +337,88 @@ function selectMode(el, mode) {
   calculateEstimatedCost();
 }
 
-function updateSliderLabels() {
-  const accInput = document.getElementById("accCountSlider");
-  const chInput = document.getElementById("chCountSlider");
-  if (accInput) {
-    document.getElementById("accCountLabel").textContent = `${accInput.value} Sesi`;
+function getTaskAccountsCount() {
+  const inp = document.getElementById("accCountInput");
+  if (inp && inp.value !== "") {
+    return Math.max(1, parseInt(inp.value) || 1);
   }
-  if (chInput) {
-    document.getElementById("chCountLabel").textContent = `${chInput.value} Bab`;
+  const slider = document.getElementById("accCountSlider");
+  return Math.max(1, parseInt(slider ? slider.value : 10) || 1);
+}
+
+function getTaskMaxChapters() {
+  const inp = document.getElementById("chCountInput");
+  if (inp && inp.value !== "") {
+    return Math.max(1, parseInt(inp.value) || 1);
   }
+  const slider = document.getElementById("chCountSlider");
+  return Math.max(1, parseInt(slider ? slider.value : 5) || 1);
+}
+
+function updateTaskNumericInputs() {
+  const accVal = getTaskAccountsCount();
+  const chVal = getTaskMaxChapters();
+
+  const accSlider = document.getElementById("accCountSlider");
+  if (accSlider) accSlider.value = accVal;
+  const chSlider = document.getElementById("chCountSlider");
+  if (chSlider) chSlider.value = chVal;
+
+  syncTaskAccChips(accVal);
+  syncTaskChChips(chVal);
   calculateEstimatedCost();
 }
 
+function setTaskAccCount(val) {
+  const inp = document.getElementById("accCountInput");
+  if (inp) inp.value = val;
+  const slider = document.getElementById("accCountSlider");
+  if (slider) slider.value = val;
+  syncTaskAccChips(val);
+  calculateEstimatedCost();
+}
+
+function setTaskChCount(val) {
+  const inp = document.getElementById("chCountInput");
+  if (inp) inp.value = val;
+  const slider = document.getElementById("chCountSlider");
+  if (slider) slider.value = val;
+  syncTaskChChips(val);
+  calculateEstimatedCost();
+}
+
+function syncTaskAccChips(val) {
+  const chips = document.querySelectorAll("#taskAccChips .preset-chip");
+  chips.forEach(chip => {
+    if (parseInt(chip.getAttribute("data-val")) === parseInt(val)) {
+      chip.classList.add("active");
+    } else {
+      chip.classList.remove("active");
+    }
+  });
+}
+
+function syncTaskChChips(val) {
+  const chips = document.querySelectorAll("#taskChChips .preset-chip");
+  chips.forEach(chip => {
+    if (parseInt(chip.getAttribute("data-val")) === parseInt(val)) {
+      chip.classList.add("active");
+    } else {
+      chip.classList.remove("active");
+    }
+  });
+}
+
+// Fallbacks for legacy calls
+function updateSliderLabels() {
+  updateTaskNumericInputs();
+}
+
 function setSliderVal(id, val) {
-  const el = document.getElementById(id);
-  if (el) {
-    el.value = val;
-    updateSliderLabels();
+  if (id === "accCountSlider" || id === "accCountInput") {
+    setTaskAccCount(val);
+  } else if (id === "chCountSlider" || id === "chCountInput") {
+    setTaskChCount(val);
   }
 }
 
@@ -388,8 +453,7 @@ async function pasteNovelFromClipboard() {
 }
 
 function calculateEstimatedCost() {
-  const accInput = document.getElementById("accCountSlider");
-  const accCount = accInput ? parseInt(accInput.value) || 5 : 5;
+  const accCount = getTaskAccountsCount();
   let estimated = 0;
 
   const vrRate = (globalPricing && globalPricing.rates && globalPricing.rates.valid_reader) ? globalPricing.rates.valid_reader : 500;
@@ -398,10 +462,10 @@ function calculateEstimatedCost() {
 
   if (activeMode === "full_auto" || activeMode === "member_read") {
     estimated = accCount * vrRate;
-    formulaNote = `${accCount} Sesi Member × Rp ${vrRate.toLocaleString('id-ID')}`;
+    formulaNote = `${accCount.toLocaleString('id-ID')} Sesi Member × Rp ${vrRate.toLocaleString('id-ID')}`;
   } else if (activeMode === "guest_read") {
     estimated = accCount * grRate;
-    formulaNote = `${accCount} Sesi Tamu × Rp ${grRate.toLocaleString('id-ID')}`;
+    formulaNote = `${accCount.toLocaleString('id-ID')} Sesi Tamu × Rp ${grRate.toLocaleString('id-ID')}`;
   } else if (activeMode === "like_only") {
     estimated = 0;
     formulaNote = "Mode Interaksi Sosial: Bebas biaya saldo";
@@ -436,8 +500,8 @@ async function startBotTask() {
     return;
   }
 
-  const accountsCount = parseInt(document.getElementById("accCountSlider").value) || 5;
-  const maxChapters = parseInt(document.getElementById("chCountSlider").value) || 5;
+  const accountsCount = getTaskAccountsCount();
+  const maxChapters = getTaskMaxChapters();
 
   const startBtn = document.getElementById("startBotBtn");
   const stopBtn = document.getElementById("stopBotBtn");
@@ -448,9 +512,18 @@ async function startBotTask() {
   if (statusTag) statusTag.textContent = "Status: Memulai...";
 
   // Reset UI telemetry & progress
-  document.getElementById("statAccountsDone").textContent = `0 / ${accountsCount}`;
-  document.getElementById("statChaptersRead").textContent = "0";
-  document.getElementById("statSpent").textContent = "Rp 0";
+  const statDone1 = document.getElementById("statAccountsDone");
+  if (statDone1) statDone1.textContent = `0 / ${accountsCount}`;
+  const statDone2 = document.getElementById("statAccountsDone2");
+  if (statDone2) statDone2.textContent = `0 / ${accountsCount}`;
+
+  const statCh1 = document.getElementById("statChaptersRead");
+  if (statCh1) statCh1.textContent = "0";
+  const statCh2 = document.getElementById("statChaptersRead2");
+  if (statCh2) statCh2.textContent = "0";
+
+  const statSpent = document.getElementById("statSpent");
+  if (statSpent) statSpent.textContent = "Rp 0";
   updateProgressBar(0, accountsCount);
 
   appendLog("[System]", "Memulai proses inisialisasi tugas...", "info");
@@ -592,7 +665,7 @@ function toggleAutoScroll() {
 }
 
 function copyLogs() {
-  const body = document.getElementById("terminalLogBody");
+  const body = document.getElementById("terminalLogBody2") || document.getElementById("terminalLogBody");
   if (!body) return;
   const text = body.innerText;
   navigator.clipboard.writeText(text).then(() => {
@@ -603,7 +676,7 @@ function copyLogs() {
 }
 
 function downloadLogs() {
-  const body = document.getElementById("terminalLogBody");
+  const body = document.getElementById("terminalLogBody2") || document.getElementById("terminalLogBody");
   if (!body) return;
   const text = body.innerText;
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
@@ -618,38 +691,39 @@ function downloadLogs() {
 }
 
 function appendLog(timePrefix, text, level) {
-  const terminal = document.getElementById("terminalLogBody");
-  if (!terminal) return;
+  const terminals = [document.getElementById("terminalLogBody"), document.getElementById("terminalLogBody2")].filter(Boolean);
+  if (terminals.length === 0) return;
 
-  const row = document.createElement("div");
-  row.className = "log-row";
+  terminals.forEach(terminal => {
+    const row = document.createElement("div");
+    row.className = "log-row";
 
-  const timeSpan = document.createElement("span");
-  timeSpan.className = "log-time";
-  timeSpan.textContent = timePrefix;
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "log-time";
+    timeSpan.textContent = timePrefix;
 
-  const msgSpan = document.createElement("span");
-  msgSpan.className = `log-msg-${level}`;
-  msgSpan.textContent = text;
+    const msgSpan = document.createElement("span");
+    msgSpan.className = `log-msg-${level}`;
+    msgSpan.textContent = text;
 
-  row.appendChild(timeSpan);
-  row.appendChild(msgSpan);
-  terminal.appendChild(row);
-  if (isAutoScrollEnabled) {
-    terminal.scrollTop = terminal.scrollHeight;
-  }
+    row.appendChild(timeSpan);
+    row.appendChild(msgSpan);
+    terminal.appendChild(row);
+    if (isAutoScrollEnabled) {
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+  });
 }
 
 function clearLogs() {
-  const terminal = document.getElementById("terminalLogBody");
-  if (terminal) {
+  [document.getElementById("terminalLogBody"), document.getElementById("terminalLogBody2")].filter(Boolean).forEach(terminal => {
     terminal.innerHTML = `
       <div class="log-row">
         <span class="log-time">[System]</span>
         <span class="log-msg-info">Log aktivitas dibersihkan.</span>
       </div>
     `;
-  }
+  });
 }
 
 function updateStatsUI(stats) {
@@ -659,9 +733,13 @@ function updateStatsUI(stats) {
 
   const statAcc = document.getElementById("statAccountsDone");
   if (statAcc) statAcc.textContent = `${done} / ${total}`;
+  const statAcc2 = document.getElementById("statAccountsDone2");
+  if (statAcc2) statAcc2.textContent = `${done} / ${total}`;
 
   const statCh = document.getElementById("statChaptersRead");
   if (statCh) statCh.textContent = stats.chapters_read || 0;
+  const statCh2 = document.getElementById("statChaptersRead2");
+  if (statCh2) statCh2.textContent = stats.chapters_read || 0;
 
   const statSpent = document.getElementById("statSpent");
   if (statSpent) statSpent.textContent = formatRupiah(stats.total_spent || 0);
@@ -1027,11 +1105,11 @@ async function loadAdminPayments() {
         : `<span class="badge badge-suspended" style="background: #fef3c7; color: #92400e; border: 1px solid #fde68a;">PENDING</span>`;
 
       const typeLabel = p.order_type === "topup"
-        ? `<span style="font-weight: 600; color: #2563eb;">Top Up</span>`
+        ? `<span style="font-weight: 600; color: var(--primary);">Top Up</span>`
         : `<span style="font-weight: 600; color: #16a34a;">Token Baru</span>`;
 
       const tokenRef = p.generated_token
-        ? `<code style="font-weight: 700; color: #1e40af;">${p.generated_token}</code>`
+        ? `<code style="font-weight: 700; color: var(--primary-text);">${p.generated_token}</code>`
         : (p.target_token ? `<code>${p.target_token}</code>` : `-`);
 
       const createdDate = p.created_at ? new Date(p.created_at).toLocaleString("id-ID") : "-";
@@ -1577,7 +1655,6 @@ function startPaymentCountdown(expiredTimestamp) {
 // =============================================================================
 // DYNAMIC PRICING & ADMIN TIER CONFIGURATION
 // =============================================================================
-let adminPackagesState = [];
 
 async function loadPricingConfig() {
   try {
@@ -1608,7 +1685,7 @@ async function loadPricingConfig() {
       }
       const grPriceEl = document.getElementById("modeGuestReaderPrice");
       if (grPriceEl) {
-        grPriceEl.textContent = `Rp ${grRate.toLocaleString('id-ID')} / sesi (10 = Rp ${(grRate * 10).toLocaleString('id-ID')})`;
+        grPriceEl.textContent = `Rp ${grRate.toLocaleString('id-ID')} / sesi`;
       }
 
       // 3. Re-render public pricing cards on homepage if element exists
@@ -1709,6 +1786,44 @@ async function loadPricingConfig() {
       if (typeof updateAccountGenEstimatedCost === "function") {
         updateAccountGenEstimatedCost();
       }
+
+      // 9. Free Trial banner & pricing card
+      const trialCfg = data.free_trial || {};
+      const trialEnabled = Boolean(trialCfg.enabled !== false);
+      const trialAccounts = parseInt(trialCfg.accounts_count) || 5;
+      const trialCooldown = parseInt(trialCfg.cooldown_hours) || 24;
+      const trialLike = trialCfg.do_like !== false;
+      const trialFollow = trialCfg.do_follow !== false;
+
+      // Banner di dashboard
+      const ftBanner = document.getElementById("freeTrialBanner");
+      if (ftBanner) ftBanner.style.display = trialEnabled ? "" : "none";
+
+      // Card di pricing page
+      const ftPricingCard = document.getElementById("pricingFreeTrialCard");
+      if (ftPricingCard) ftPricingCard.style.display = trialEnabled ? "" : "none";
+
+      // Update counter labels
+      const accCountEls = ["trialAccountCount", "trialAccountCount2", "trialAccFeature", "ftModalAccCount"];
+      accCountEls.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = id === "ftModalAccCount" ? `${trialAccounts} Akun` : trialAccounts;
+      });
+
+      // Update cooldown info
+      const ftCooldown = document.getElementById("ftCooldownHours");
+      if (ftCooldown) ftCooldown.textContent = trialCooldown;
+
+      // Update like/follow feature visibility
+      const ftpcLike = document.getElementById("ftpcLikeFeat");
+      if (ftpcLike) ftpcLike.style.display = (trialLike || trialFollow) ? "" : "none";
+      const ftModalLike = document.getElementById("ftModalLikeBox");
+      if (ftModalLike) ftModalLike.style.display = trialLike ? "" : "none";
+      const ftModalFollow = document.getElementById("ftModalFollowBox");
+      if (ftModalFollow) ftModalFollow.style.display = trialFollow ? "" : "none";
+
+      // Store trial config for modal
+      window._trialCfg = { enabled: trialEnabled, accounts_count: trialAccounts, cooldown_hours: trialCooldown, do_like: trialLike, do_follow: trialFollow };
     }
   } catch (e) {
     console.error("Error loading pricing config:", e);
@@ -1731,6 +1846,7 @@ async function loadAdminPricing() {
     const rates = cfg.rates || {};
     const pkgs = cfg.packages || [];
     const ownerWa = cfg.owner_wa || "6287734343023";
+    const trial = cfg.free_trial || {};
 
     if (document.getElementById("priceValidReaderInput")) {
       document.getElementById("priceValidReaderInput").value = rates.valid_reader || 500;
@@ -1748,6 +1864,18 @@ async function loadAdminPricing() {
       document.getElementById("priceOwnerWaInput").value = ownerWa;
     }
 
+    // Free trial settings
+    const trialEnabled = document.getElementById("trialEnabledToggle");
+    if (trialEnabled) trialEnabled.checked = (trial.enabled !== false);
+    const trialAccounts = document.getElementById("trialAccountsCountInput");
+    if (trialAccounts) trialAccounts.value = trial.accounts_count || 5;
+    const trialCooldown = document.getElementById("trialCooldownInput");
+    if (trialCooldown) trialCooldown.value = trial.cooldown_hours || 24;
+    const trialLike = document.getElementById("trialDoLikeToggle");
+    if (trialLike) trialLike.checked = (trial.do_like !== false);
+    const trialFollow = document.getElementById("trialDoFollowToggle");
+    if (trialFollow) trialFollow.checked = (trial.do_follow !== false);
+
     // Set state & render dynamic package cards
     adminPackagesState = JSON.parse(JSON.stringify(pkgs));
     renderAdminPackages();
@@ -1761,67 +1889,75 @@ function renderAdminPackages() {
   if (!container) return;
 
   if (!adminPackagesState || adminPackagesState.length === 0) {
-    container.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 24px; background: rgba(255,255,255,0.02); border-radius: var(--radius-md); border: 1px dashed var(--border-color);">Belum ada paket yang dibuat. Klik tombol <b>"+ Tambah Paket Baru"</b> di atas.</div>`;
+    container.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 28px; background: var(--bg-subtle); border-radius: var(--radius-md); border: 1px dashed var(--border-color);">Belum ada paket yang dibuat. Klik tombol <b>"+ Tambah Paket"</b> di atas.</div>`;
     return;
   }
 
   container.innerHTML = adminPackagesState.map((pkg, idx) => {
     const isPop = Boolean(pkg.popular || pkg.is_featured);
     const cardClass = isPop ? "admin-pkg-card featured" : "admin-pkg-card";
-    const icon = isPop ? "⭐" : (idx === 0 ? "📦" : (idx === 1 ? "⭐" : "🚀"));
     const featuresStr = Array.isArray(pkg.features) ? pkg.features.join("\n") : (pkg.features || "");
     const pkgName = pkg.name || `Paket Saldo ${Math.round((pkg.price || 10000) / 1000)}K`;
+
+    const pkgIconSvg = isPop
+      ? `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`
+      : `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`;
 
     return `
       <div class="${cardClass}" id="adminPkgCard_${idx}">
         <div class="admin-pkg-header">
           <div class="admin-pkg-title-wrap">
-            <span class="admin-pkg-icon">${icon}</span>
+            <div style="width: 32px; height: 32px; border-radius: var(--radius-md); background: ${isPop ? 'var(--primary-subtle)' : 'var(--bg-subtle)'}; color: ${isPop ? 'var(--primary)' : 'var(--text-muted)'}; display: flex; align-items: center; justify-content: center; border: 1px solid ${isPop ? 'var(--primary-border)' : 'var(--border-color)'}; flex-shrink: 0;">
+              ${pkgIconSvg}
+            </div>
             <div>
-              <span class="admin-pkg-title" id="pkgCardHeader_${idx}">
-                <span class="pkg-header-name">${pkgName}</span>
-              </span>
-              ${isPop ? `<div class="admin-featured-badge" style="margin-left: 8px;">⭐ Unggulan</div>` : ''}
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="admin-pkg-title" id="pkgCardHeader_${idx}">
+                  <span class="pkg-header-name">${pkgName}</span>
+                </span>
+                ${isPop ? `<span class="badge badge-primary" style="font-size: 10px; padding: 2px 7px;">Unggulan</span>` : ''}
+              </div>
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px;">
-            <span class="tag" style="background: rgba(255,255,255,0.05); color: #94a3b8; border-color: rgba(255,255,255,0.1); font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+            <span class="font-mono" style="font-size: 11px; color: var(--text-muted); background: var(--bg-subtle); border: 1px solid var(--border-color); padding: 3px 8px; border-radius: var(--radius-xs);">
               ID: ${pkg.id || `pkg_${idx + 1}`}
             </span>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="adminDeletePackageCard(${idx})" style="padding: 4px 10px; font-size: 11px; color: #f87171; border-color: rgba(239, 68, 68, 0.3); background: rgba(239, 68, 68, 0.08);" title="Hapus paket ini">
-              🗑️ Hapus
+            <button type="button" class="btn btn-secondary btn-sm" onclick="adminDeletePackageCard(${idx})" style="padding: 4px 10px; font-size: 11px; color: var(--danger); border-color: rgba(220,38,38,0.25); background: rgba(220,38,38,0.04); display: inline-flex; align-items: center; gap: 4px;" title="Hapus paket ini">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              Hapus
             </button>
           </div>
         </div>
 
-        <div style="display: grid; grid-template-columns: 1fr 180px; gap: 12px; margin-bottom: 12px;">
+        <div style="display: grid; grid-template-columns: 1fr 200px; gap: 14px; margin-bottom: 12px;">
           <div>
-            <label class="form-label" style="font-size: 11px; color: #94a3b8;">Nama Paket:</label>
+            <label class="form-label" style="font-size: 11px; color: var(--text-muted); margin-bottom: 5px;">Nama Paket:</label>
             <input type="text" class="form-control" value="${pkgName}" placeholder="Contoh: Paket Starter Novel" oninput="onAdminPkgNameChange(${idx}, this.value)" style="font-weight: 600;">
           </div>
           <div>
-            <label class="form-label" style="font-size: 11px; color: #94a3b8;">Harga Saldo (Rp):</label>
+            <label class="form-label" style="font-size: 11px; color: var(--text-muted); margin-bottom: 5px;">Harga Saldo (Rp):</label>
             <div class="admin-currency-input-wrap">
               <span class="admin-currency-prefix">Rp</span>
-              <input type="number" class="form-control" value="${pkg.price || 10000}" min="1000" step="1000" oninput="onAdminPkgPriceChange(${idx}, this.value)">
+              <input type="number" class="form-control" value="${pkg.price || 10000}" min="1000" step="1000" oninput="onAdminPkgPriceChange(${idx}, this.value)" style="font-weight: 700;">
             </div>
           </div>
         </div>
 
         <div style="margin-bottom: 14px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <label class="form-label" style="font-size: 11px; color: #94a3b8; margin-bottom: 0;">Deskripsi Sesi / Rincian Fitur (1 baris per poin fitur, tekan Enter):</label>
-            <span style="font-size: 10px; color: #64748b;">Gunakan Enter untuk bullet points</span>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+            <label class="form-label" style="font-size: 11px; color: var(--text-muted); margin-bottom: 0;">Deskripsi Sesi / Rincian Fitur:</label>
+            <span style="font-size: 10px; color: var(--text-muted);">Gunakan Enter untuk bullet points</span>
           </div>
-          <textarea class="form-control admin-features-textarea" rows="3" placeholder="Contoh:\n40 sesi akun member resmi\n400 sesi pembaca tamu\nOtomatis suka & simpan novel" oninput="onAdminPkgFeaturesChange(${idx}, this.value)">${featuresStr}</textarea>
+          <textarea class="form-control admin-features-textarea" rows="3" placeholder="Contoh:&#10;40 sesi akun member resmi&#10;400 sesi pembaca tamu&#10;Otomatis suka &amp; simpan novel" oninput="onAdminPkgFeaturesChange(${idx}, this.value)">${featuresStr}</textarea>
         </div>
 
-        <label class="modern-toggle-label">
+        <label class="modern-toggle-label" style="font-size: 12px; margin: 0;">
           <div class="modern-toggle-switch">
             <input type="checkbox" ${isPop ? 'checked' : ''} onchange="onAdminPkgFeaturedToggle(${idx}, this.checked)">
             <span class="modern-toggle-slider"></span>
           </div>
-          <span>Tandai sebagai <b>Paket Unggulan / Featured</b> (Diberi highlight & efek glow di halaman depan)</span>
+          <span style="color: var(--text-body);">Tandai sebagai <b>Paket Unggulan / Featured</b> (Diberi highlight di halaman kasir &amp; beranda)</span>
         </label>
       </div>
     `;
@@ -1926,15 +2062,22 @@ async function saveAdminPricing() {
       popular: Boolean(p.popular || p.is_featured),
       is_featured: Boolean(p.popular || p.is_featured),
     })),
-    owner_wa: ownerWa
+    owner_wa: ownerWa,
+    free_trial: {
+      enabled: document.getElementById("trialEnabledToggle")?.checked !== false,
+      accounts_count: Math.max(1, Math.min(50, parseInt(document.getElementById("trialAccountsCountInput")?.value) || 5)),
+      cooldown_hours: Math.max(1, Math.min(720, parseInt(document.getElementById("trialCooldownInput")?.value) || 24)),
+      do_like: document.getElementById("trialDoLikeToggle")?.checked !== false,
+      do_follow: document.getElementById("trialDoFollowToggle")?.checked !== false,
+    },
   };
 
   if (btn) btn.disabled = true;
   if (alertEl) {
     alertEl.style.display = "block";
-    alertEl.style.background = "#eff6ff";
-    alertEl.style.color = "#1e40af";
-    alertEl.style.border = "1px solid #bfdbfe";
+    alertEl.style.background = "var(--primary-subtle)";
+    alertEl.style.color = "var(--primary-text)";
+    alertEl.style.border = "1px solid var(--primary-border)";
     alertEl.textContent = "Menyimpan pengaturan tarif & paket...";
   }
 
@@ -1973,9 +2116,135 @@ async function saveAdminPricing() {
 }
 
 // =============================================================================
+// FREE TRIAL SUITE (Tanpa Token)
+// =============================================================================
+let _ftEventSource = null;
+
+function openFreeTrialModal() {
+  const modal = document.getElementById("freeTrialModal");
+  if (!modal) return;
+  // Reset to step 1
+  const s1 = document.getElementById("ftStep1");
+  const s2 = document.getElementById("ftStep2");
+  const done = document.getElementById("ftStep2Done");
+  if (s1) s1.style.display = "";
+  if (s2) s2.style.display = "none";
+  if (done) done.style.display = "none";
+  const errBox = document.getElementById("ftErrorBox");
+  if (errBox) errBox.style.display = "none";
+  const logBody = document.getElementById("ftLogBody");
+  if (logBody) logBody.innerHTML = "";
+  // Pre-fill novel URL from main input
+  const mainNovel = document.getElementById("novelUrlInput") || document.getElementById("ftNovelUrlInput");
+  const ftInput = document.getElementById("ftNovelUrlInput");
+  if (ftInput && mainNovel && mainNovel !== ftInput && mainNovel.value.trim()) {
+    ftInput.value = mainNovel.value.trim();
+  }
+  modal.style.display = "flex";
+}
+
+function closeFreeTrialModal() {
+  const modal = document.getElementById("freeTrialModal");
+  if (modal) modal.style.display = "none";
+  if (_ftEventSource) { _ftEventSource.close(); _ftEventSource = null; }
+}
+
+async function startFreeTrial() {
+  const novelUrl = (document.getElementById("ftNovelUrlInput")?.value || "").trim();
+  if (!novelUrl) {
+    const errBox = document.getElementById("ftErrorBox");
+    if (errBox) { errBox.textContent = "Masukkan URL atau ID novel terlebih dahulu!"; errBox.style.display = "block"; }
+    return;
+  }
+
+  const btn = document.getElementById("ftStartBtn");
+  const errBox = document.getElementById("ftErrorBox");
+  if (errBox) errBox.style.display = "none";
+  if (btn) btn.disabled = true;
+
+  try {
+    const resp = await fetch("/api/free-trial/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ novel_url: novelUrl }),
+    });
+    const data = await resp.json();
+
+    if (!data.ok) {
+      if (errBox) {
+        let errMsg = data.error || "Gagal memulai free trial.";
+        // Jika cooldown, tambahkan CTA beli
+        if (resp.status === 429) {
+          errMsg += ` <a href="#" style="color:var(--primary);font-weight:700;" onclick="closeFreeTrialModal();openPaymentModal('new_token');return false;">→ Beli Paket Sekarang</a>`;
+        }
+        errBox.innerHTML = errMsg;
+        errBox.style.display = "block";
+      }
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    // Tampilkan step 2: live log
+    const s1 = document.getElementById("ftStep1");
+    const s2 = document.getElementById("ftStep2");
+    if (s1) s1.style.display = "none";
+    if (s2) s2.style.display = "";
+
+    const taskId = data.task_id;
+    const logBody = document.getElementById("ftLogBody");
+    const statusTag = document.getElementById("ftTrialStatusTag");
+
+    function appendFtLog(msg, cls) {
+      if (!logBody) return;
+      const row = document.createElement("div");
+      row.className = "log-row";
+      const ts = new Date().toLocaleTimeString("id-ID");
+      row.innerHTML = `<span class="log-time">[${ts}]</span><span class="${cls || 'log-msg-system'}">${msg}</span>`;
+      logBody.appendChild(row);
+      logBody.scrollTop = logBody.scrollHeight;
+    }
+
+    appendFtLog(`Free Trial dimulai dengan ${data.trial_accounts || 5} akun tamu. Task ID: ${taskId}`, "log-msg-system");
+
+    // Connect SSE
+    if (_ftEventSource) _ftEventSource.close();
+    _ftEventSource = new EventSource(`/api/tasks/stream/${taskId}`);
+
+    _ftEventSource.onmessage = (e) => {
+      try {
+        const ev = JSON.parse(e.data);
+        if (ev.type === "log") {
+          const lvl = ev.level || "info";
+          const cls = lvl === "success" ? "log-msg-success" : (lvl === "error" ? "log-msg-error" : (lvl === "warning" ? "log-msg-warning" : "log-msg-info"));
+          appendFtLog(ev.message || "", cls);
+        } else if (ev.type === "done" || ev.type === "complete") {
+          if (statusTag) { statusTag.textContent = "Selesai"; statusTag.style.background = "#dcfce7"; statusTag.style.color = "#166534"; statusTag.style.borderColor = "#bbf7d0"; }
+          appendFtLog("Free trial selesai. Silakan periksa pembacaan dan like di akun novel target.", "log-msg-success");
+          const doneDiv = document.getElementById("ftStep2Done");
+          if (doneDiv) doneDiv.style.display = "";
+          _ftEventSource.close(); _ftEventSource = null;
+        }
+      } catch (_) {}
+    };
+
+    _ftEventSource.onerror = () => {
+      if (statusTag) { statusTag.textContent = "Terputus"; statusTag.style.background = "#fef2f2"; statusTag.style.color = "#991b1b"; }
+      appendFtLog("⚠️ Koneksi stream terputus.", "log-msg-warning");
+      _ftEventSource.close(); _ftEventSource = null;
+    };
+
+  } catch (err) {
+    if (errBox) { errBox.textContent = "Gagal terhubung ke server: " + err.message; errBox.style.display = "block"; }
+    if (btn) btn.disabled = false;
+  }
+}
+
+
+// =============================================================================
 // CLIENT ACCOUNT GENERATOR SUITE
 // =============================================================================
 let clientGeneratedAccounts = [];
+
 
 function updateAccountGenEstimatedCost() {
   const countInput = document.getElementById("clientGenCountInput");
@@ -1999,7 +2268,19 @@ function setClientGenCount(val) {
   const slider = document.getElementById("clientGenCountSlider");
   if (input) input.value = val;
   if (slider) slider.value = val;
+  syncGenChips(val);
   updateAccountGenEstimatedCost();
+}
+
+function syncGenChips(val) {
+  const chips = document.querySelectorAll("#clientGenPresetChips .preset-chip");
+  chips.forEach(chip => {
+    if (parseInt(chip.getAttribute("data-val")) === parseInt(val)) {
+      chip.classList.add("active");
+    } else {
+      chip.classList.remove("active");
+    }
+  });
 }
 
 async function generateClientAccounts() {
@@ -2090,19 +2371,19 @@ async function generateClientAccounts() {
         alertEl.style.background = "var(--primary-subtle)";
         alertEl.style.color = "var(--primary)";
         alertEl.style.border = "1px solid var(--primary-border)";
-        alertEl.innerHTML = `🎉 <b>Berhasil!</b> ${created} akun WebNovel berhasil digenerate &amp; siap digunakan. Saldo terpotong: <b>${formatRupiah(billed)}</b> (Rp ${data.rate_per_account}/akun). Sisa saldo: <b>${formatRupiah(data.remaining_balance)}</b>.`;
+        alertEl.innerHTML = `<b>Berhasil:</b> ${created} akun WebNovel berhasil digenerate &amp; siap digunakan. Terpotong: <b>${formatRupiah(billed)}</b> (Rp ${data.rate_per_account}/akun). Sisa saldo: <b>${formatRupiah(data.remaining_balance)}</b>.`;
       } else if (created > 0) {
         alertEl.className = "alert alert-warning";
         alertEl.style.background = "var(--warning-subtle)";
         alertEl.style.color = "var(--warning)";
         alertEl.style.border = "1px solid var(--warning-border)";
-        alertEl.innerHTML = `⚠️ <b>Selesai Sebagian:</b> ${created} dari ${count} akun berhasil dibuat. Saldo hanya dipotong untuk akun sukses: <b>${formatRupiah(billed)}</b>. Sisa saldo: <b>${formatRupiah(data.remaining_balance)}</b>.`;
+        alertEl.innerHTML = `<b>Selesai Sebagian:</b> ${created} dari ${count} akun berhasil dibuat. Saldo hanya dipotong untuk akun sukses: <b>${formatRupiah(billed)}</b>. Sisa saldo: <b>${formatRupiah(data.remaining_balance)}</b>.`;
       } else {
         alertEl.className = "alert alert-danger";
         alertEl.style.background = "var(--danger-subtle)";
         alertEl.style.color = "var(--danger)";
         alertEl.style.border = "1px solid var(--danger-border)";
-        alertEl.innerHTML = `❌ <b>Gagal:</b> Tidak ada akun yang berhasil dibuat. Saldo Anda tidak dipotong sama sekali (Rp 0). Periksa koneksi proxy atau coba negara lain.`;
+        alertEl.innerHTML = `<b>Gagal:</b> Tidak ada akun yang berhasil dibuat. Saldo Anda tidak dipotong (Rp 0). Periksa koneksi proxy atau coba negara lain.`;
       }
     }
 
@@ -2113,7 +2394,7 @@ async function generateClientAccounts() {
       alertEl.style.background = "var(--danger-subtle)";
       alertEl.style.color = "var(--danger)";
       alertEl.style.border = "1px solid var(--danger-border)";
-      alertEl.innerHTML = `❌ <b>Terjadi Kesalahan:</b> ${err.message}`;
+      alertEl.innerHTML = `<b>Terjadi Kesalahan:</b> ${err.message}`;
     }
   } finally {
     if (btn) {
@@ -2134,10 +2415,12 @@ function renderClientGeneratedAccounts() {
 
   if (clientGeneratedAccounts.length === 0) {
     container.innerHTML = `
-      <div style="text-align:center;padding:48px 16px;color:var(--text-muted);">
-        <div style="font-size:32px;margin-bottom:8px;opacity:0.7;">👥</div>
-        <div style="font-weight:600;color:var(--text-body);margin-bottom:4px;">Belum Ada Akun Digenerate</div>
-        <div style="font-size:12px;">Tentukan jumlah akun di panel kiri lalu klik tombol <b>Generate Akun Sekarang</b>.</div>
+      <div style="text-align:center;padding:64px 20px;color:var(--text-muted);">
+        <div style="width:48px;height:48px;border-radius:50%;background:var(--bg-subtle);border:1px solid var(--border-color);display:inline-flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--text-muted);">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </div>
+        <div style="font-weight:600;color:var(--text-heading);margin-bottom:4px;font-size:14px;">Belum Ada Akun Dibuat</div>
+        <div style="font-size:12px;max-width:320px;margin:0 auto;line-height:1.5;">Tentukan jumlah akun pada formulir lalu klik tombol <b>Generate Akun Sekarang</b>.</div>
       </div>
     `;
     if (rawTextarea) rawTextarea.value = "";
@@ -2178,8 +2461,9 @@ function renderClientGeneratedAccounts() {
           </div>
         </div>
         <div style="display:flex;gap:6px;flex-shrink:0;">
-          <button class="btn btn-secondary btn-sm" onclick="copySingleAccount('${emailEsc}', '${passEsc}', '${tokEsc}')" title="Salin Email:Pass" style="padding:4px 8px;font-size:11px;">
-            📋 Salin
+          <button class="btn btn-secondary btn-sm" onclick="copySingleAccount('${emailEsc}', '${passEsc}', '${tokEsc}')" title="Salin Email:Pass" style="padding:4px 8px;font-size:11px;display:inline-flex;align-items:center;gap:4px;">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Salin
           </button>
         </div>
       </div>

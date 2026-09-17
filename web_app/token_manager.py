@@ -25,6 +25,14 @@ RATE_LIKE = 100          # Opsional: Rp 100 per like sukses
 RATE_BOOKMARK = 100      # Opsional: Rp 100 per bookmark sukses
 RATE_FOLLOW = 100        # Opsional: Rp 100 per follow sukses
 
+DEFAULT_FREE_TRIAL = {
+    "enabled": True,
+    "accounts_count": 5,
+    "do_like": True,
+    "do_follow": True,
+    "cooldown_hours": 24,
+}
+
 DEFAULT_PACKAGES = [
     {
         "id": "pkg_10k",
@@ -115,6 +123,14 @@ class TokenManager:
             rates = cfg.get("rates", {})
             packages = cfg.get("packages") or DEFAULT_PACKAGES
             owner_wa = cfg.get("owner_wa", OWNER_WHATSAPP)
+            trial = cfg.get("free_trial") or {}
+            free_trial_cfg = {
+                "enabled": bool(trial.get("enabled", DEFAULT_FREE_TRIAL["enabled"])),
+                "accounts_count": max(1, int(trial.get("accounts_count", DEFAULT_FREE_TRIAL["accounts_count"]))),
+                "do_like": bool(trial.get("do_like", DEFAULT_FREE_TRIAL["do_like"])),
+                "do_follow": bool(trial.get("do_follow", DEFAULT_FREE_TRIAL["do_follow"])),
+                "cooldown_hours": max(1, int(trial.get("cooldown_hours", DEFAULT_FREE_TRIAL["cooldown_hours"]))),
+            }
             return {
                 "rates": {
                     "valid_reader": int(rates.get("valid_reader", RATE_VALID_READER)),
@@ -126,6 +142,7 @@ class TokenManager:
                 },
                 "packages": packages,
                 "owner_wa": str(owner_wa),
+                "free_trial": free_trial_cfg,
             }
 
     @classmethod
@@ -134,6 +151,7 @@ class TokenManager:
         rates: Optional[Dict[str, Any]] = None,
         packages: Optional[List[Dict[str, Any]]] = None,
         owner_wa: Optional[str] = None,
+        free_trial: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Memperbarui konfigurasi tarif dan paket harga secara dinamis oleh Admin."""
         with cls._lock:
@@ -171,6 +189,25 @@ class TokenManager:
                     cfg["packages"] = cleaned_pkgs
             if owner_wa is not None:
                 cfg["owner_wa"] = str(owner_wa).strip()
+
+            if free_trial is not None and isinstance(free_trial, dict):
+                cur_trial = cfg.setdefault("free_trial", dict(DEFAULT_FREE_TRIAL))
+                if "enabled" in free_trial:
+                    cur_trial["enabled"] = bool(free_trial["enabled"])
+                if "accounts_count" in free_trial:
+                    try:
+                        cur_trial["accounts_count"] = max(1, min(100, int(free_trial["accounts_count"])))
+                    except (ValueError, TypeError):
+                        pass
+                if "do_like" in free_trial:
+                    cur_trial["do_like"] = bool(free_trial["do_like"])
+                if "do_follow" in free_trial:
+                    cur_trial["do_follow"] = bool(free_trial["do_follow"])
+                if "cooldown_hours" in free_trial:
+                    try:
+                        cur_trial["cooldown_hours"] = max(1, min(720, int(free_trial["cooldown_hours"])))
+                    except (ValueError, TypeError):
+                        pass
 
             cls._save_data(db)
             return cls.get_pricing_config()

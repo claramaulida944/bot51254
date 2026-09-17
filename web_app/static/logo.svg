@@ -1,42 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
-  <defs>
-    <linearGradient id="rdGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#3b82f6" />
-      <stop offset="50%" stop-color="#2563eb" />
-      <stop offset="100%" stop-color="#1d4ed8" />
-    </linearGradient>
-    <linearGradient id="rdAccent" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#60a5fa" />
-      <stop offset="100%" stop-color="#38bdf8" />
-    </linearGradient>
-    <filter id="rdShadow" x="-10%" y="-10%" width="120%" height="120%">
-      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1d4ed8" flood-opacity="0.25" />
-    </filter>
-  </defs>
+  <!-- Rounded Base (Terracotta / QuarterFull Coral) -->
+  <rect x="2" y="2" width="44" height="44" rx="10" fill="#E05A38"/>
 
-  <!-- Squircle Base -->
-  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#rdGrad)" filter="url(#rdShadow)"/>
-  <rect x="2.5" y="2.5" width="43" height="43" rx="10.5" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="1"/>
-
-  <!-- Stylized Geometric "R" with Automation Nodes -->
-  <!-- Left Pillar -->
-  <rect x="12" y="11" width="5.5" height="26" rx="2.75" fill="#ffffff" />
-
-  <!-- Upper Loop -->
-  <path d="M14 11 H26 C30.418 11 34 14.582 34 19 C34 23.418 30.418 27 26 27 H14" 
-        fill="none" 
-        stroke="#ffffff" 
-        stroke-width="5.5" 
-        stroke-linecap="round" 
-        stroke-linejoin="round" />
-
-  <!-- Dynamic Automation Leg / Forward Arrow -->
-  <path d="M23 25 L32.5 35.5" 
-        fill="none" 
-        stroke="url(#rdAccent)" 
-        stroke-width="5.5" 
-        stroke-linecap="round" />
-
-  <!-- High-Tech Automation Energy Dot -->
-  <circle cx="33.5" cy="19" r="2.2" fill="#38bdf8" />
+  <!-- Minimalist Novel Book + Automation Forward Play Vector -->
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Open Book Spread -->
+    <path d="M12 15.5 C16 14 20 14.5 24 16.5 C28 14.5 32 14 36 15.5 V32 C32 30.5 28 31 24 33 C20 31 16 30.5 12 32 Z" 
+          stroke-width="2.8" />
+    
+    <!-- Spine Line -->
+    <line x1="24" y1="16.5" x2="24" y2="33" stroke-width="2.5" />
+    
+    <!-- Fast-Reading Automation Glyph (Crisp Right Arrow / Play) -->
+    <polygon points="21.5,21 27.5,24.5 21.5,28" fill="#FFFFFF" stroke="none" />
+  </g>
 </svg>
