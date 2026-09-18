@@ -191,6 +191,9 @@ class ProxyInfo:
         self.customer: str = ""
         self.zone: str = ""
         self.current_country: Optional[str] = None
+        self.failure_count: int = 0
+        self.last_failed_at: float = 0.0
+        self.cooldown_until: float = 0.0
         self._parse()
 
     def _parse(self) -> None:
@@ -1032,17 +1035,21 @@ class ProxyManager:
 
             # 1. Penanganan Khusus HypeProxy: AUTO-START (MULAI) & ROTASI IP SAAT GAGAL / ERROR
             if p_found.is_hypeproxy:
-                if reason == "failed" and p_found.proxy_id:
-                    def _recover_slot():
-                        # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
-                        HypeProxyClient.start_proxy(p_found.proxy_id)
-                        # 2. Picu rotasi IP instan di thread terpisah
-                        HypeProxyClient.rotate_proxy(p_found.proxy_id)
+                if reason == "failed":
+                    p_found.failure_count = getattr(p_found, "failure_count", 0) + 1
+                    p_found.last_failed_at = time.time()
+                    p_found.cooldown_until = time.time() + 60.0
+                    if p_found.proxy_id:
+                        def _recover_slot():
+                            # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
+                            HypeProxyClient.start_proxy(p_found.proxy_id)
+                            # 2. Picu rotasi IP instan di thread terpisah
+                            HypeProxyClient.rotate_proxy(p_found.proxy_id)
 
-                    threading.Thread(target=_recover_slot, daemon=True).start()
-                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start) & rotasi IP.")
-                    if self.verbose:
-                        console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
+                        threading.Thread(target=_recover_slot, daemon=True).start()
+                        logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start), rotasi IP, & cooldown 60s.")
+                        if self.verbose:
+                            console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
                 elif reason == "used":
                     logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan.")
                 return True
@@ -1086,7 +1093,8 @@ class ProxyManager:
     ) -> Optional[str]:
         """
         Mengambil proxy untuk satu sesi kerja secara instan:
-        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar 8 slot.
+        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar slot aktif.
+        - Memprioritaskan slot yang sehat (tidak sedang cooldown 60s karena mati/error).
         - Langsung mengembalikan URL proxy tanpa latensi tambahan.
         """
         with self._lock:
@@ -1098,7 +1106,12 @@ class ProxyManager:
 
             # HypeProxy dan Bright Data berputar terus menerus (round-robin)
             if self.is_brightdata or self.is_hypeproxy:
-                proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+                now = time.time()
+                candidates = [p for p in self.parsed_proxies if getattr(p, "cooldown_until", 0.0) <= now]
+                if not candidates:
+                    candidates = self.parsed_proxies
+
+                proxy_info = candidates[self._current_index % len(candidates)]
                 self._current_index += 1
 
                 if proxy_info.is_brightdata:
@@ -1124,7 +1137,7 @@ class ProxyManager:
         session_id: Optional[str] = None,
         auto_replenish: bool = True,
     ) -> Optional[str]:
-        """Mengambil proxy berikutnya secara round-robin."""
+        """Mengambil proxy berikutnya secara round-robin (memprioritaskan slot sehat)."""
         self.reload_if_modified()
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
@@ -1133,7 +1146,12 @@ class ProxyManager:
             if not self.parsed_proxies:
                 return None
 
-            proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+            now = time.time()
+            candidates = [p for p in self.parsed_proxies if getattr(p, "cooldown_until", 0.0) <= now]
+            if not candidates:
+                candidates = self.parsed_proxies
+
+            proxy_info = candidates[self._current_index % len(candidates)]
             self._current_index += 1
 
             if proxy_info.is_brightdata:
