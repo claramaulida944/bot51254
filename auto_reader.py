@@ -18,6 +18,7 @@ Fitur Tambahan:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -89,6 +90,28 @@ console = Console(highlight=False)
 _account_file_lock = threading.Lock()
 
 
+def is_jwt_expired(token: Optional[str], buffer_seconds: int = 60) -> bool:
+    """Mengecek apakah token JWT sudah kedaluwarsa secara instan (0 ms) tanpa memanggil network."""
+    if not token or not isinstance(token, str):
+        return True
+    parts = token.split(".")
+    if len(parts) < 2:
+        return True
+    try:
+        payload_b64 = parts[1]
+        rem = len(payload_b64) % 4
+        if rem > 0:
+            payload_b64 += "=" * (4 - rem)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+        payload = json.loads(payload_bytes)
+        exp = payload.get("exp")
+        if exp is None:
+            return False
+        return (time.time() + buffer_seconds) >= float(exp)
+    except Exception:
+        return True
+
+
 class NovelTargetResolver:
     """Menguraikan URL atau ID Novel dan mengambil daftar bab yang valid untuk dibaca."""
 
@@ -145,12 +168,13 @@ class NovelTargetResolver:
 
                 for acc in accounts[:5]:
                     access_token = acc.get("access_token")
-                    if access_token and not force_refresh:
+                    if access_token and not force_refresh and not is_jwt_expired(access_token, buffer_seconds=60):
                         try:
                             with httpx.Client(**client_kwargs) as client:
                                 chk = client.get(
                                     f"{cls.BASE_URL}/api/v1/users/me",
                                     headers={"authorization": f"Bearer {access_token}"},
+                                    timeout=httpx.Timeout(5.0, connect=3.0),
                                 )
                                 if chk.status_code == 200:
                                     cls._cached_auth_token = access_token
@@ -466,7 +490,7 @@ class BaseReaderSession:
                 "base_url": self.BASE_URL,
                 "http2": False if self.proxy else True,
                 "headers": self.build_base_headers(),
-                "timeout": httpx.Timeout(self.timeout),
+                "timeout": httpx.Timeout(self.timeout, connect=min(4.0, self.timeout)),
             }
             if self.proxy:
                 kwargs["proxy"] = self.proxy
@@ -677,7 +701,7 @@ class MemberReaderSession(BaseReaderSession):
         account_data: Dict[str, Any],
         novel_title: str = "Novel",
         proxy: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: float = 15.0,
         proxy_manager: Optional[ProxyManager] = None,
     ) -> None:
         super().__init__(
@@ -703,46 +727,66 @@ class MemberReaderSession(BaseReaderSession):
         return headers
 
     def _save_refreshed_account(self, file_path: str = "akun.txt") -> None:
-        """Menyimpan pembaruan access_token & refresh_token ke berkas akun.txt (thread-safe)."""
+        """Menyimpan pembaruan access_token & refresh_token ke seluruh berkas akun.txt yang relevan (thread-safe)."""
+        candidate_paths = [
+            Path(file_path),
+            Path("akun.txt"),
+            Path(__file__).parent / "akun.txt",
+            Path.cwd() / "akun.txt",
+            Path(__file__).parent.parent / "akun.txt",
+        ]
+        target_files = set()
+        for p in candidate_paths:
+            if p.is_file():
+                target_files.add(p.resolve())
+        if not target_files:
+            target_files.add(Path(file_path).resolve())
+
         try:
             with _account_file_lock:
-                if not os.path.exists(file_path):
-                    return
-                lines = []
-                updated = False
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line_str = line.strip()
-                        if not line_str:
-                            continue
-                        try:
-                            data = json.loads(line_str)
-                            if data.get("email") == self.email:
-                                data["access_token"] = self.access_token
-                                if self.account.get("refresh_token"):
-                                    data["refresh_token"] = self.account["refresh_token"]
-                                lines.append(json.dumps(data, ensure_ascii=False))
-                                updated = True
+                for tf in target_files:
+                    if not tf.exists():
+                        continue
+                    lines = []
+                    updated = False
+                    with open(tf, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            line_str = line.strip()
+                            if not line_str:
                                 continue
-                        except Exception:
-                            pass
-                        lines.append(line_str)
-                if updated:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
+                            try:
+                                data = json.loads(line_str)
+                                if data.get("email") == self.email:
+                                    data["access_token"] = self.access_token
+                                    if self.account.get("refresh_token"):
+                                        data["refresh_token"] = self.account["refresh_token"]
+                                    lines.append(json.dumps(data, ensure_ascii=False))
+                                    updated = True
+                                    continue
+                            except Exception:
+                                pass
+                            lines.append(line_str)
+                    if updated:
+                        with open(tf, "w", encoding="utf-8") as f:
+                            f.write("\n".join(lines) + "\n")
         except Exception as exc:
             logger.debug("[%s] Gagal menyimpan token baru ke %s: %s", self.worker_id, file_path, exc)
 
-    async def refresh_access_token(self) -> bool:
-        """Memperbarui access_token member via POST /api/auth/token/refresh."""
+    async def refresh_access_token(self, timeout_sec: float = 6.0) -> bool:
+        """Memperbarui access_token member via POST /api/auth/token/refresh secara cepat."""
         refresh_token = self.account.get("refresh_token")
         if not refresh_token:
+            return False
+
+        # Cek apakah refresh token sendiri sudah expired via JWT payload
+        if is_jwt_expired(refresh_token, buffer_seconds=30):
+            logger.debug("[%s] refresh_token sudah kedaluwarsa secara lokal.", self.worker_id)
             return False
 
         try:
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "timeout": httpx.Timeout(self.timeout),
+                "timeout": httpx.Timeout(timeout_sec, connect=min(3.5, timeout_sec)),
                 "headers": {
                     "user-agent": self.user_agent,
                     "x-device-id": self.device_id,
@@ -772,11 +816,24 @@ class MemberReaderSession(BaseReaderSession):
                         self._save_refreshed_account()
                         logger.info("[%s] Token member berhasil diperbarui otomatis!", self.worker_id)
                         return True
+                elif resp.status_code in (401, 403, 400, 422):
+                    logger.debug("[%s] Refresh token ditolak server (HTTP %d). Wajib login password.", self.worker_id, resp.status_code)
+                    return False
         except Exception as exc:
             logger.debug("[%s] Gagal refresh token: %s", self.worker_id, exc)
+            if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
+                if self.proxy:
+                    self.proxy_manager.mark_failed(self.proxy, exc)
+                new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                await self.set_proxy(new_proxy)
         return False
 
-    async def login_with_password(self, max_retries: int = 5) -> bool:
+    async def login_with_password(
+        self,
+        max_retries: int = 3,
+        timeout_sec: float = 7.0,
+        status_cb: Optional[Any] = None,
+    ) -> bool:
         """Melakukan login ulang penuh ke POST /api/auth/login menggunakan email & password.
         Mendukung rotasi proxy otomatis jika terjadi kendala jaringan/proxy mati."""
         password = self.account.get("password")
@@ -784,10 +841,12 @@ class MemberReaderSession(BaseReaderSession):
             return False
 
         for attempt in range(1, max_retries + 1):
+            if status_cb:
+                status_cb(f"[yellow]Login password ({attempt}/{max_retries})...[/]")
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
                 "http2": False if self.proxy else True,
-                "timeout": httpx.Timeout(15.0),
+                "timeout": httpx.Timeout(timeout_sec, connect=min(3.5, timeout_sec)),
                 "headers": {
                     "user-agent": self.user_agent,
                     "x-device-id": self.device_id,
@@ -829,13 +888,7 @@ class MemberReaderSession(BaseReaderSession):
                         await self.set_proxy(new_proxy)
                         continue
                     elif resp.status_code in (400, 401, 404, 422):
-                        logger.warning("[%s] Login ditolak server (HTTP %d, mencoba proxy lain %d/%d): %s", self.worker_id, resp.status_code, attempt, max_retries, resp.text[:100])
-                        if attempt < max_retries:
-                            if self.proxy:
-                                self.proxy_manager.mark_failed(self.proxy, f"HTTP {resp.status_code}")
-                            new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
-                            await self.set_proxy(new_proxy)
-                            continue
+                        logger.warning("[%s] Login ditolak server (HTTP %d): %s", self.worker_id, resp.status_code, resp.text[:100])
                         return False
                     else:
                         logger.debug("[%s] Login respons status %d, mencoba proxy lain...", self.worker_id, resp.status_code)
@@ -850,40 +903,70 @@ class MemberReaderSession(BaseReaderSession):
 
         return False
 
-    async def ensure_valid_session(self, max_retries: int = 5) -> bool:
-        """Memverifikasi keaktifan sesi token member; auto-refresh atau re-login bila kedaluwarsa."""
-        for attempt in range(1, max_retries + 1):
-            if not self.access_token:
-                if await self.refresh_access_token():
-                    return True
-                return await self.login_with_password(max_retries=max_retries)
+    async def ensure_valid_session(
+        self,
+        max_retries: int = 2,
+        status_cb: Optional[Any] = None,
+    ) -> bool:
+        """
+        Memverifikasi keaktifan sesi token member secara cepat dan efisien:
+        1. Cek kedaluwarsa JWT secara lokal (0 ms, hemat bandwidth & proxy).
+        2. Jika token masih valid (>60 detik), ping /api/auth/profile dengan timeout cepat.
+        3. Jika token kedaluwarsa, coba refresh token via /api/auth/token/refresh.
+        4. Jika refresh token gagal/kedaluwarsa, langsung login ulang dengan password.
+        """
+        # 1. Cek JWT lokal instan (0 ms) - hindari request sia-sia jika sudah jelas expired
+        if not self.access_token or is_jwt_expired(self.access_token, buffer_seconds=60):
+            if status_cb:
+                status_cb("[yellow]Token exp, perbarui...[/]")
+            logger.info("[%s] Access token kedaluwarsa di lokal. Mencoba refresh token...", self.worker_id)
+            if await self.refresh_access_token(timeout_sec=6.0):
+                if status_cb:
+                    status_cb("[green]Token refreshed (OK)[/]")
+                return True
 
+            # Refresh token gagal, langsung login ulang dengan password
+            if status_cb:
+                status_cb("[yellow]Sesi exp, login password...[/]")
+            return await self.login_with_password(max_retries=max_retries, timeout_sec=7.0, status_cb=status_cb)
+
+        # 2. Token masih valid di lokal: Ping profil cepat ke server
+        for attempt in range(1, max_retries + 1):
+            if status_cb:
+                status_cb("[dim]Verifikasi token...[/]")
             try:
                 client = await self.get_client()
-                resp = await client.get("/api/auth/profile")
+                resp = await client.get("/api/auth/profile", timeout=httpx.Timeout(5.0, connect=3.0))
                 if resp.status_code == 200:
+                    if status_cb:
+                        status_cb("[green]Sesi aktif (OK)[/]")
                     return True
+
                 if resp.status_code == 401:
-                    # Token kedaluwarsa: Coba refresh token dulu
-                    if await self.refresh_access_token():
+                    # Token ditolak di server: Coba refresh token dulu
+                    if status_cb:
+                        status_cb("[yellow]Token 401, refresh...[/]")
+                    if await self.refresh_access_token(timeout_sec=6.0):
+                        if status_cb:
+                            status_cb("[green]Token refreshed (OK)[/]")
                         return True
-                    # Jika refresh gagal, langsung login ulang dengan password & rotasi proxy
-                    logged_in = await self.login_with_password(max_retries=max_retries)
-                    if logged_in:
-                        return True
-                    # Jika gagal karena proxy, loop attempt berikutnya akan mencoba proxy baru
-                    if attempt < max_retries:
-                        if self.proxy:
-                            self.proxy_manager.mark_failed(self.proxy, "login failed on 401 profile")
-                        new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
-                        await self.set_proxy(new_proxy)
-                        continue
-                    return False
+                    # Jika refresh gagal, langsung login ulang dengan password
+                    if status_cb:
+                        status_cb("[yellow]Sesi exp, login password...[/]")
+                    return await self.login_with_password(max_retries=max_retries, timeout_sec=7.0, status_cb=status_cb)
+
+                if resp.status_code in (403, 429, 500, 502, 503, 504):
+                    if self.proxy:
+                        self.proxy_manager.mark_failed(self.proxy, f"HTTP {resp.status_code} profile")
+                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
+                    await self.set_proxy(new_proxy)
+                    continue
+
             except Exception as exc:
                 if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
                     if self.proxy:
                         logger.warning(
-                            "[%s] Proxy error saat verifikasi sesi (%s), otomatis DIHAPUS dan mencoba proxy baru (%d/%d)...",
+                            "[%s] Proxy error saat verifikasi sesi (%s), rotasi proxy (%d/%d)...",
                             self.worker_id,
                             exc,
                             attempt,
@@ -895,8 +978,10 @@ class MemberReaderSession(BaseReaderSession):
                     continue
                 return False
 
-        # Fallback akhir: coba login ulang sekali lagi dengan password
-        return await self.login_with_password(max_retries=3)
+        # Fallback jika profile check gagal karena error jaringan/proxy: Coba login password langsung
+        if status_cb:
+            status_cb("[yellow]Coba login password...[/]")
+        return await self.login_with_password(max_retries=max_retries, timeout_sec=7.0, status_cb=status_cb)
 
     async def get_read_chapter_ids(self, novel_id: str) -> set:
         """
@@ -914,7 +999,7 @@ class MemberReaderSession(BaseReaderSession):
             "include_read_progress": "true",
         }
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, timeout=httpx.Timeout(8.0, connect=3.5))
             if resp.status_code == 200:
                 data = resp.json()
                 items = data.get("items", [])
@@ -1424,16 +1509,19 @@ class ReadingSimulationOrchestrator:
             slot_idx, task_id = await slot_queue.get()
             try:
                 progress.reset(task_id, total=len(self.chapters))
+
+                def update_status(msg: str) -> None:
+                    try:
+                        progress.update(task_id, description=msg)
+                    except Exception:
+                        pass
+
                 progress.update(
                     task_id,
                     role=f"[magenta]{worker_id}[/]",
                     description="[dim]Cek sesi token...[/]",
                 )
-                is_valid = await session.ensure_valid_session()
-                if not is_valid:
-                    # Jangan langsung skip! Coba login ulang langsung dengan password & rotasi proxy
-                    progress.update(task_id, description="[yellow]Sesi exp, login ulang...[/]")
-                    is_valid = await session.login_with_password(max_retries=5)
+                is_valid = await session.ensure_valid_session(status_cb=update_status)
 
                 if not is_valid:
                     progress.update(

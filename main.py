@@ -52,7 +52,7 @@ from rich.text import Text
 
 # Import modul yang sudah ada
 import auto_reader
-from auto_reader import NovelTargetResolver, load_accounts_from_file, load_proxies_from_file
+from auto_reader import NovelTargetResolver, load_accounts_from_file, load_proxies_from_file, is_jwt_expired
 from auto_signup import COUNTRY_CONFIG, HighEntropyProfileGenerator, RegistrationRunner, UserAgentGenerator
 from session_manager import IdentifierGenerator, ToodatGuestClient
 import interaction_manager
@@ -530,11 +530,19 @@ def feature_account_manager() -> None:
             for idx, acc in enumerate(accounts, start=1):
                 email = acc.get("email", "-")
                 country = acc.get("country", "ID")
+                tok = acc.get("access_token", "")
+
+                # 1. Cek JWT lokal instan (0 ms) - jika token sudah expired, tidak perlu request sia-sia
+                if not tok or is_jwt_expired(tok, buffer_seconds=60):
+                    status_str = "[bold red]KADALUARSA (Expired)[/]"
+                    expired_accounts.append(acc)
+                    console.print(f"  [{idx:02d}] {email} -> {status_str}")
+                    continue
 
                 status_str = "[bold red]KADALUARSA (Expired)[/]"
                 is_valid = False
 
-                for chk_attempt in range(1, 4):
+                for chk_attempt in range(1, 3):
                     if chk_attempt == 1 and acc.get("proxy"):
                         chk_proxy = acc.get("proxy")
                     else:
@@ -545,26 +553,33 @@ def feature_account_manager() -> None:
                         break
 
                     headers = {
-                        "authorization": f"Bearer {acc.get('access_token', '')}",
+                        "authorization": f"Bearer {tok}",
                         "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
                         "x-device-id": acc.get("device_id", ""),
                     }
                     try:
-                        with httpx.Client(http2=False, proxy=chk_proxy, base_url="https://api.quarterfull.io", timeout=12.0) as client:
-                            resp = client.get("/api/reading/progress", headers=headers)
-                            if resp.status_code != 401:
+                        with httpx.Client(
+                            http2=False,
+                            proxy=chk_proxy,
+                            base_url="https://api.quarterfull.io",
+                            timeout=httpx.Timeout(5.0, connect=3.0),
+                        ) as client:
+                            resp = client.get("/api/auth/profile", headers=headers)
+                            if resp.status_code == 200:
                                 status_str = "[bold green]AKTIF (Valid)[/]"
                                 is_valid = True
                                 default_proxy_manager.mark_used(chk_proxy)
                                 break
-                            else:
+                            elif resp.status_code == 401:
                                 status_str = "[bold red]KADALUARSA (Expired)[/]"
                                 break
+                            elif resp.status_code in (403, 429, 500, 502, 503, 504):
+                                default_proxy_manager.mark_failed(chk_proxy, f"HTTP {resp.status_code}")
+                                continue
                     except Exception as exc:
                         status_str = f"[yellow]Error ({exc})[/]"
                         if is_dead_or_proxy_error(exc) or "10054" in str(exc) or "timeout" in str(exc).lower():
                             default_proxy_manager.mark_failed(chk_proxy, exc)
-                        time.sleep(0.3)
                         continue
 
                 if not is_valid:
@@ -581,7 +596,7 @@ def feature_account_manager() -> None:
                 if do_relogin:
                     console.print("\n[cyan]Memulai proses Login Ulang akun via proxy (dengan Auto-Retry & Rotasi Proxy)...[/]\n")
                     relogin_success = 0
-                    max_retries = 5
+                    max_retries = 3
 
                     for i, acc in enumerate(expired_accounts, start=1):
                         email = acc.get("email")
@@ -614,7 +629,12 @@ def feature_account_manager() -> None:
                                 break
 
                             try:
-                                with httpx.Client(http2=False, proxy=current_proxy, base_url="https://api.quarterfull.io", timeout=18.0) as relogin_client:
+                                with httpx.Client(
+                                    http2=False,
+                                    proxy=current_proxy,
+                                    base_url="https://api.quarterfull.io",
+                                    timeout=httpx.Timeout(8.0, connect=3.5),
+                                ) as relogin_client:
                                     r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
                                     if r.status_code == 200:
                                         d = r.json()
@@ -632,13 +652,11 @@ def feature_account_manager() -> None:
                                         break
                                     else:
                                         last_err = f"HTTP {r.status_code}"
-                                        time.sleep(0.5)
                                         continue
                             except Exception as err:
                                 last_err = str(err)
                                 if is_dead_or_proxy_error(err) or "10054" in str(err) or "timeout" in str(err).lower() or "reset" in str(err).lower():
                                     default_proxy_manager.mark_failed(current_proxy, err)
-                                time.sleep(0.5)
                                 continue
 
                         if not relogin_ok:

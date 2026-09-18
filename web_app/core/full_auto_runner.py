@@ -11,6 +11,7 @@ rotasi proxy cerdas multi-negara, dan tampilan terminal visual interaktif menggu
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -62,6 +63,28 @@ for _lib in ("httpx", "httpcore"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 console = Console(highlight=False)
 _account_file_lock = threading.Lock()
+
+
+def is_jwt_expired(token: Optional[str], buffer_seconds: int = 60) -> bool:
+    """Mengecek apakah token JWT sudah kedaluwarsa secara instan (0 ms) tanpa memanggil network."""
+    if not token or not isinstance(token, str):
+        return True
+    parts = token.split(".")
+    if len(parts) < 2:
+        return True
+    try:
+        payload_b64 = parts[1]
+        rem = len(payload_b64) % 4
+        if rem > 0:
+            payload_b64 += "=" * (4 - rem)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+        payload = json.loads(payload_bytes)
+        exp = payload.get("exp")
+        if exp is None:
+            return False
+        return (time.time() + buffer_seconds) >= float(exp)
+    except Exception:
+        return True
 
 
 class FullAutoWorker:
@@ -316,11 +339,11 @@ class FullAutoWorker:
 
         return False
 
-    async def ensure_valid_session(self, client: httpx.AsyncClient, max_retries: int = 5) -> bool:
+    async def ensure_valid_session(self, client: httpx.AsyncClient, max_retries: int = 3) -> bool:
         """Memverifikasi validitas token worker via /api/auth/profile; auto refresh atau login ulang jika sesi kedaluwarsa."""
-        if self.access_token:
+        if self.access_token and not is_jwt_expired(self.access_token, buffer_seconds=60):
             try:
-                profile_resp = await client.get("/api/auth/profile")
+                profile_resp = await client.get("/api/auth/profile", timeout=httpx.Timeout(5.0, connect=3.0))
                 if profile_resp.status_code == 200:
                     return True
             except Exception:

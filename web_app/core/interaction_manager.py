@@ -12,6 +12,7 @@ dukungan rotasi proxy via `proxies.txt`, dan jeda pacing natural untuk mencegah 
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -54,6 +55,28 @@ from proxy_manager import (
 
 console = Console(highlight=False)
 logger = logging.getLogger("interaction_manager")
+
+
+def is_jwt_expired(token: Optional[str], buffer_seconds: int = 60) -> bool:
+    """Mengecek apakah token JWT sudah kedaluwarsa secara instan (0 ms) tanpa memanggil network."""
+    if not token or not isinstance(token, str):
+        return True
+    parts = token.split(".")
+    if len(parts) < 2:
+        return True
+    try:
+        payload_b64 = parts[1]
+        rem = len(payload_b64) % 4
+        if rem > 0:
+            payload_b64 += "=" * (4 - rem)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+        payload = json.loads(payload_bytes)
+        exp = payload.get("exp")
+        if exp is None:
+            return False
+        return (time.time() + buffer_seconds) >= float(exp)
+    except Exception:
+        return True
 
 
 def load_accounts_from_file(filepath: str = "akun.txt") -> List[Dict[str, Any]]:
@@ -499,7 +522,7 @@ class SocialInteractionBot:
     def ensure_valid_session(self, account: Dict[str, Any]) -> bool:
         """Memverifikasi validitas token akun via GET /api/auth/profile, auto refresh/relogin jika kedaluwarsa."""
         token = account.get("access_token")
-        if token:
+        if token and not is_jwt_expired(token, buffer_seconds=60):
             headers = self._build_headers(account)
             country = account.get("country", "ID")
             try:
@@ -508,6 +531,8 @@ class SocialInteractionBot:
                     f"{self.BASE_URL}/api/auth/profile",
                     headers=headers,
                     account_country=country,
+                    account=account,
+                    timeout=5.0,
                 )
                 if resp.status_code == 200:
                     return True
