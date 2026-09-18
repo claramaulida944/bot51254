@@ -951,7 +951,8 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
             origin_country = novel_info.get("origin_country", "ID")
             chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_country)
         except Exception as exc:
-            console.print(f"[bold red][ERROR] Gagal menghubungi API server:[/] {exc}")
+            err_msg = str(exc).strip() or type(exc).__name__
+            console.print(f"[bold red][ERROR] Gagal menghubungi API server:[/] {err_msg}")
             return
 
     novel_title = novel_info.get("title", f"Novel-{novel_id}")

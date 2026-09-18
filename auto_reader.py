@@ -169,18 +169,8 @@ class NovelTargetResolver:
                 for acc in accounts[:5]:
                     access_token = acc.get("access_token")
                     if access_token and not force_refresh and not is_jwt_expired(access_token, buffer_seconds=60):
-                        try:
-                            with httpx.Client(**client_kwargs) as client:
-                                chk = client.get(
-                                    f"{cls.BASE_URL}/api/v1/users/me",
-                                    headers={"authorization": f"Bearer {access_token}"},
-                                    timeout=httpx.Timeout(5.0, connect=3.0),
-                                )
-                                if chk.status_code == 200:
-                                    cls._cached_auth_token = access_token
-                                    return access_token
-                        except Exception:
-                            pass
+                        cls._cached_auth_token = access_token
+                        return access_token
 
                     # Coba refresh token
                     refresh_tok = acc.get("refresh_token")
@@ -190,6 +180,7 @@ class NovelTargetResolver:
                                 r_ref = client.post(
                                     f"{cls.BASE_URL}/api/auth/token/refresh",
                                     json={"refresh_token": refresh_tok},
+                                    timeout=httpx.Timeout(5.0, connect=2.5),
                                 )
                                 if r_ref.status_code == 200:
                                     data = r_ref.json()
@@ -214,6 +205,7 @@ class NovelTargetResolver:
                                 r_login = client.post(
                                     f"{cls.BASE_URL}/api/auth/login",
                                     json={"login_id": email, "password": password},
+                                    timeout=httpx.Timeout(6.0, connect=3.0),
                                 )
                                 if r_login.status_code == 200:
                                     data = r_login.json()
@@ -258,75 +250,84 @@ class NovelTargetResolver:
 
     @classmethod
     async def fetch_novel_details(cls, novel_id: str, proxy: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
-        """Mengambil metadata novel (judul, deskripsi, penulis) via proxy dengan auto-retry, rotasi instan, dan otentikasi otomatis untuk novel 18+."""
+        """Mengambil metadata novel (judul, deskripsi, penulis) dengan fallback instan, auto-retry, dan otentikasi otomatis untuk novel 18+."""
         url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}"
         data = None
         last_exc = None
         active_token = auth_token or cls._cached_auth_token
 
-        for attempt in range(1, 5):
-            current_proxy = proxy or (default_proxy_manager.pop_proxy() if default_proxy_manager and default_proxy_manager.has_proxies else None)
-            headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
-            if active_token:
-                headers["authorization"] = f"Bearer {active_token}"
-
-            client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 10.0}
-            if current_proxy:
-                client_kwargs["proxy"] = current_proxy
-                client_kwargs["http2"] = False
-            else:
-                client_kwargs["http2"] = True
-
+        # Jika proxy tidak ditentukan secara spesifik, coba direct connection terlebih dahulu (instan 0.2s)
+        if not proxy:
             try:
-                async with httpx.AsyncClient(**client_kwargs) as client:
-                    resp = await client.get(url)
-                    # Deteksi konten dewasa jika belum berotentikasi
+                d_headers = {"user-agent": "okhttp/4.12.0"}
+                if active_token:
+                    d_headers["authorization"] = f"Bearer {active_token}"
+                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(6.0, connect=2.5), http2=True) as d_client:
+                    resp = await d_client.get(url)
                     if resp.status_code == 404 and "adult_access_required" in resp.text:
                         active_token = cls.get_auth_token(force_refresh=False)
                         if active_token:
-                            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
                     elif resp.status_code == 401 and active_token:
                         active_token = cls.get_auth_token(force_refresh=True)
                         if active_token:
-                            resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
-
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if current_proxy and default_proxy_manager:
-                        default_proxy_manager.mark_used(current_proxy)
-                    break
+                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+                    if resp.status_code == 200:
+                        data = resp.json()
             except Exception as exc:
                 last_exc = exc
-                if current_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_failed(current_proxy, exc)
-                continue
+
+        # Jika direct gagal atau proxy ditentukan secara eksplisit, gunakan rotasi proxy
+        if not data and (proxy or (default_proxy_manager and default_proxy_manager.has_proxies)):
+            attempts = 2 if not proxy else 1
+            for attempt in range(1, attempts + 1):
+                current_proxy = proxy or default_proxy_manager.pop_proxy()
+                if not current_proxy:
+                    continue
+                headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
+                if active_token:
+                    headers["authorization"] = f"Bearer {active_token}"
+
+                try:
+                    async with httpx.AsyncClient(headers=headers, proxy=current_proxy, http2=False, timeout=httpx.Timeout(5.0, connect=2.5)) as client:
+                        resp = await client.get(url)
+                        if resp.status_code == 404 and "adult_access_required" in resp.text:
+                            active_token = cls.get_auth_token(force_refresh=False)
+                            if active_token:
+                                resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+                        elif resp.status_code == 401 and active_token:
+                            active_token = cls.get_auth_token(force_refresh=True)
+                            if active_token:
+                                resp = await client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if default_proxy_manager:
+                                default_proxy_manager.mark_used(current_proxy)
+                            break
+                except Exception as exc:
+                    last_exc = exc
+                    if default_proxy_manager:
+                        default_proxy_manager.mark_failed(current_proxy, exc)
+                    continue
+
+        # Fallback terakhir jika proxy gagal
+        if not data:
+            try:
+                d_headers = {"user-agent": "okhttp/4.12.0"}
+                if active_token:
+                    d_headers["authorization"] = f"Bearer {active_token}"
+                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(8.0, connect=3.0), http2=True) as d_client:
+                    resp = await d_client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+            except Exception as exc:
+                last_exc = exc
 
         if not data:
             if last_exc:
                 raise last_exc
             raise RuntimeError(f"Gagal mengambil metadata novel {novel_id}")
-
-        # Deteksi jika novel aslinya berasal dari luar negeri (misal EN) atau berstatus terjemahan (is_translated=True)
-        origin = str(data.get("origin_country", "ID")).upper()
-        if (origin == "EN" or data.get("is_translated")) and not proxy and default_proxy_manager and default_proxy_manager.has_proxies:
-            en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
-            target_cc = random.choice(en_countries) if origin == "EN" else origin
-            origin_proxy = default_proxy_manager.get_proxy(country_code=target_cc)
-            if origin_proxy:
-                try:
-                    p_headers = {"user-agent": "okhttp/4.12.0"}
-                    if active_token:
-                        p_headers["authorization"] = f"Bearer {active_token}"
-                    async with httpx.AsyncClient(proxy=origin_proxy, http2=False, timeout=10.0, headers=p_headers) as p_client:
-                        p_resp = await p_client.get(url)
-                        if p_resp.status_code == 200:
-                            p_data = p_resp.json()
-                            orig_count = p_data.get("stats", {}).get("chapter_count", 0)
-                            curr_count = data.get("stats", {}).get("chapter_count", 0)
-                            if orig_count >= curr_count:
-                                data = p_data
-                except Exception as e:
-                    logger.debug("Gagal fetch novel details via origin proxy: %s", e)
 
         return data
 
@@ -341,7 +342,7 @@ class NovelTargetResolver:
         """
         Mengambil daftar bab novel secara dinamis dengan dukungan paginasi kursor (cursor),
         memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
-        Dilengkapi auto-retry, rotasi proxy, dan otentikasi otomatis jika novel butuh akses 18+.
+        Dilengkapi fallback instan, auto-retry, rotasi proxy, dan otentikasi otomatis jika novel butuh akses 18+.
         """
         active_token = auth_token or cls._cached_auth_token
 
@@ -353,7 +354,10 @@ class NovelTargetResolver:
             if active_token:
                 headers["authorization"] = f"Bearer {active_token}"
 
-            client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 15.0}
+            client_kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "timeout": httpx.Timeout(6.0, connect=2.5) if target_proxy else httpx.Timeout(10.0, connect=3.0),
+            }
             if target_proxy:
                 client_kwargs["proxy"] = target_proxy
                 client_kwargs["http2"] = False
@@ -391,31 +395,50 @@ class NovelTargetResolver:
             readable_list.sort(key=lambda x: x.get("chapter_num", 0))
             return readable_list
 
+        # Jika proxy tidak ditentukan secara eksplisit, coba direct connection terlebih dahulu (0.3s)
         last_exc = None
-        for attempt in range(1, 5):
-            if attempt == 1 and proxy:
-                curr_proxy = proxy
-            elif default_proxy_manager and default_proxy_manager.has_proxies:
-                if origin_country and origin_country.upper() == "EN":
-                    en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
-                    curr_proxy = default_proxy_manager.get_proxy(country_code=random.choice(en_countries))
-                elif origin_country and origin_country.upper() != "ID":
-                    curr_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
-                else:
-                    curr_proxy = default_proxy_manager.pop_proxy()
-            else:
-                curr_proxy = None
-
+        if not proxy:
             try:
-                res = await _query_chapters(curr_proxy)
-                if curr_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_used(curr_proxy)
-                return res
+                return await _query_chapters(target_proxy=None)
             except Exception as exc:
                 last_exc = exc
-                if curr_proxy and default_proxy_manager:
-                    default_proxy_manager.mark_failed(curr_proxy, exc)
-                continue
+
+        # Jika direct gagal atau proxy ditentukan, coba via proxy
+        if proxy or (default_proxy_manager and default_proxy_manager.has_proxies):
+            attempts = 2 if not proxy else 1
+            for attempt in range(1, attempts + 1):
+                if attempt == 1 and proxy:
+                    curr_proxy = proxy
+                elif default_proxy_manager and default_proxy_manager.has_proxies:
+                    if origin_country and origin_country.upper() == "EN":
+                        en_countries = ["GB", "AU", "CA", "US", "NZ", "IE"]
+                        curr_proxy = default_proxy_manager.get_proxy(country_code=random.choice(en_countries))
+                    elif origin_country and origin_country.upper() != "ID":
+                        curr_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
+                    else:
+                        curr_proxy = default_proxy_manager.pop_proxy()
+                else:
+                    curr_proxy = None
+
+                if not curr_proxy:
+                    continue
+
+                try:
+                    res = await _query_chapters(curr_proxy)
+                    if default_proxy_manager:
+                        default_proxy_manager.mark_used(curr_proxy)
+                    return res
+                except Exception as exc:
+                    last_exc = exc
+                    if default_proxy_manager:
+                        default_proxy_manager.mark_failed(curr_proxy, exc)
+                    continue
+
+        # Fallback terakhir jika proxy gagal: coba direct connection
+        try:
+            return await _query_chapters(target_proxy=None)
+        except Exception as exc:
+            last_exc = exc
 
         if last_exc:
             raise last_exc
@@ -2023,7 +2046,8 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
             origin_country = novel_info.get("origin_country", "ID")
             chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_country)
         except Exception as exc:
-            console.print(f"[bold red]Gagal mengambil informasi novel:[/] {exc}")
+            err_msg = str(exc).strip() or type(exc).__name__
+            console.print(f"[bold red]Gagal mengambil informasi novel:[/] {err_msg}")
             return
 
     is_adult = novel_info.get("is_adult_only", False)
