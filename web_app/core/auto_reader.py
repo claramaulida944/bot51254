@@ -1098,6 +1098,27 @@ class MemberReaderSession(BaseReaderSession):
                 return await self.read_chapter(novel_id, chapter, reading_delay_sec)
             return False, f"GET Chapter Gagal: {exc}"
 
+        # 1b. Kirim Telemetri CHAPTER_OPENED (Pemicu agregasi Tampilan/Views dan Unik di Quarterfull Studio Analytics)
+        logical_reading_session_id = f"rls_{secrets.token_hex(8)}"
+        opened_payload = {
+            "novel_id": novel_id,
+            "chapter_id": ch_id,
+            "event_type": "CHAPTER_OPENED",
+            "event_properties": {
+                "source": "chapter_route",
+                "logical_reading_session_id": logical_reading_session_id,
+                "reader_entry_surface": "chapter_route",
+            },
+        }
+        try:
+            ev_resp = await client.post("/api/reading/events", json=opened_payload)
+            if ev_resp.status_code == 401:
+                refreshed = await self.refresh_access_token() or await self.login_with_password()
+                if refreshed:
+                    await client.post("/api/reading/events", json=opened_payload)
+        except Exception as ev_exc:
+            logger.debug("[%s] CHAPTER_OPENED error: %s", self.worker_id, ev_exc)
+
         # 2. Simulasi jeda baca natural & heartbeat progress scrolling berkala (tiap ~3 detik)
         read_delay = max(4.0, reading_delay_sec)
         step_interval = random.uniform(2.5, 3.5)
@@ -1148,6 +1169,25 @@ class MemberReaderSession(BaseReaderSession):
                     await client.post("/api/reading/sessions/heartbeat", json=heartbeat_payload)
         except Exception as hb_exc:
             logger.debug("[%s] Heartbeat member bab %d: %s", self.worker_id, ch_num, hb_exc)
+
+        # 3b. Kirim Event CHAPTER_COMPLETED
+        completed_payload = {
+            "novel_id": novel_id,
+            "chapter_id": ch_id,
+            "event_type": "CHAPTER_COMPLETED",
+            "reading_time_seconds": int(target_dwell),
+            "scroll_percent": 1.0,
+            "reading_progress": 1.0,
+            "event_properties": {
+                "source": "chapter_route",
+                "logical_reading_session_id": logical_reading_session_id,
+                "reader_entry_surface": "chapter_route",
+            },
+        }
+        try:
+            await client.post("/api/reading/events", json=completed_payload)
+        except Exception:
+            pass
 
         # 4. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2221,6 +2261,22 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
     if not selected_chapters:
         console.print("[yellow]Tidak ada bab yang dipilih untuk dibaca. Tugas dibatalkan.[/]")
         return
+
+    # Peringatan dini jika pengguna memilih bab 3 ke atas dengan hanya Guest Reader
+    has_gated_chapters = any(int(ch.get("chapter_num", 1) or 1) >= 3 for ch in selected_chapters)
+    if has_gated_chapters and guest_count > 0 and member_count == 0:
+        console.print(
+            Panel(
+                "[bold red][!] PERINGATAN SISTEM QUARTERFULL:[/]\n"
+                "[bold yellow]Quarterfull secara server-side MEMBLOKIR pembaca Tamu (Guest) pada Bab 3 ke atas.[/]\n"
+                "[dim]Guest Reader hanya diizinkan membaca Bab 1 & 2. Bab 3 hingga bab terakhir (seperti Bab 7+) "
+                "memerlukan pembaca Login (Member) agar teks dapat dimuat dan tercatat di Studio Analytics.[/]\n\n"
+                "[cyan]Tips:[/] Jalankan modul dengan menyertakan [bold green]Member Readers[/] dari akun.txt "
+                "agar Bab 3 ke atas terbaca tuntas 100% dan masuk ke analitik karya Anda.",
+                border_style="red",
+                title="[bold yellow]Informasi Gate Bab 3+[/]",
+            )
+        )
 
     # Opsi Lewatkan bab yang sudah pernah dibaca (khusus akun member)
     skip_already_read = True
