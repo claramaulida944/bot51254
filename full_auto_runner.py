@@ -136,6 +136,7 @@ class FullAutoWorker:
         self.do_follow = do_follow
         self.skip_already_read = skip_already_read
         self.inter_chapter_delay = max(0.0, inter_chapter_delay)
+        self.timeout = 25.0
 
         self.like_result = "-"
         self.bookmark_result = "-"

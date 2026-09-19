@@ -191,9 +191,6 @@ class ProxyInfo:
         self.customer: str = ""
         self.zone: str = ""
         self.current_country: Optional[str] = None
-        self.failure_count: int = 0
-        self.last_failed_at: float = 0.0
-        self.cooldown_until: float = 0.0
         self._parse()
 
     def _parse(self) -> None:
@@ -252,19 +249,6 @@ class ProxyInfo:
                         self.proxy_id = int(m_num.group(1))
                     except Exception:
                         self.proxy_id = None
-
-    @property
-    def country(self) -> str:
-        """Mengembalikan kode negara proxy (misal 'US', 'KR', 'ID', 'AUTO')."""
-        if self.is_brightdata:
-            return (self.current_country or "US").upper()
-        if self.is_hypeproxy and self.proxy_id:
-            try:
-                mapping = HypeProxyClient.get_slot_country_map()
-                return mapping.get(self.proxy_id, "AUTO").upper()
-            except Exception:
-                return "AUTO"
-        return "AUTO"
 
     def format_for_country(
         self,
@@ -425,29 +409,6 @@ class HypeProxyClient:
         except Exception as exc:
             logger.error(f"[HypeProxy] Exception get_proxies: {exc}")
             return []
-
-    _slot_country_cache: Dict[int, str] = {}
-    _last_cache_time: float = 0.0
-
-    @classmethod
-    def get_slot_country_map(cls, force_refresh: bool = False) -> Dict[int, str]:
-        """Mengambil pemetaan ID slot ke kode negara (misal {89: 'US', 98: 'ID'})."""
-        now = time.time()
-        if not force_refresh and cls._slot_country_cache and (now - cls._last_cache_time < 300):
-            return cls._slot_country_cache
-        try:
-            proxies = cls.get_proxies(user_only=True)
-            new_map = {}
-            for p in proxies:
-                pid = p.get("id")
-                if pid:
-                    new_map[int(pid)] = str(p.get("country", "AUTO")).upper().strip()
-            if new_map:
-                cls._slot_country_cache = new_map
-                cls._last_cache_time = now
-        except Exception:
-            pass
-        return cls._slot_country_cache
 
     @classmethod
     def get_proxy(cls, proxy_id: Union[int, str]) -> Dict[str, Any]:
@@ -1071,21 +1032,17 @@ class ProxyManager:
 
             # 1. Penanganan Khusus HypeProxy: AUTO-START (MULAI) & ROTASI IP SAAT GAGAL / ERROR
             if p_found.is_hypeproxy:
-                if reason == "failed":
-                    p_found.failure_count = getattr(p_found, "failure_count", 0) + 1
-                    p_found.last_failed_at = time.time()
-                    p_found.cooldown_until = time.time() + 60.0
-                    if p_found.proxy_id:
-                        def _recover_slot():
-                            # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
-                            HypeProxyClient.start_proxy(p_found.proxy_id)
-                            # 2. Picu rotasi IP instan di thread terpisah
-                            HypeProxyClient.rotate_proxy(p_found.proxy_id)
+                if reason == "failed" and p_found.proxy_id:
+                    def _recover_slot():
+                        # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
+                        HypeProxyClient.start_proxy(p_found.proxy_id)
+                        # 2. Picu rotasi IP instan di thread terpisah
+                        HypeProxyClient.rotate_proxy(p_found.proxy_id)
 
-                        threading.Thread(target=_recover_slot, daemon=True).start()
-                        logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start), rotasi IP, & cooldown 60s.")
-                        if self.verbose:
-                            console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
+                    threading.Thread(target=_recover_slot, daemon=True).start()
+                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start) & rotasi IP.")
+                    if self.verbose:
+                        console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
                 elif reason == "used":
                     logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan.")
                 return True
@@ -1129,8 +1086,7 @@ class ProxyManager:
     ) -> Optional[str]:
         """
         Mengambil proxy untuk satu sesi kerja secara instan:
-        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar slot aktif.
-        - Memprioritaskan slot yang sehat (tidak sedang cooldown 60s karena mati/error).
+        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar 8 slot.
         - Langsung mengembalikan URL proxy tanpa latensi tambahan.
         """
         with self._lock:
@@ -1142,31 +1098,13 @@ class ProxyManager:
 
             # HypeProxy dan Bright Data berputar terus menerus (round-robin)
             if self.is_brightdata or self.is_hypeproxy:
-                now = time.time()
-                healthy_proxies = [p for p in self.parsed_proxies if getattr(p, "cooldown_until", 0.0) <= now]
-                if not healthy_proxies:
-                    healthy_proxies = self.parsed_proxies
+                proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+                self._current_index += 1
 
-                target_country = str(country_code).upper().strip() if country_code else None
-
-                if self.is_brightdata:
-                    proxy_info = healthy_proxies[self._current_index % len(healthy_proxies)]
-                    self._current_index += 1
+                if proxy_info.is_brightdata:
                     return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
-                # Smart Country Routing untuk HypeProxy
-                candidates = healthy_proxies
-                if target_country and target_country not in ("RANDOM", "ALL", "AUTO"):
-                    matched = [p for p in healthy_proxies if p.country == target_country]
-                    if matched:
-                        candidates = matched
-                    else:
-                        auto_matched = [p for p in healthy_proxies if p.country in ("AUTO", "ALL", "")]
-                        if auto_matched:
-                            candidates = auto_matched
-
-                proxy_info = candidates[self._current_index % len(candidates)]
-                self._current_index += 1
+                # Untuk HypeProxy: Langsung return URL proxy tanpa beban API tambahan
                 return proxy_info.raw_url
 
             # Legacy free proxy (single-use)
@@ -1186,7 +1124,7 @@ class ProxyManager:
         session_id: Optional[str] = None,
         auto_replenish: bool = True,
     ) -> Optional[str]:
-        """Mengambil proxy berikutnya secara round-robin (memprioritaskan slot sehat & negara cocok)."""
+        """Mengambil proxy berikutnya secara round-robin."""
         self.reload_if_modified()
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
@@ -1195,30 +1133,12 @@ class ProxyManager:
             if not self.parsed_proxies:
                 return None
 
-            now = time.time()
-            healthy_proxies = [p for p in self.parsed_proxies if getattr(p, "cooldown_until", 0.0) <= now]
-            if not healthy_proxies:
-                healthy_proxies = self.parsed_proxies
+            proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
+            self._current_index += 1
 
-            target_country = str(country_code).upper().strip() if country_code else None
-
-            if self.is_brightdata:
-                proxy_info = healthy_proxies[self._current_index % len(healthy_proxies)]
-                self._current_index += 1
+            if proxy_info.is_brightdata:
                 return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
 
-            candidates = healthy_proxies
-            if target_country and target_country not in ("RANDOM", "ALL", "AUTO"):
-                matched = [p for p in healthy_proxies if p.country == target_country]
-                if matched:
-                    candidates = matched
-                else:
-                    auto_matched = [p for p in healthy_proxies if p.country in ("AUTO", "ALL", "")]
-                    if auto_matched:
-                        candidates = auto_matched
-
-            proxy_info = candidates[self._current_index % len(candidates)]
-            self._current_index += 1
             return proxy_info.raw_url
 
     def get_base_fallback_proxy(self) -> Optional[str]:

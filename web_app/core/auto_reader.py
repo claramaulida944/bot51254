@@ -581,7 +581,7 @@ class GuestReaderSession(BaseReaderSession):
                 resp.raise_for_status()
                 data = resp.json()
                 self.guest_id = data.get("guest_id")
-                self.guest_token = data.get("guest_token")
+                self.guest_token = data.get("guest_token") or resp.cookies.get("qf_guest_reader")
 
                 if self.guest_token:
                     client.headers["x-guest-token"] = self.guest_token
@@ -639,8 +639,12 @@ class GuestReaderSession(BaseReaderSession):
 
             get_resp.raise_for_status()
             ch_data = get_resp.json()
-            content = ch_data.get("content", "")
-            char_count = len(content)
+            content = ch_data.get("content") or ""
+            char_count = len(content) if content else int(chapter.get("char_count") or 1500)
+            reading_access = ch_data.get("reading_access") or {}
+            is_blocked = reading_access.get("acquisition_body_blocked", False)
+            if is_blocked:
+                return False, "QUARTERFULL_GATE_BLOCKED (Trusted Chapter Access Required)"
         except Exception as exc:
             if is_dead_or_proxy_error(exc):
                 if self.proxy:
@@ -694,10 +698,14 @@ class GuestReaderSession(BaseReaderSession):
             }
             try:
                 put_resp = await client.put("/api/guest-reading/progress", json=progress_payload)
+                if put_resp.status_code == 409 or "trusted chapter access" in put_resp.text:
+                    return False, "QUARTERFULL_GATE_BLOCKED (Trusted Chapter Access Required)"
                 if is_last:
                     put_resp.raise_for_status()
             except Exception as exc:
                 if is_last:
+                    if "409" in str(exc) or "trusted chapter access" in str(exc):
+                        return False, "QUARTERFULL_GATE_BLOCKED (Trusted Chapter Access Required)"
                     return False, f"PUT Progress Gagal: {exc}"
 
         return True, "200 OK (Heartbeat Berkala Selesai)"
@@ -1199,11 +1207,13 @@ class ReadingSimulationOrchestrator:
         origin_country: str = "ID",
         skip_already_read: bool = True,
         inter_chapter_delay: float = 3.0,
+        fresh_accounts_pool: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.novel_id: str = novel_id
         self.novel_title: str = novel_title
         self.chapters: List[Dict[str, Any]] = chapters
         self.member_accounts: List[Dict[str, Any]] = member_accounts
+        self.fresh_accounts_pool: List[Dict[str, Any]] = list(fresh_accounts_pool or [])
         self.guest_count: int = guest_count
         self.max_concurrency: int = max(1, max_concurrency)
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -1220,6 +1230,136 @@ class ReadingSimulationOrchestrator:
         self.total_readers: int = len(member_accounts) + guest_count
         self.background_tasks: set = set()
         self.results: List[Dict[str, Any]] = []
+
+    def _save_new_account(self, acc_data: Dict[str, Any], file_path: str = "akun.txt") -> None:
+        """Menyimpan akun baru hasil auto-upgrade ke file akun.txt (thread-safe)."""
+        candidate_paths = [
+            Path(file_path),
+            Path("akun.txt"),
+            Path(__file__).parent / "akun.txt",
+            Path.cwd() / "akun.txt",
+            Path(__file__).parent.parent / "akun.txt",
+        ]
+        target_files = set()
+        for p in candidate_paths:
+            if p.is_file():
+                target_files.add(p.resolve())
+        if not target_files:
+            target_files.add(Path(file_path).resolve())
+
+        try:
+            with _account_file_lock:
+                for tf in target_files:
+                    with open(tf, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(acc_data, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("Gagal append akun baru: %s", exc)
+
+    async def _upgrade_guest_to_member(
+        self,
+        worker_id: str,
+        country: str = "ID",
+        proxy: Optional[str] = None,
+        novel_title: str = "Novel",
+    ) -> Tuple[Optional[MemberReaderSession], Dict[str, Any]]:
+        """
+        Mengonversi sesi Guest menjadi Member secara otomatis saat menghadapi gate akuisisi Quarterfull (Bab 3+).
+        1. Coba ambil akun segar dari pool akun yang belum membaca novel ini jika ada.
+        2. Jika pool kosong, lakukan pendaftaran instan akun baru via POST /api/auth/signup.
+        3. Simpan akun ke akun.txt jika akun baru dibuat.
+        4. Kembalikan MemberReaderSession siap pakai untuk membaca seluruh bab hingga tuntas 100%.
+        """
+        # 1. Coba ambil akun segar dari pool jika tersedia
+        if self.fresh_accounts_pool:
+            try:
+                acc = self.fresh_accounts_pool.pop(0)
+                member_sess = MemberReaderSession(
+                    worker_id=worker_id,
+                    account_data=acc,
+                    novel_title=novel_title,
+                    proxy=proxy,
+                    proxy_manager=self.proxy_manager,
+                )
+                logger.info("[%s] Sesi Guest memanfaatkan akun segar (%s) untuk membuka seluruh bab!", worker_id, acc.get("email"))
+                return member_sess, acc
+            except Exception:
+                pass
+
+        # 2. Pendaftaran instan akun baru via POST /api/auth/signup
+        try:
+            import uuid
+            base_url = "https://api.quarterfull.io"
+            email = f"reader_{uuid.uuid4().hex[:8]}@gmail.com"
+            password = f"Pass_{secrets.token_hex(4)}!1"
+            dev_id = str(uuid.uuid4())
+            tz_str = "Asia/Jakarta" if country == "ID" else "UTC"
+
+            headers = {
+                "user-agent": "okhttp/4.12.0",
+                "x-platform": "android",
+                "x-app-variant": "prod",
+                "x-app-version": "3.0.52",
+                "x-timezone": tz_str,
+                "x-local-date": datetime.now().strftime("%Y-%m-%d"),
+                "x-user-country": country,
+                "x-user-raw-country": country,
+                "accept-language": "id-ID,id;q=0.9" if country == "ID" else "en-US,en;q=0.9",
+                "x-device-id": dev_id,
+                "content-type": "application/json",
+                "accept": "application/json",
+            }
+
+            payload = {
+                "email": email,
+                "password": password,
+                "password_confirm": password,
+                "birth_date": "2001-05-15",
+                "gender": "male",
+                "is_agree_terms": True,
+                "meta_attribution": {"source_site": "appsflyer"},
+                "skip_email_verification": True,
+                "signup_market_country": country,
+                "signup_market_source": "auto",
+            }
+
+            kwargs = {
+                "base_url": base_url,
+                "timeout": httpx.Timeout(12.0, connect=4.0),
+                "http2": False if proxy else True,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy
+
+            async with httpx.AsyncClient(**kwargs) as client:
+                resp = await client.post("/api/auth/signup", headers=headers, json=payload)
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    new_acc = {
+                        "email": email,
+                        "password": password,
+                        "nickname": email.split("@")[0],
+                        "access_token": data.get("access_token"),
+                        "refresh_token": data.get("refresh_token"),
+                        "user_id": data.get("user_id"),
+                        "device_id": dev_id,
+                        "user_agent": "okhttp/4.12.0",
+                        "country": country,
+                        "created_at": datetime.now().isoformat(),
+                    }
+                    self._save_new_account(new_acc)
+                    logger.info("[%s] Sesi Guest otomatis mendaftar akun baru (%s) untuk membuka seluruh bab!", worker_id, email)
+                    member_sess = MemberReaderSession(
+                        worker_id=worker_id,
+                        account_data=new_acc,
+                        novel_title=novel_title,
+                        proxy=proxy,
+                        proxy_manager=self.proxy_manager,
+                    )
+                    return member_sess, new_acc
+        except Exception as exc:
+            logger.debug("[%s] Gagal upgrade guest ke member: %s", worker_id, exc)
+
+        return None, {}
 
     def _get_proxy_for_worker(self, country_code: str = "ID", session_id: Optional[str] = None) -> Optional[str]:
         if not self.proxy_manager.has_proxies:
@@ -1410,6 +1550,7 @@ class ReadingSimulationOrchestrator:
                     await session.close()
                     return
 
+                current_session: BaseReaderSession = session
                 ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
                 total_chs = len(self.chapters)
                 ch_read_count = 0
@@ -1421,7 +1562,26 @@ class ReadingSimulationOrchestrator:
                     )
 
                     read_sec = random.uniform(self.base_delay * 0.8, self.base_delay * 1.3)
-                    success, status_msg = await session.read_chapter(self.novel_id, ch, read_sec)
+                    success, status_msg = await current_session.read_chapter(self.novel_id, ch, read_sec)
+
+                    # Jika terhalang gate registrasi Quarterfull (Bab 3+), upgrade otomatis ke Akun Member
+                    if not success and ("QUARTERFULL_GATE_BLOCKED" in status_msg or "409" in status_msg or "trusted chapter access" in status_msg):
+                        progress.update(
+                            task_id,
+                            description=f"[cyan]Bab {ch_num} (Gate Signup -> Auto-Upgrade Member)[/]",
+                        )
+                        upgraded_sess, acc_info = await self._upgrade_guest_to_member(
+                            worker_id=worker_id,
+                            country=proxy_cc,
+                            proxy=current_session.proxy,
+                            novel_title=self.novel_title,
+                        )
+                        if upgraded_sess:
+                            await current_session.close()
+                            current_session = upgraded_sess
+                            ident = f"Member:{acc_info.get('email', '')[:10]}"
+                            # Baca ulang bab ini dengan sesi member yang baru terupgrade
+                            success, status_msg = await current_session.read_chapter(self.novel_id, ch, read_sec)
 
                     if success:
                         ch_read_count += 1
@@ -1432,47 +1592,48 @@ class ReadingSimulationOrchestrator:
                     if ch_idx < total_chs and success and self.inter_chapter_delay > 0:
                         next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
                         await self._inter_chapter_pause(
-                            session=session,
+                            session=current_session,
                             worker_id=worker_id,
                             task_id=task_id,
                             progress=progress,
                             chapter=ch,
                             next_chapter_num=next_ch_num,
                             pause_seconds=self.inter_chapter_delay,
-                            is_guest=True,
+                            is_guest=not isinstance(current_session, MemberReaderSession),
                         )
 
                 progress.update(task_id, description="[bold green]Selesai [OK][/]")
                 self.results.append({
                     "worker_id": worker_id,
-                    "type": "Guest",
+                    "type": "Guest (Upgraded)" if isinstance(current_session, MemberReaderSession) else "Guest",
                     "ident": ident,
                     "country": proxy_cc,
                     "chapters_read": ch_read_count,
                     "status": "[green]Sukses[/]",
                 })
-                if session.proxy:
-                    self.proxy_manager.mark_used(session.proxy)
+                if current_session.proxy:
+                    self.proxy_manager.mark_used(current_session.proxy)
 
-                detached_client = session.detach_client()
+                detached_client = current_session.detach_client()
                 if detached_client:
                     bg_task = asyncio.create_task(
                         self._background_dwell_pulser(
                             client=detached_client,
                             worker_id=worker_id,
-                            is_guest=True,
+                            is_guest=not isinstance(current_session, MemberReaderSession),
                             novel_id=self.novel_id,
                             chapters=self.chapters,
                             session_info={
-                                "guest_id": session.guest_id,
-                                "guest_token": session.guest_token,
+                                "token": getattr(current_session, "access_token", getattr(current_session, "guest_token", "")),
+                                "country": current_session.country,
+                                "novel_title": self.novel_title,
                             },
                         )
                     )
                     self.background_tasks.add(bg_task)
                     bg_task.add_done_callback(self.background_tasks.discard)
 
-                await session.close()
+                await current_session.close()
             finally:
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, task_id))
@@ -2121,6 +2282,7 @@ async def main_async(preset_novel_id: Optional[str] = None) -> None:
         origin_country=novel_info.get("origin_country", "ID") or "ID",
         skip_already_read=skip_already_read,
         inter_chapter_delay=inter_chapter_delay,
+        fresh_accounts_pool=fresh_accounts[member_count:],
     )
 
     start_time = time.time()
