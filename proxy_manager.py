@@ -262,20 +262,6 @@ class ProxyInfo:
         Jika ini adalah proxy Bright Data, parameter `-country-xx` akan disesuaikan.
         Jika ini adalah proxy HypeProxy, region dapat disesuaikan melalui API HypeProxy.
         """
-        if self.is_hypeproxy and self.proxy_id and country_code:
-            target_country = str(country_code).upper().strip()
-            if target_country and target_country not in ("RANDOM", "ALL", "AUTO"):
-                if getattr(self, "_current_hype_country", None) != target_country:
-                    try:
-                        # Panggil API HypeProxy PATCH /api/proxies/:id/region
-                        res = HypeProxyClient.set_proxy_region(self.proxy_id, target_country)
-                        if res and (res.get("ok") or res.get("message") == "Slot updated" or "updated" in str(res).lower()):
-                            self._current_hype_country = target_country
-                            logger.info(f"[HypeProxy] Slot #{self.proxy_id} berhasil dialihkan ke region {target_country}")
-                    except Exception as e:
-                        logger.debug(f"[HypeProxy] Gagal ubah region slot #{self.proxy_id}: {e}")
-            return self.raw_url
-
         if not self.is_brightdata:
             return self.raw_url
 
