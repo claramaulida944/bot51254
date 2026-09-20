@@ -261,30 +261,11 @@ class NovelTargetResolver:
         last_exc = None
         active_token = auth_token or cls._cached_auth_token or cls.get_auth_token(force_refresh=False)
 
-        # 1. Jika proxy tidak ditentukan secara spesifik, coba direct connection terlebih dahulu
-        if not proxy:
-            try:
-                d_headers = {"user-agent": "okhttp/4.12.0"}
-                if active_token:
-                    d_headers["authorization"] = f"Bearer {active_token}"
-                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(10.0, connect=6.0), http2=True) as d_client:
-                    resp = await d_client.get(url)
-                    if resp.status_code == 404 and "adult_access_required" in resp.text:
-                        active_token = cls.get_auth_token(force_refresh=False)
-                        if active_token:
-                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
-                    elif resp.status_code == 401 and active_token:
-                        active_token = cls.get_auth_token(force_refresh=True)
-                        if active_token:
-                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
-                    if resp.status_code == 200:
-                        data = resp.json()
-            except Exception as exc:
-                last_exc = exc
-
-        # 2. Jika direct gagal atau proxy ditentukan secara eksplisit, gunakan rotasi proxy
-        if not data and (proxy or (default_proxy_manager and default_proxy_manager.has_proxies)):
-            attempts = 2 if not proxy else 1
+        # 1. Jika proxy tersedia (atau ditentukan), prioritaskan rotasi proxy tanpa pernah mencoba direct IP
+        has_proxy_pool = bool(proxy or (default_proxy_manager and default_proxy_manager.has_proxies))
+        if has_proxy_pool:
+            pool_len = len(default_proxy_manager.parsed_proxies) if default_proxy_manager else 1
+            attempts = min(5, max(3, pool_len)) if not proxy else 1
             for attempt in range(1, attempts + 1):
                 current_proxy = proxy or default_proxy_manager.get_proxy()
                 if not current_proxy:
@@ -293,8 +274,9 @@ class NovelTargetResolver:
                 if active_token:
                     headers["authorization"] = f"Bearer {active_token}"
 
+                failed = False
                 try:
-                    async with httpx.AsyncClient(headers=headers, proxy=current_proxy, http2=False, timeout=httpx.Timeout(15.0, connect=10.0)) as client:
+                    async with httpx.AsyncClient(headers=headers, proxy=current_proxy, http2=False, timeout=httpx.Timeout(8.0, connect=3.5)) as client:
                         resp = await client.get(url)
                         if resp.status_code == 404 and "adult_access_required" in resp.text:
                             active_token = cls.get_auth_token(force_refresh=False)
@@ -310,25 +292,32 @@ class NovelTargetResolver:
                             if default_proxy_manager and not proxy:
                                 default_proxy_manager.mark_used(current_proxy)
                             break
+                        else:
+                            last_exc = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:100]}")
                 except Exception as exc:
                     last_exc = exc
+                    failed = True
                     if default_proxy_manager and not proxy:
                         default_proxy_manager.mark_failed(current_proxy, exc)
                     continue
                 finally:
-                    if default_proxy_manager and not proxy and current_proxy:
+                    if not failed and default_proxy_manager and not proxy and current_proxy:
                         default_proxy_manager.release_proxy_slot(current_proxy)
 
-        # 3. Fallback terakhir jika proxy gagal
-        if not data:
+        # 2. Hanya jika proxy SAMA SEKALI TIDAK ADA di proxies.txt, baru coba direct connection
+        if not data and not has_proxy_pool:
             try:
                 d_headers = {"user-agent": "okhttp/4.12.0"}
                 if active_token:
                     d_headers["authorization"] = f"Bearer {active_token}"
-                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(12.0, connect=8.0), http2=True) as d_client:
+                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(8.0, connect=4.0), http2=True) as d_client:
                     resp = await d_client.get(url)
                     if resp.status_code == 404 and "adult_access_required" in resp.text:
                         active_token = cls.get_auth_token(force_refresh=False)
+                        if active_token:
+                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
+                    elif resp.status_code == 401 and active_token:
+                        active_token = cls.get_auth_token(force_refresh=True)
                         if active_token:
                             resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
                     if resp.status_code == 200:
@@ -368,7 +357,7 @@ class NovelTargetResolver:
 
             client_kwargs: Dict[str, Any] = {
                 "headers": headers,
-                "timeout": httpx.Timeout(15.0, connect=10.0) if target_proxy else httpx.Timeout(12.0, connect=8.0),
+                "timeout": httpx.Timeout(12.0, connect=3.5) if target_proxy else httpx.Timeout(8.0, connect=4.0),
             }
             if target_proxy:
                 client_kwargs["proxy"] = target_proxy
@@ -407,17 +396,13 @@ class NovelTargetResolver:
             readable_list.sort(key=lambda x: x.get("chapter_num", 0))
             return readable_list
 
-        # Jika proxy tidak ditentukan secara eksplisit, coba direct connection terlebih dahulu (0.3s)
         last_exc = None
-        if not proxy:
-            try:
-                return await _query_chapters(target_proxy=None)
-            except Exception as exc:
-                last_exc = exc
+        has_proxy_pool = bool(proxy or (default_proxy_manager and default_proxy_manager.has_proxies))
 
-        # Jika direct gagal atau proxy ditentukan, coba via proxy
-        if proxy or (default_proxy_manager and default_proxy_manager.has_proxies):
-            attempts = 2 if not proxy else 1
+        # 1. Jika proxy tersedia (atau ditentukan), prioritaskan rotasi proxy
+        if has_proxy_pool:
+            pool_len = len(default_proxy_manager.parsed_proxies) if default_proxy_manager else 1
+            attempts = min(5, max(3, pool_len)) if not proxy else 1
             for attempt in range(1, attempts + 1):
                 if attempt == 1 and proxy:
                     curr_proxy = proxy
@@ -435,6 +420,7 @@ class NovelTargetResolver:
                 if not curr_proxy:
                     continue
 
+                failed = False
                 try:
                     res = await _query_chapters(curr_proxy)
                     if default_proxy_manager and not proxy:
@@ -442,18 +428,20 @@ class NovelTargetResolver:
                     return res
                 except Exception as exc:
                     last_exc = exc
+                    failed = True
                     if default_proxy_manager and not proxy:
                         default_proxy_manager.mark_failed(curr_proxy, exc)
                     continue
                 finally:
-                    if default_proxy_manager and not proxy and curr_proxy:
+                    if not failed and default_proxy_manager and not proxy and curr_proxy:
                         default_proxy_manager.release_proxy_slot(curr_proxy)
 
-        # Fallback terakhir jika proxy gagal: coba direct connection
-        try:
-            return await _query_chapters(target_proxy=None)
-        except Exception as exc:
-            last_exc = exc
+        # 2. Hanya jika proxy SAMA SEKALI TIDAK ADA di proxies.txt, baru coba direct connection
+        if not has_proxy_pool:
+            try:
+                return await _query_chapters(target_proxy=None)
+            except Exception as exc:
+                last_exc = exc
 
         if last_exc:
             raise last_exc
