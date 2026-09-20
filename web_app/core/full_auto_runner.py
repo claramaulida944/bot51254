@@ -121,6 +121,8 @@ class FullAutoWorker:
         raw_cc = str(account.get("country", "ID")).upper().strip()
         self.country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
         cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+        self.service_country = cfg.get("service_country", self.country)
+        self.raw_country = cfg.get("raw_country", self.country)
         self.timezone = cfg["timezone"]
         self.lang = cfg["lang"]
 
@@ -198,8 +200,8 @@ class FullAutoWorker:
             "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
             "accept-language": self.lang,
-            "x-user-country": self.country,
-            "x-user-raw-country": self.country,
+            "x-user-country": self.service_country,
+            "x-user-raw-country": self.raw_country,
             "x-device-id": self.device_id,
             "authorization": f"Bearer {self.access_token}",
             "content-type": "application/json",
@@ -740,6 +742,8 @@ class FullAutoOrchestrator:
                         self.proxy_manager.mark_used(proxy)
                 return res
             finally:
+                if proxy:
+                    self.proxy_manager.release_proxy_slot(proxy)
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, tid))
 

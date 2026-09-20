@@ -102,6 +102,9 @@ class IdentifierGenerator:
         return f"guest-open:{chapter_hash_id}:{timestamp_ms}:{rand_b36}"
 
 
+from proxy_manager import SUPPORTED_QUARTERFULL_COUNTRIES, resolve_service_country
+
+
 class ToodatGuestClient:
     """
     Klien HTTP/2 untuk simulasi interaksi pengguna tamu (guest reader)
@@ -113,26 +116,37 @@ class ToodatGuestClient:
     PLATFORM: str = "android"
     APP_VARIANT: str = "prod"
     APP_VERSION: str = "3.0.52"
-    TIMEZONE: str = "Asia/Jakarta"
-    COUNTRY: str = "ID"
-    LANGUAGE: str = "id"
 
     def __init__(
         self,
         device_id: Optional[str] = None,
+        country: str = "ID",
         timeout: float = 30.0,
         verify_ssl: bool = True,
+        proxy: Optional[str] = None,
     ) -> None:
         """
         Inisialisasi klien dengan Device ID dan konfigurasi HTTP/2.
 
         :param device_id: UUID v4 device ID klien (akan di-generate jika None).
+        :param country: Kode negara reader resmi Quarterfull (cth: 'ID', 'US', 'JP', dsb).
         :param timeout: Durasi timeout koneksi dalam detik.
         :param verify_ssl: Verifikasi sertifikat SSL server.
+        :param proxy: URL proxy opsional.
         """
         self.device_id: str = device_id or IdentifierGenerator.generate_device_id()
         self.guest_id: Optional[str] = None
         self.guest_token: Optional[str] = None
+
+        clean_country = str(country or "ID").upper().strip()
+        if clean_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
+            clean_country = "ID"
+        self.country = clean_country
+        cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+        self.service_country: str = cfg.get("service_country", self.country)
+        self.raw_country: str = cfg.get("raw_country", self.country)
+        self.timezone: str = cfg["timezone"]
+        self.language: str = cfg["lang"]
 
         # Siapkan base headers default
         headers = {
@@ -142,34 +156,41 @@ class ToodatGuestClient:
             "x-platform": self.PLATFORM,
             "x-app-variant": self.APP_VARIANT,
             "x-app-version": self.APP_VERSION,
-            "x-timezone": self.TIMEZONE,
+            "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
-            "x-user-country": self.COUNTRY,
-            "x-user-raw-country": self.COUNTRY,
-            "accept-language": self.LANGUAGE,
+            "x-user-country": self.service_country,
+            "x-user-raw-country": self.raw_country,
+            "accept-language": self.language,
             "x-device-id": self.device_id,
             "accept": "application/json",
         }
 
-        # Inisialisasi httpx.Client dengan protokol HTTP/2
-        self._client: httpx.Client = httpx.Client(
-            base_url=self.BASE_URL,
-            http2=True,
-            headers=headers,
-            timeout=httpx.Timeout(timeout),
-            verify=verify_ssl,
-        )
+        client_kwargs: Dict[str, Any] = {
+            "base_url": self.BASE_URL,
+            "http2": False if proxy else True,
+            "headers": headers,
+            "timeout": httpx.Timeout(timeout),
+            "verify": verify_ssl,
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        # Inisialisasi httpx.Client dengan protokol HTTP/2 (atau HTTP/1.1 via proxy)
+        self._client: httpx.Client = httpx.Client(**client_kwargs)
 
         logger.info(
-            "ToodatGuestClient berhasil diinisialisasi [Device ID: %s, HTTP/2: True]",
+            "ToodatGuestClient berhasil diinisialisasi [Device ID: %s, Country: %s/%s, HTTP/2: %s]",
             self.device_id,
+            self.service_country,
+            self.raw_country,
+            not bool(proxy),
         )
 
     def _get_current_local_date(self) -> str:
-        """Mengembalikan tanggal lokal saat ini dalam format YYYY-MM-DD sesuai zona waktu Asia/Jakarta."""
+        """Mengembalikan tanggal lokal saat ini dalam format YYYY-MM-DD sesuai zona waktu yang dikonfigurasi."""
         try:
             if ZoneInfo is not None:
-                now = datetime.now(ZoneInfo(self.TIMEZONE))
+                now = datetime.now(ZoneInfo(self.timezone))
             else:
                 now = datetime.now()
             return now.strftime("%Y-%m-%d")

@@ -121,6 +121,8 @@ class FullAutoWorker:
         raw_cc = str(account.get("country", "ID")).upper().strip()
         self.country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
         cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+        self.service_country = cfg.get("service_country", self.country)
+        self.raw_country = cfg.get("raw_country", self.country)
         self.timezone = cfg["timezone"]
         self.lang = cfg["lang"]
 
@@ -148,7 +150,7 @@ class FullAutoWorker:
         """
         Mengambil daftar ID bab (dan nomor bab) yang sudah pernah dibaca oleh akun ini.
         Endpoint: GET /api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=true
-        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca.
+        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca (is_read=True atau reading_progress >= 0.95).
         """
         read_set = set()
         url = f"/api/v1/novels/{self.novel_id}/chapters"
@@ -159,7 +161,7 @@ class FullAutoWorker:
             "include_read_progress": "true",
         }
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, timeout=httpx.Timeout(10.0, connect=4.0))
             if resp.status_code == 200:
                 data = resp.json()
                 items = data.get("items", [])
@@ -198,8 +200,8 @@ class FullAutoWorker:
             "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
             "accept-language": self.lang,
-            "x-user-country": self.country,
-            "x-user-raw-country": self.country,
+            "x-user-country": self.service_country,
+            "x-user-raw-country": self.raw_country,
             "x-device-id": self.device_id,
             "authorization": f"Bearer {self.access_token}",
             "content-type": "application/json",
@@ -769,6 +771,8 @@ class FullAutoOrchestrator:
                         self.proxy_manager.mark_used(proxy)
                 return res
             finally:
+                if proxy:
+                    self.proxy_manager.release_proxy_slot(proxy)
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, tid))
 

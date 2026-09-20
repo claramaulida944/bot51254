@@ -55,6 +55,8 @@ from proxy_manager import (
     is_dead_or_proxy_error,
     sanitize_proxy_url,
     get_weighted_royalty_country,
+    SUPPORTED_QUARTERFULL_COUNTRIES,
+    resolve_service_country,
 )
 
 # Konfigurasi logging
@@ -473,9 +475,9 @@ class HighEntropyProfileGenerator:
             selected_country = get_weighted_royalty_country(all_countries)
         else:
             selected_country = country_code.upper()
-            if selected_country not in COUNTRY_CONFIG:
+            if selected_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
                 logger.warning(
-                    "Kode negara '%s' tidak ditemukan dalam katalog. Menggunakan negara acak berbobot royalti.",
+                    "Kode negara '%s' tidak didukung resmi oleh Quarterfull. Menggunakan negara acak berbobot royalti.",
                     selected_country,
                 )
                 selected_country = get_weighted_royalty_country(all_countries)
@@ -626,7 +628,7 @@ OFFICIAL_SERVICE_MARKETS = {
     "AT", "BR", "DE", "DK", "EN", "ES", "SE", "FR", "HK", "ID", "IN", "IT",
     "NL", "NO", "FI", "PL", "HU", "PT", "CZ", "JP", "AR", "PE", "CL", "EC",
     "DO", "GT", "PA", "BO", "VE", "PY", "HN", "SV", "NI", "CO", "MX", "KR",
-    "MY", "PH", "SG", "TH", "TR", "TW", "VN"
+    "MY", "MO", "PH", "SG", "TH", "TR", "TW", "UK", "VN"
 }
 
 
@@ -750,6 +752,8 @@ class RegistrationRunner:
         except Exception:
             current_date = datetime.now().strftime("%Y-%m-%d")
 
+        service_country, raw_country = resolve_service_country(profile.country)
+
         headers = {
             "host": "api.quarterfull.io",
             "user-agent": user_agent,
@@ -759,8 +763,8 @@ class RegistrationRunner:
             "x-app-version": "3.0.52",
             "x-timezone": profile.timezone,
             "x-local-date": current_date,
-            "x-user-country": profile.country,
-            "x-user-raw-country": profile.country,
+            "x-user-country": service_country,
+            "x-user-raw-country": raw_country,
             "accept-language": profile.accept_language,
             "x-device-id": device_id,
             "content-type": "application/json",

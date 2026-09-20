@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sys
 import threading
 import time
@@ -22,7 +23,10 @@ if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
 from token_manager import TokenManager, OWNER_WHATSAPP
-from proxy_manager import ProxyManager, default_proxy_manager, HypeProxyClient, get_weighted_royalty_country
+from proxy_manager import (
+    ProxyManager, default_proxy_manager, HypeProxyClient,
+    get_weighted_royalty_country, SUPPORTED_QUARTERFULL_COUNTRIES, resolve_service_country
+)
 from auto_reader import NovelTargetResolver, MemberReaderSession, GuestReaderSession
 from full_auto_runner import FullAutoWorker
 from interaction_manager import SocialInteractionBot
@@ -169,6 +173,8 @@ class BotBridge:
         # Filter berdasarkan negara jika user memilih lock country spesifik
         if target_country and target_country.upper().strip() not in ("RANDOM", "ALL", "AUTO"):
             req_cc = target_country.upper().strip()
+            if req_cc not in SUPPORTED_QUARTERFULL_COUNTRIES:
+                req_cc = "ID"
             matching_accounts = [acc for acc in all_accounts if acc.get("country", "").upper() == req_cc]
             candidate_pool = matching_accounts if matching_accounts else all_accounts
         else:
@@ -200,30 +206,20 @@ class BotBridge:
     @classmethod
     def get_token_dedicated_proxy(cls, token_code: str, target_country: Optional[str] = None) -> Optional[str]:
         """
-        Mengalokasikan node proxy residensial khusus untuk token tersebut
-        agar lalu lintas jaringan antar token terisolasi pada IP node yang berbeda.
-        Dapat disesuaikan dengan negara target (lock country).
+        Mengalokasikan node proxy dengan Slot Lease Governor agar lalu lintas jaringan
+        terbagi merata pada slot yang minim beban, menghindari tabrakan dan perebutan port.
         """
         if not default_proxy_manager or not default_proxy_manager.has_proxies:
             return None
-        
-        parsed = getattr(default_proxy_manager, "parsed_proxies", [])
-        if not parsed:
-            return None
-            
-        token_hash = int(hashlib.sha256(token_code.strip().upper().encode()).hexdigest(), 16)
-        dedicated_slot = token_hash % len(parsed)
-        p_obj = parsed[dedicated_slot]
 
+        req_cc = None
         if target_country and target_country.upper().strip() not in ("RANDOM", "ALL", "AUTO"):
             req_cc = target_country.upper().strip()
-            sess_id = f"tok_{token_code.lower().replace('-', '')[:8]}"
-            try:
-                return p_obj.format_for_country(country_code=req_cc, session_id=sess_id)
-            except Exception:
-                return getattr(p_obj, "raw_url", None)
+            if req_cc not in SUPPORTED_QUARTERFULL_COUNTRIES:
+                req_cc = "ID"
 
-        return getattr(p_obj, "raw_url", None)
+        sess_id = f"tok_{token_code.lower().replace('-', '')[:8]}"
+        return default_proxy_manager.acquire_proxy_slot(country_code=req_cc, session_id=sess_id)
 
     @classmethod
     async def get_novel_info(cls, raw_url_or_id: str) -> Dict[str, Any]:
@@ -369,6 +365,12 @@ class BotBridge:
         """
         target_country = (task.config.get("country") or "RANDOM").upper().strip()
         is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
+        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
+            await task.emit_log(
+                f"[GEO] Target negara '{target_country}' tidak didukung Quarterfull. Dialihkan otomatis ke 'ID'.",
+                level="warning"
+            )
+            target_country = "ID"
         country_display = target_country if is_locked else "Global / Multi-Negara"
 
         target_sessions = min(int(task.config.get("accounts_count", 5)), 100)
@@ -401,7 +403,6 @@ class BotBridge:
 
         task.stats["accounts_total"] = min(target_sessions, len(fresh_accounts))
         proxy_mgr = default_proxy_manager
-        dedicated_proxy = cls.get_token_dedicated_proxy(task.token_code, target_country=target_country)
         delay_sec = float(task.config.get("reading_delay", 5.0))
 
         await task.emit_log(
@@ -441,7 +442,8 @@ class BotBridge:
                 acc_data["country"] = target_country
 
             proxy_country = target_country if is_locked else acc_data.get("country")
-            proxy_url = dedicated_proxy or (proxy_mgr.get_proxy(country_code=proxy_country) if proxy_mgr.has_proxies else None)
+            sess_id = f"mbr_{task.token_code[:6]}_{candidate_idx}_{secrets.token_hex(2)}"
+            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_country, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
 
             session = MemberReaderSession(
                 worker_id=f"W-{successful_sessions + 1:02d}",
@@ -451,135 +453,145 @@ class BotBridge:
                 proxy_manager=proxy_mgr,
             )
 
-            # Validasi Real-time ke Server: Pastikan akun belum pernah membaca/like/bookmark di server
             try:
-                client = await session.get_client()
-                server_check = await AccountHistoryManager.check_server_interaction(client, acc_data, novel_id)
-                if server_check.get("already_interacted"):
-                    await task.emit_log(
-                        f"Akun #{candidate_idx} ({acc.get('email')}) dilewati (Skip): Terdeteksi {server_check['reason']} di server. Mencari akun segar berikutnya...",
-                        level="warning"
-                    )
+                # Validasi Real-time ke Server: Pastikan akun belum pernah membaca/like/bookmark di server
+                try:
+                    client = await session.get_client()
+                    server_check = await AccountHistoryManager.check_server_interaction(client, acc_data, novel_id)
+                    if server_check.get("already_interacted"):
+                        await task.emit_log(
+                            f"Akun #{candidate_idx} ({acc.get('email')}) dilewati (Skip): Terdeteksi {server_check['reason']} di server. Mencari akun segar berikutnya...",
+                            level="warning"
+                        )
+                        continue
+                except Exception as e_check:
+                    logger.debug("Pre-check server gagal, melanjutkan dengan akun: %s", e_check)
+
+                # Akun Segar Terverifikasi -> Jalankan Sesi
+                curr_worker = successful_sessions + 1
+                await task.emit_log(
+                    f"[{curr_worker}/{target_sessions}] Menjalankan sesi pembaca unik #{curr_worker} (Akun: {acc.get('email')}, Wilayah: {proxy_country})...",
+                    level="info"
+                )
+
+                # Ambil bab (gunakan cache hasil inspeksi atau fetch dengan origin country)
+                chapters = (task.novel_info or {}).get("chapters")
+                if not chapters:
+                    origin_cc = (task.novel_info or {}).get("origin_country", "ID")
+                    chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
+                if not chapters:
+                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Tidak ada bab yang dapat dibaca.", level="warning")
                     continue
-            except Exception as e_check:
-                logger.debug("Pre-check server gagal, melanjutkan dengan akun: %s", e_check)
 
-            # Akun Segar Terverifikasi -> Jalankan Sesi
-            curr_worker = successful_sessions + 1
-            await task.emit_log(
-                f"[{curr_worker}/{target_sessions}] Menjalankan sesi pembaca unik #{curr_worker} (Akun: {acc.get('email')}, Wilayah: {proxy_country})...",
-                level="info"
-            )
+                max_ch = min(len(chapters), int(task.config.get("max_chapters", 5)))
+                target_chapters = chapters[:max_ch]
 
-            # Ambil bab (gunakan cache hasil inspeksi atau fetch dengan origin country)
-            chapters = (task.novel_info or {}).get("chapters")
-            if not chapters:
-                origin_cc = (task.novel_info or {}).get("origin_country", "ID")
-                chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
-            if not chapters:
-                await task.emit_log(f"[{curr_worker}/{target_sessions}] Tidak ada bab yang dapat dibaca.", level="warning")
-                continue
-
-            max_ch = min(len(chapters), int(task.config.get("max_chapters", 5)))
-            target_chapters = chapters[:max_ch]
-
-            # Interaksi Sosial (Like, Bookmark, Follow)
-            try:
-                client = await session.get_client()
-
-                # A. Like Novel
+                # Interaksi Sosial (Like, Bookmark, Follow)
                 try:
-                    r_like = await client.post(f"/api/v1/novels/{novel_id}/like")
-                    if r_like.status_code == 200:
-                        l_data = r_like.json()
-                        if not l_data.get("is_liked", True):
-                            await asyncio.sleep(0.3)
-                            await client.post(f"/api/v1/novels/{novel_id}/like")
-                        AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
-                        task.stats["likes"] += 1
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyukai (Like) novel.", level="info")
-                    else:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Like server: HTTP {r_like.status_code}", level="warning")
-                except Exception as ex_like:
-                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Like: {ex_like}", level="warning")
+                    client = await session.get_client()
 
-                await asyncio.sleep(0.5)
-
-                # B. Bookmark Novel
-                try:
-                    r_bm = await client.post(f"/api/v1/novels/{novel_id}/bookmark")
-                    if r_bm.status_code == 200:
-                        b_data = r_bm.json()
-                        if not b_data.get("is_saved", True):
-                            await asyncio.sleep(0.3)
-                            await client.post(f"/api/v1/novels/{novel_id}/bookmark")
-                        AccountHistoryManager.record_interaction(acc_data, novel_id, bookmarked=True)
-                        task.stats["bookmarks"] += 1
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyimpan (Bookmark) novel.", level="info")
-                    else:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Bookmark server: HTTP {r_bm.status_code}", level="warning")
-                except Exception as ex_bm:
-                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Bookmark: {ex_bm}", level="warning")
-
-                await asyncio.sleep(0.5)
-
-                # C. Follow Author jika profile_id tersedia
-                author_pid = (task.novel_info or {}).get("author_profile_id")
-                if author_pid:
+                    # A. Like Novel
                     try:
-                        r_fol = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
-                        if r_fol.status_code in (200, 204):
-                            task.stats["follows"] += 1
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil mengikuti (Follow) penulis novel.", level="info")
-                    except Exception as ex_fol:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Follow: {ex_fol}", level="warning")
+                        r_like = await client.post(f"/api/v1/novels/{novel_id}/like")
+                        if r_like.status_code == 200:
+                            l_data = r_like.json()
+                            if not l_data.get("is_liked", True):
+                                await asyncio.sleep(0.3)
+                                await client.post(f"/api/v1/novels/{novel_id}/like")
+                            AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
+                            task.stats["likes"] += 1
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyukai (Like) novel.", level="info")
+                        else:
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Like server: HTTP {r_like.status_code}", level="warning")
+                    except Exception as ex_like:
+                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Like: {ex_like}", level="warning")
 
-            except Exception as e_social:
-                await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan interaksi sosial: {e_social}", level="warning")
+                    await asyncio.sleep(0.5)
 
-            # Eksekusi Pembacaan Bab
-            first_ch_read = False
-            session_read_success = False
+                    # B. Bookmark Novel
+                    try:
+                        r_bm = await client.post(f"/api/v1/novels/{novel_id}/bookmark")
+                        if r_bm.status_code == 200:
+                            b_data = r_bm.json()
+                            if not b_data.get("is_saved", True):
+                                await asyncio.sleep(0.3)
+                                await client.post(f"/api/v1/novels/{novel_id}/bookmark")
+                            AccountHistoryManager.record_interaction(acc_data, novel_id, bookmarked=True)
+                            task.stats["bookmarks"] += 1
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyimpan (Bookmark) novel.", level="info")
+                        else:
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Bookmark server: HTTP {r_bm.status_code}", level="warning")
+                    except Exception as ex_bm:
+                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Bookmark: {ex_bm}", level="warning")
 
-            for ch_idx, ch in enumerate(target_chapters, 1):
-                if task.is_cancelled:
-                    break
+                    await asyncio.sleep(0.5)
+
+                    # C. Follow Author jika profile_id tersedia
+                    author_pid = (task.novel_info or {}).get("author_profile_id")
+                    if author_pid:
+                        try:
+                            r_fol = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
+                            if r_fol.status_code in (200, 204):
+                                task.stats["follows"] += 1
+                                await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil mengikuti (Follow) penulis novel.", level="info")
+                        except Exception as ex_fol:
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Follow: {ex_fol}", level="warning")
+
+                except Exception as e_social:
+                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan interaksi sosial: {e_social}", level="warning")
+
+                # Eksekusi Pembacaan Bab
+                first_ch_read = False
+                session_read_success = False
+
+                for ch_idx, ch in enumerate(target_chapters, 1):
+                    if task.is_cancelled:
+                        break
+                    try:
+                        ok, msg = await session.read_chapter(novel_id, ch, reading_delay_sec=delay_sec)
+                        if ok:
+                            task.stats["chapters_read"] += 1
+                            session_read_success = True
+                            ch_num_val = ch.get("chapter_num", ch_idx)
+                            AccountHistoryManager.record_interaction(acc_data, novel_id, read=True, chapter_num=ch_num_val)
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Sukses membaca Bab #{ch_num_val}", level="info")
+
+                            # Potong saldo segera saat bab pertama berhasil dibaca
+                            if not first_ch_read:
+                                rate = TokenManager.get_rate("valid_reader")
+                                deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
+                                    task.token_code,
+                                    item_type="valid_reader",
+                                    quantity=1,
+                                    note=f"Sesi akun #{curr_worker} ({acc.get('email')}) membaca bab {ch_num_val}"
+                                )
+                                if deduct_ok:
+                                    task.stats["total_spent"] += rate
+                                    task.stats["current_balance"] = new_bal
+                                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Pembayaran sesi sukses (-Rp {rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
+                                first_ch_read = True
+
+                            await task.emit_stats()
+                        else:
+                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Bab #{ch.get('chapter_num', ch_idx)} tidak tercatat: {msg}", level="warning")
+                    except Exception as e:
+                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Kesalahan membaca bab: {e}", level="warning")
+
+                    await asyncio.sleep(delay_sec)
+
+                if session_read_success:
+                    successful_sessions += 1
+                    task.stats["accounts_done"] = successful_sessions
+                    await task.emit_stats()
+                    if proxy_url and proxy_mgr:
+                        proxy_mgr.mark_used(proxy_url)
+            finally:
+                if proxy_url and proxy_mgr:
+                    proxy_mgr.release_proxy_slot(proxy_url)
                 try:
-                    ok, msg = await session.read_chapter(novel_id, ch, reading_delay_sec=delay_sec)
-                    if ok:
-                        task.stats["chapters_read"] += 1
-                        session_read_success = True
-                        ch_num_val = ch.get("chapter_num", ch_idx)
-                        AccountHistoryManager.record_interaction(acc_data, novel_id, read=True, chapter_num=ch_num_val)
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Sukses membaca Bab #{ch_num_val}", level="info")
-
-                        # Potong saldo segera saat bab pertama berhasil dibaca
-                        if not first_ch_read:
-                            rate = TokenManager.get_rate("valid_reader")
-                            deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
-                                task.token_code,
-                                item_type="valid_reader",
-                                quantity=1,
-                                note=f"Sesi akun #{curr_worker} ({acc.get('email')}) membaca bab {ch_num_val}"
-                            )
-                            if deduct_ok:
-                                task.stats["total_spent"] += rate
-                                task.stats["current_balance"] = new_bal
-                                await task.emit_log(f"[{curr_worker}/{target_sessions}] Pembayaran sesi sukses (-Rp {rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
-                            first_ch_read = True
-
-                        await task.emit_stats()
-                    else:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Bab #{ch.get('chapter_num', ch_idx)} tidak tercatat: {msg}", level="warning")
-                except Exception as e:
-                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Kesalahan membaca bab: {e}", level="warning")
-
-                await asyncio.sleep(delay_sec)
-
-            if session_read_success:
-                successful_sessions += 1
-                task.stats["accounts_done"] = successful_sessions
-                await task.emit_stats()
+                    await session.close()
+                except Exception:
+                    pass
 
             # Jeda antar sesi pembaca unik
             await asyncio.sleep(1.5)
@@ -595,6 +607,12 @@ class BotBridge:
         guest_count = int(task.config.get("accounts_count", 20))
         target_country = (task.config.get("country") or "RANDOM").upper().strip()
         is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
+        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
+            await task.emit_log(
+                f"[GEO] Target negara '{target_country}' tidak didukung resmi oleh Quarterfull. Mengalihkan otomatis ke 'ID'.",
+                level="warning"
+            )
+            target_country = "ID"
         country_display = target_country if is_locked else "Global / Multi-Negara"
 
         task.stats["accounts_total"] = guest_count
@@ -619,7 +637,8 @@ class BotBridge:
                 except Exception:
                     proxy_cc = "ID"
 
-            proxy_url = proxy_mgr.get_proxy(country_code=proxy_cc) if proxy_mgr.has_proxies else None
+            sess_id = f"gst_{task.token_code[:6]}_{i}_{secrets.token_hex(2)}"
+            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_cc, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
 
             session = GuestReaderSession(
                 worker_id=f"G-{i:03d}",
@@ -629,23 +648,22 @@ class BotBridge:
                 proxy_manager=proxy_mgr,
             )
 
-
-            chapters = (task.novel_info or {}).get("chapters")
-            if not chapters:
-                origin_cc = (task.novel_info or {}).get("origin_country", "ID")
-                chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
-            if not chapters:
-                await task.emit_log(f"[{i}/{guest_count}] Tidak ada bab yang dapat dibaca.", level="warning")
-                continue
-
-            target_ch = chapters[0]
-
             try:
+                chapters = (task.novel_info or {}).get("chapters")
+                if not chapters:
+                    origin_cc = (task.novel_info or {}).get("origin_country", "ID")
+                    chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
+                if not chapters:
+                    await task.emit_log(f"[{i}/{guest_count}] Tidak ada bab yang dapat dibaca.", level="warning")
+                    continue
+
+                target_ch = chapters[0]
+
                 ok, msg = await session.read_guest_session(novel_id, target_ch, dwell_seconds=float(task.config.get("reading_delay", 4.0)))
                 if ok:
                     task.stats["accounts_done"] += 1
                     task.stats["chapters_read"] += 1
-                    
+
                     gr_rate = TokenManager.get_rate("guest_reader")
                     deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
                         task.token_code,
@@ -661,11 +679,15 @@ class BotBridge:
                         await task.emit_log(f"[{i}/{guest_count}] Saldo token tidak mencukupi untuk melanjutkan sesi tamu.", level="error")
                         break
                     await task.emit_stats()
+                    if proxy_url and proxy_mgr:
+                        proxy_mgr.mark_used(proxy_url)
                 else:
                     await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} gagal: {msg}", level="warning")
             except Exception as e:
                 await task.emit_log(f"[{i}/{guest_count}] Exception sesi tamu #{i}: {e}", level="warning")
             finally:
+                if proxy_url and proxy_mgr:
+                    proxy_mgr.release_proxy_slot(proxy_url)
                 try:
                     await session.close()
                 except Exception:
@@ -678,6 +700,12 @@ class BotBridge:
         """Menjalankan like/bookmark/follow massal dengan akun partisi token, dengan proteksi anti-duplikasi."""
         target_country = (task.config.get("country") or "RANDOM").upper().strip()
         is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
+        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
+            await task.emit_log(
+                f"[GEO] Target negara '{target_country}' tidak didukung Quarterfull. Dialihkan otomatis ke 'ID'.",
+                level="warning"
+            )
+            target_country = "ID"
         country_display = target_country if is_locked else "Global / Multi-Negara"
 
         target_count = min(int(task.config.get("accounts_count", 5)), 100)
@@ -690,7 +718,6 @@ class BotBridge:
         await task.emit_log(f"Memulai pengiriman {item_name} (Target: {target_count} Akun Unik | Tersedia: {len(fresh_accounts)}) | Target Wilayah: {country_display}...", level="info")
 
         proxy_mgr = default_proxy_manager
-        dedicated_proxy = cls.get_token_dedicated_proxy(task.token_code, target_country=target_country)
 
         successful_count = 0
         for acc in fresh_accounts:
@@ -701,7 +728,8 @@ class BotBridge:
                 acc_data["country"] = target_country
 
             proxy_country = target_country if is_locked else acc_data.get("country")
-            proxy_url = dedicated_proxy or (proxy_mgr.get_proxy(country_code=proxy_country) if proxy_mgr.has_proxies else None)
+            sess_id = f"si_{task.token_code[:6]}_{successful_count + 1}_{secrets.token_hex(2)}"
+            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_country, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
             session = MemberReaderSession(
                 worker_id=f"I-{successful_count + 1:02d}",
                 account_data=acc_data,
@@ -765,10 +793,19 @@ class BotBridge:
                         await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')})", level="info")
                     
                     await task.emit_stats()
+                    if proxy_url and proxy_mgr:
+                        proxy_mgr.mark_used(proxy_url)
                 else:
                     await task.emit_log(f"Respon server {item_name} tidak sukses via ({acc.get('email')})", level="warning")
             except Exception as e:
                 await task.emit_log(f"Gagal kirim {item_name}: {e}", level="warning")
+            finally:
+                if proxy_url and proxy_mgr:
+                    proxy_mgr.release_proxy_slot(proxy_url)
+                try:
+                    await session.close()
+                except Exception:
+                    pass
 
             await asyncio.sleep(1.0)
 
@@ -816,7 +853,8 @@ class BotBridge:
 
             curr_worker = successful_count + 1
             acc_data = dict(acc)
-            proxy_url = proxy_mgr.get_proxy() if (proxy_mgr and proxy_mgr.has_proxies) else None
+            sess_id = f"trial_{curr_worker}_{secrets.token_hex(2)}"
+            proxy_url = proxy_mgr.acquire_proxy_slot(session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
 
             session = MemberReaderSession(
                 worker_id=f"TRIAL-{curr_worker:02d}",
@@ -867,9 +905,18 @@ class BotBridge:
                 successful_count += 1
                 task.stats["accounts_done"] = successful_count
                 await task.emit_stats()
+                if proxy_url and proxy_mgr:
+                    proxy_mgr.mark_used(proxy_url)
 
             except Exception as exc:
                 await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun gagal menjalankan sesi trial: {exc}", level="warning")
+            finally:
+                if proxy_url and proxy_mgr:
+                    proxy_mgr.release_proxy_slot(proxy_url)
+                try:
+                    await session.close()
+                except Exception:
+                    pass
 
             await asyncio.sleep(1.0)
 

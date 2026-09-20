@@ -67,7 +67,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Column, Table
 from rich.text import Text
 
-from auto_signup import UserAgentGenerator
+from auto_signup import UserAgentGenerator, resolve_signup_market_country
 from session_manager import IdentifierGenerator
 from proxy_manager import (
     ProxyManager,
@@ -77,6 +77,7 @@ from proxy_manager import (
     is_dead_or_proxy_error,
     sanitize_proxy_url,
     get_weighted_royalty_country,
+    resolve_service_country,
 )
 from account_history import AccountHistoryManager
 
@@ -467,9 +468,11 @@ class BaseReaderSession:
         # Validasi negara resmi Quarterfull (hanya yang terverifikasi dan didukung API)
         c_upper = str(country).upper().strip()
         if c_upper not in SUPPORTED_QUARTERFULL_COUNTRIES:
-            c_upper = random.choice(list(SUPPORTED_QUARTERFULL_COUNTRIES.keys()))
+            c_upper = "ID"
         self.country = c_upper
         cfg = SUPPORTED_QUARTERFULL_COUNTRIES[self.country]
+        self.service_country: str = cfg.get("service_country", self.country)
+        self.raw_country: str = cfg.get("raw_country", self.country)
 
         self.timezone: str = timezone_str or cfg["timezone"]
         self.lang: str = cfg["lang"]
@@ -500,8 +503,8 @@ class BaseReaderSession:
             "x-timezone": self.timezone,
             "x-local-date": self._get_current_local_date(),
             "accept-language": self.lang,
-            "x-user-country": self.country,
-            "x-user-raw-country": self.country,
+            "x-user-country": self.service_country,
+            "x-user-raw-country": self.raw_country,
             "x-device-id": self.device_id,
             "accept": "application/json",
         }
@@ -633,8 +636,8 @@ class GuestReaderSession(BaseReaderSession):
             # Smart fallback jika terjadi 404 (misal akibat novel asing EN vs ID)
             if get_resp.status_code == 404:
                 alt_headers = dict(get_headers)
-                alt_headers["x-user-country"] = "US" if self.country != "US" else "ID"
-                alt_headers["x-user-raw-country"] = alt_headers["x-user-country"]
+                alt_headers["x-user-country"] = "EN" if self.service_country != "EN" else "ID"
+                alt_headers["x-user-raw-country"] = "US" if self.service_country != "EN" else "ID"
                 get_resp = await client.get(ch_url, headers=alt_headers)
 
             get_resp.raise_for_status()
@@ -1346,18 +1349,23 @@ class ReadingSimulationOrchestrator:
             email = f"reader_{uuid.uuid4().hex[:8]}@gmail.com"
             password = f"Pass_{secrets.token_hex(4)}!1"
             dev_id = str(uuid.uuid4())
-            tz_str = "Asia/Jakarta" if country == "ID" else "UTC"
+            
+            clean_country = country if country in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
+            cfg = SUPPORTED_QUARTERFULL_COUNTRIES[clean_country]
+            service_cc = cfg.get("service_country", clean_country)
+            raw_cc = cfg.get("raw_country", clean_country)
+            market_country = resolve_signup_market_country(clean_country)
 
             headers = {
                 "user-agent": "okhttp/4.12.0",
                 "x-platform": "android",
                 "x-app-variant": "prod",
                 "x-app-version": "3.0.52",
-                "x-timezone": tz_str,
+                "x-timezone": cfg["timezone"],
                 "x-local-date": datetime.now().strftime("%Y-%m-%d"),
-                "x-user-country": country,
-                "x-user-raw-country": country,
-                "accept-language": "id-ID,id;q=0.9" if country == "ID" else "en-US,en;q=0.9",
+                "x-user-country": service_cc,
+                "x-user-raw-country": raw_cc,
+                "accept-language": cfg["lang"],
                 "x-device-id": dev_id,
                 "content-type": "application/json",
                 "accept": "application/json",
@@ -1372,7 +1380,7 @@ class ReadingSimulationOrchestrator:
                 "is_agree_terms": True,
                 "meta_attribution": {"source_site": "appsflyer"},
                 "skip_email_verification": True,
-                "signup_market_country": country,
+                "signup_market_country": market_country,
                 "signup_market_source": "auto",
             }
 
@@ -1397,7 +1405,7 @@ class ReadingSimulationOrchestrator:
                         "user_id": data.get("user_id"),
                         "device_id": dev_id,
                         "user_agent": "okhttp/4.12.0",
-                        "country": country,
+                        "country": clean_country,
                         "created_at": datetime.now().isoformat(),
                     }
                     self._save_new_account(new_acc)
@@ -1571,18 +1579,18 @@ class ReadingSimulationOrchestrator:
         worker_id = f"Guest-{worker_idx:02d}"
         pool_countries = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
         proxy_cc = get_weighted_royalty_country(pool_countries)
-        
-        sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
-        proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
-        session = GuestReaderSession(
-            worker_id=worker_id,
-            country=proxy_cc,
-            proxy=proxy,
-            proxy_manager=self.proxy_manager,
-        )
 
         async with self.semaphore:
             slot_idx, task_id = await slot_queue.get()
+            sess_key = f"guest_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
+            proxy = self._get_proxy_for_worker(country_code=proxy_cc, session_id=sess_key)
+            session = GuestReaderSession(
+                worker_id=worker_id,
+                country=proxy_cc,
+                proxy=proxy,
+                proxy_manager=self.proxy_manager,
+            )
+            current_session: BaseReaderSession = session
             try:
                 progress.reset(task_id, total=len(self.chapters))
                 progress.update(
@@ -1604,7 +1612,6 @@ class ReadingSimulationOrchestrator:
                     await session.close()
                     return
 
-                current_session: BaseReaderSession = session
                 ident = f"Guest:{session.guest_id[:8]}" if session.guest_id else "Guest"
                 total_chs = len(self.chapters)
                 ch_read_count = 0
@@ -1689,6 +1696,8 @@ class ReadingSimulationOrchestrator:
 
                 await current_session.close()
             finally:
+                if current_session and current_session.proxy:
+                    self.proxy_manager.release_proxy_slot(current_session.proxy)
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, task_id))
 
@@ -1707,30 +1716,31 @@ class ReadingSimulationOrchestrator:
         raw_cc = str(account.get("country", "ID")).upper().strip()
         acc_country = raw_cc if raw_cc in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
 
-        sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
-        acc_proxy = account.get("proxy") or self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
-        if not acc_proxy:
-            logger.error("[%s] Ditolak: Tidak ada proxy aktif untuk akun %s (%s). Proxy wajib aktif!", worker_id, email, acc_country)
-            self.results.append({
-                "worker_id": worker_id,
-                "type": "Member",
-                "ident": short_email,
-                "country": acc_country,
-                "chapters_read": 0,
-                "status": "[bold red]Gagal (Wajib Proxy)[/]",
-            })
-            return
-
-        session = MemberReaderSession(
-            worker_id=worker_id,
-            account_data=account,
-            novel_title=self.novel_title,
-            proxy=acc_proxy,
-            proxy_manager=self.proxy_manager,
-        )
-
         async with self.semaphore:
             slot_idx, task_id = await slot_queue.get()
+            sess_key = f"member_{worker_idx}_{int(time.time()*1000)}_{random.randint(1000, 9999)}"
+            acc_proxy = account.get("proxy") or self._get_proxy_for_worker(country_code=acc_country, session_id=sess_key)
+            if not acc_proxy:
+                logger.error("[%s] Ditolak: Tidak ada proxy aktif untuk akun %s (%s). Proxy wajib aktif!", worker_id, email, acc_country)
+                self.results.append({
+                    "worker_id": worker_id,
+                    "type": "Member",
+                    "ident": short_email,
+                    "country": acc_country,
+                    "chapters_read": 0,
+                    "status": "[bold red]Gagal (Wajib Proxy)[/]",
+                })
+                progress.advance(overall_task, 1)
+                slot_queue.put_nowait((slot_idx, task_id))
+                return
+
+            session = MemberReaderSession(
+                worker_id=worker_id,
+                account_data=account,
+                novel_title=self.novel_title,
+                proxy=acc_proxy,
+                proxy_manager=self.proxy_manager,
+            )
             try:
                 progress.reset(task_id, total=len(self.chapters))
 
@@ -1844,6 +1854,8 @@ class ReadingSimulationOrchestrator:
 
                 await session.close()
             finally:
+                if session and session.proxy:
+                    self.proxy_manager.release_proxy_slot(session.proxy)
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, task_id))
 

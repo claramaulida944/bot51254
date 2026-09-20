@@ -1,19 +1,15 @@
 # =============================================================================
 # DAFTAR PROXY BOT TOODAT / QUARTERFULL
 # Diperbarui secara otomatis melalui HypeProxy API (https://hypeproxy.site)
-# Total Proxy Aktif: 13
+# Total Proxy Aktif: 9
 # =============================================================================
 
-http://user89:MjR13YqbOtmJ@proxy.hypeproxy.site:1092
-http://user90:0DQzZJtPGqOj@proxy.hypeproxy.site:1093
-http://user91:y5JRfVSrMvj2@proxy.hypeproxy.site:1094
-http://user92:rpq3hIoO9jiu@proxy.hypeproxy.site:1095
-http://user93:zezi5fJHMk4j@proxy.hypeproxy.site:1096
-http://user94:1wp-4gp-6O47@proxy.hypeproxy.site:1097
-http://user95:Is8NLmx2nP3e@proxy.hypeproxy.site:1098
-http://user96:BSvQxyrF8afp@proxy.hypeproxy.site:1099
-http://user97:En4nXaYdYZdX@proxy.hypeproxy.site:1100
-http://user98:ljkkdQ4U_ZLq@proxy.hypeproxy.site:1101
-http://user99:wgMJze7g_yrP@proxy.hypeproxy.site:1102
-http://user100:UV0PIU_ejrlR@proxy.hypeproxy.site:1103
-http://user101:7K0FTSOEhAA8@proxy.hypeproxy.site:1104
+http://user27:vU2wsdXJgCL_@proxy.hypeproxy.site:1030
+http://user90:xH5TbMPIzm_J@proxy.hypeproxy.site:1091
+http://user122:9IEIeIFkx90t@proxy.hypeproxy.site:1122
+http://user138:q2Z4UBZMWxpo@proxy.hypeproxy.site:1138
+http://user139:GMMwCBG0SqGJ@proxy.hypeproxy.site:1139
+http://user143:3fOBZYwuw-wa@proxy.hypeproxy.site:1143
+http://user147:yNPRylWslouN@proxy.hypeproxy.site:1147
+http://user148:a0_LLHpwF01T@proxy.hypeproxy.site:1148
+http://user149:RhKhS5Fovy4-@proxy.hypeproxy.site:1149

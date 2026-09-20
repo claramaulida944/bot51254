@@ -282,6 +282,8 @@ class SocialInteractionBot:
         raw_country = str(account.get("country", "ID")).upper().strip()
         country = raw_country if raw_country in SUPPORTED_QUARTERFULL_COUNTRIES else "ID"
         cfg = SUPPORTED_QUARTERFULL_COUNTRIES[country]
+        service_cc = cfg.get("service_country", country)
+        raw_cc = cfg.get("raw_country", country)
 
         return {
             "host": "api.quarterfull.io",
@@ -292,8 +294,8 @@ class SocialInteractionBot:
             "x-app-version": "3.0.52",
             "x-timezone": cfg["timezone"],
             "x-local-date": today,
-            "x-user-country": country,
-            "x-user-raw-country": country,
+            "x-user-country": service_cc,
+            "x-user-raw-country": raw_cc,
             "accept-language": cfg["lang"],
             "x-device-id": account.get("device_id", "d24063e7-a5ff-4831-92b2-4e28c0123498"),
             "authorization": f"Bearer {account.get('access_token', '')}",

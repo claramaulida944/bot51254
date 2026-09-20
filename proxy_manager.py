@@ -49,48 +49,84 @@ logger = logging.getLogger("ProxyManager")
 console = Console()
 
 
-# 23 Negara Resmi Quarterfull yang Terverifikasi di API /api/v1/service-countries & Memiliki IP Aktif
+# 45 Negara & Pasar Resmi Quarterfull yang Terverifikasi di API /api/v1/service-countries
+# Pasar resmi di header x-user-country:
+# - US, CA, AU, NZ dipetakan ke service_country: "EN"
+# - GB dipetakan ke service_country: "UK"
 SUPPORTED_QUARTERFULL_COUNTRIES: Dict[str, Dict[str, str]] = {
-    "US": {"name": "United States", "timezone": "America/New_York", "lang": "en-US,en;q=0.9"},
-    "KR": {"name": "South Korea", "timezone": "Asia/Seoul", "lang": "ko-KR,ko;q=0.9"},
-    "JP": {"name": "Japan", "timezone": "Asia/Tokyo", "lang": "ja-JP,ja;q=0.9"},
-    "ID": {"name": "Indonesia", "timezone": "Asia/Jakarta", "lang": "id"},
-    "GB": {"name": "United Kingdom", "timezone": "Europe/London", "lang": "en-GB,en;q=0.9"},
-    "AU": {"name": "Australia", "timezone": "Australia/Sydney", "lang": "en-AU,en;q=0.9"},
-    "CA": {"name": "Canada", "timezone": "America/Toronto", "lang": "en-CA,en;q=0.9"},
-    "SG": {"name": "Singapore", "timezone": "Asia/Singapore", "lang": "en-SG,en;q=0.9"},
-    "MY": {"name": "Malaysia", "timezone": "Asia/Kuala_Lumpur", "lang": "ms-MY,ms;q=0.9,en;q=0.8"},
-    "JP": {"name": "Japan", "timezone": "Asia/Tokyo", "lang": "ja-JP,ja;q=0.9"},
-    "IN": {"name": "India", "timezone": "Asia/Kolkata", "lang": "en-IN,en;q=0.9,hi;q=0.8"},
-    "DE": {"name": "Germany", "timezone": "Europe/Berlin", "lang": "de-DE,de;q=0.9"},
-    "FR": {"name": "France", "timezone": "Europe/Paris", "lang": "fr-FR,fr;q=0.9"},
-    "ES": {"name": "Spain", "timezone": "Europe/Madrid", "lang": "es-ES,es;q=0.9"},
-    "IT": {"name": "Italy", "timezone": "Europe/Rome", "lang": "it-IT,it;q=0.9"},
-    "NL": {"name": "Netherlands", "timezone": "Europe/Amsterdam", "lang": "nl-NL,nl;q=0.9"},
-    "SE": {"name": "Sweden", "timezone": "Europe/Stockholm", "lang": "sv-SE,sv;q=0.9"},
-    "NO": {"name": "Norway", "timezone": "Europe/Oslo", "lang": "no-NO,no;q=0.9"},
-    "DK": {"name": "Denmark", "timezone": "Europe/Copenhagen", "lang": "da-DK,da;q=0.9"},
-    "PL": {"name": "Poland", "timezone": "Europe/Warsaw", "lang": "pl-PL,pl;q=0.9"},
-    "CZ": {"name": "Czech Republic", "timezone": "Europe/Prague", "lang": "cs-CZ,cs;q=0.9"},
-    "TR": {"name": "Turkey", "timezone": "Europe/Istanbul", "lang": "tr-TR,tr;q=0.9"},
-    "BR": {"name": "Brazil", "timezone": "America/Sao_Paulo", "lang": "pt-BR,pt;q=0.9"},
-    "AR": {"name": "Argentina", "timezone": "America/Argentina/Buenos_Aires", "lang": "es-AR,es;q=0.9"},
-    "CO": {"name": "Colombia", "timezone": "America/Bogota", "lang": "es-CO,es;q=0.9"},
+    "ID": {"name": "Indonesia", "timezone": "Asia/Jakarta", "lang": "id", "service_country": "ID", "raw_country": "ID"},
+    "US": {"name": "United States", "timezone": "America/New_York", "lang": "en-US,en;q=0.9", "service_country": "EN", "raw_country": "US"},
+    "KR": {"name": "South Korea", "timezone": "Asia/Seoul", "lang": "ko-KR,ko;q=0.9", "service_country": "KR", "raw_country": "KR"},
+    "JP": {"name": "Japan", "timezone": "Asia/Tokyo", "lang": "ja-JP,ja;q=0.9", "service_country": "JP", "raw_country": "JP"},
+    "GB": {"name": "United Kingdom", "timezone": "Europe/London", "lang": "en-GB,en;q=0.9", "service_country": "UK", "raw_country": "GB"},
+    "UK": {"name": "United Kingdom", "timezone": "Europe/London", "lang": "en-GB,en;q=0.9", "service_country": "UK", "raw_country": "GB"},
+    "EN": {"name": "English / Global", "timezone": "America/New_York", "lang": "en-US,en;q=0.9", "service_country": "EN", "raw_country": "US"},
+    "AU": {"name": "Australia", "timezone": "Australia/Sydney", "lang": "en-AU,en;q=0.9", "service_country": "EN", "raw_country": "AU"},
+    "CA": {"name": "Canada", "timezone": "America/Toronto", "lang": "en-CA,en;q=0.9", "service_country": "EN", "raw_country": "CA"},
+    "SG": {"name": "Singapore", "timezone": "Asia/Singapore", "lang": "en-SG,en;q=0.9", "service_country": "SG", "raw_country": "SG"},
+    "MY": {"name": "Malaysia", "timezone": "Asia/Kuala_Lumpur", "lang": "ms-MY,ms;q=0.9,en;q=0.8", "service_country": "MY", "raw_country": "MY"},
+    "PH": {"name": "Philippines", "timezone": "Asia/Manila", "lang": "fil-PH,fil;q=0.9,en;q=0.8", "service_country": "PH", "raw_country": "PH"},
+    "TH": {"name": "Thailand", "timezone": "Asia/Bangkok", "lang": "th-TH,th;q=0.9", "service_country": "TH", "raw_country": "TH"},
+    "VN": {"name": "Vietnam", "timezone": "Asia/Ho_Chi_Minh", "lang": "vi-VN,vi;q=0.9", "service_country": "VN", "raw_country": "VN"},
+    "IN": {"name": "India", "timezone": "Asia/Kolkata", "lang": "en-IN,en;q=0.9,hi;q=0.8", "service_country": "IN", "raw_country": "IN"},
+    "DE": {"name": "Germany", "timezone": "Europe/Berlin", "lang": "de-DE,de;q=0.9", "service_country": "DE", "raw_country": "DE"},
+    "FR": {"name": "France", "timezone": "Europe/Paris", "lang": "fr-FR,fr;q=0.9", "service_country": "FR", "raw_country": "FR"},
+    "ES": {"name": "Spain", "timezone": "Europe/Madrid", "lang": "es-ES,es;q=0.9", "service_country": "ES", "raw_country": "ES"},
+    "IT": {"name": "Italy", "timezone": "Europe/Rome", "lang": "it-IT,it;q=0.9", "service_country": "IT", "raw_country": "IT"},
+    "NL": {"name": "Netherlands", "timezone": "Europe/Amsterdam", "lang": "nl-NL,nl;q=0.9", "service_country": "NL", "raw_country": "NL"},
+    "SE": {"name": "Sweden", "timezone": "Europe/Stockholm", "lang": "sv-SE,sv;q=0.9", "service_country": "SE", "raw_country": "SE"},
+    "NO": {"name": "Norway", "timezone": "Europe/Oslo", "lang": "no-NO,no;q=0.9", "service_country": "NO", "raw_country": "NO"},
+    "DK": {"name": "Denmark", "timezone": "Europe/Copenhagen", "lang": "da-DK,da;q=0.9", "service_country": "DK", "raw_country": "DK"},
+    "FI": {"name": "Finland", "timezone": "Europe/Helsinki", "lang": "fi-FI,fi;q=0.9", "service_country": "FI", "raw_country": "FI"},
+    "PL": {"name": "Poland", "timezone": "Europe/Warsaw", "lang": "pl-PL,pl;q=0.9", "service_country": "PL", "raw_country": "PL"},
+    "CZ": {"name": "Czech Republic", "timezone": "Europe/Prague", "lang": "cs-CZ,cs;q=0.9", "service_country": "CZ", "raw_country": "CZ"},
+    "TR": {"name": "Turkey", "timezone": "Europe/Istanbul", "lang": "tr-TR,tr;q=0.9", "service_country": "TR", "raw_country": "TR"},
+    "BR": {"name": "Brazil", "timezone": "America/Sao_Paulo", "lang": "pt-BR,pt;q=0.9", "service_country": "BR", "raw_country": "BR"},
+    "AR": {"name": "Argentina", "timezone": "America/Argentina/Buenos_Aires", "lang": "es-AR,es;q=0.9", "service_country": "AR", "raw_country": "AR"},
+    "CO": {"name": "Colombia", "timezone": "America/Bogota", "lang": "es-CO,es;q=0.9", "service_country": "CO", "raw_country": "CO"},
+    "MX": {"name": "Mexico", "timezone": "America/Mexico_City", "lang": "es-MX,es;q=0.9", "service_country": "MX", "raw_country": "MX"},
+    "CL": {"name": "Chile", "timezone": "America/Santiago", "lang": "es-CL,es;q=0.9", "service_country": "CL", "raw_country": "CL"},
+    "PE": {"name": "Peru", "timezone": "America/Lima", "lang": "es-PE,es;q=0.9", "service_country": "PE", "raw_country": "PE"},
+    "HK": {"name": "Hong Kong", "timezone": "Asia/Hong_Kong", "lang": "zh-HK,zh;q=0.9,en;q=0.8", "service_country": "HK", "raw_country": "HK"},
+    "TW": {"name": "Taiwan", "timezone": "Asia/Taipei", "lang": "zh-TW,zh;q=0.9", "service_country": "TW", "raw_country": "TW"},
+    "AT": {"name": "Austria", "timezone": "Europe/Vienna", "lang": "de-AT,de;q=0.9", "service_country": "AT", "raw_country": "AT"},
+    "PT": {"name": "Portugal", "timezone": "Europe/Lisbon", "lang": "pt-PT,pt;q=0.9", "service_country": "PT", "raw_country": "PT"},
+    "HU": {"name": "Hungary", "timezone": "Europe/Budapest", "lang": "hu-HU,hu;q=0.9", "service_country": "HU", "raw_country": "HU"},
 }
 
 BRIGHTDATA_SUPPORTED_COUNTRIES = set(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
 
 
+def resolve_service_country(country_code: Optional[str]) -> Tuple[str, str]:
+    """
+    Menyinkronkan kode negara dengan pasar resmi Quarterfull (/api/v1/service-countries).
+    Mengembalikan tuple: (service_country, raw_country)
+    Contoh:
+    - 'US' -> ('EN', 'US')
+    - 'GB' -> ('UK', 'GB')
+    - 'ID' -> ('ID', 'ID')
+    - 'KR' -> ('KR', 'KR')
+    - 'RU' / tak dikenal -> ('ID', 'ID')  # Fallback aman
+    """
+    clean = str(country_code or "ID").upper().strip()
+    if clean not in SUPPORTED_QUARTERFULL_COUNTRIES:
+        clean = "ID"
+    cfg = SUPPORTED_QUARTERFULL_COUNTRIES[clean]
+    return cfg.get("service_country", clean), cfg.get("raw_country", clean)
+
+
 def get_weighted_royalty_country(candidate_countries: Optional[List[str]] = None) -> str:
     """
-    Memilih kode negara dengan pembobotan dinamis:
-    - US (Amerika Serikat): 30%
+    Memilih kode negara dengan pembobotan dinamis hanya dari negara resmi Quarterfull:
+    - US (Amerika Serikat - Pasar EN): 30%
     - KR (Korea Selatan): 30%
     - ID (Indonesia): 5%
-    - Sisanya (35%): didistribusikan merata ke negara-negara lain (JP, GB, DE, SG, MY, CA, FR, AU, dll).
+    - Sisanya (35%): didistribusikan merata ke negara-negara resmi lain (JP, GB, DE, SG, MY, CA, FR, AU, dll).
     """
     if candidate_countries:
-        pool = list(candidate_countries)
+        pool = [c for c in candidate_countries if c in SUPPORTED_QUARTERFULL_COUNTRIES]
+        if not pool:
+            pool = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
     else:
         pool = list(SUPPORTED_QUARTERFULL_COUNTRIES.keys())
 
@@ -192,7 +228,15 @@ class ProxyInfo:
         self.customer: str = ""
         self.zone: str = ""
         self.current_country: Optional[str] = None
+        self.active_sessions: int = 0
+        self.rotating_until: float = 0.0
+        self.last_used_time: float = 0.0
+        self.failure_count: int = 0
         self._parse()
+
+    @property
+    def is_rotating(self) -> bool:
+        return time.time() < self.rotating_until
 
     def _parse(self) -> None:
         if not self.raw_url:
@@ -933,16 +977,17 @@ class ProxyManager:
         """
         Menyinkronkan proxy aktif dari HypeProxy API secara otomatis.
         Jika owner membeli proxy baru di dashboard HypeProxy, fungsi ini akan mengambilnya dan memperbarui proxies.txt.
+        Dijalankan secara non-blocking terhadap lock utama agar event loop tidak membeku.
         """
-        with self._lock:
-            try:
-                urls = HypeProxyClient.fetch_active_proxy_urls(user_only=True)
-                if urls:
+        try:
+            # Panggilan HTTP dijalankan di luar lock agar tidak memblokir event loop asyncio
+            urls = HypeProxyClient.fetch_active_proxy_urls(user_only=True)
+            if urls:
+                with self._lock:
                     current_set = set(self.raw_proxies)
                     has_changes = force or len(urls) != len(self.parsed_proxies) or any(u not in current_set for u in urls)
                     if has_changes:
                         HypeProxyClient.sync_proxies_to_file(output_file=str(self.proxy_file), user_only=True)
-                        # Sinkronkan juga ke root direktori jika berbeda
                         try:
                             root_file = Path(__file__).resolve().parent.parent.parent / "proxies.txt"
                             if root_file.exists() and root_file.resolve() != self.proxy_file.resolve():
@@ -951,16 +996,16 @@ class ProxyManager:
                             pass
                         self.load_proxies()
                         return len(self.parsed_proxies)
-            except Exception as exc:
-                logger.debug(f"[HypeProxy] Auto-sync check gagal: {exc}")
+        except Exception as exc:
+            logger.debug(f"[HypeProxy] Auto-sync check gagal: {exc}")
+
+        with self._lock:
             return len(self.parsed_proxies)
 
     def ensure_proxies(self, min_count: int = 2, target_count: int = 10) -> int:
         """
         Memastikan ketersediaan proxy aktif minimal `min_count`.
-        Jika proxy kosong atau kurang dari `min_count` dan bukan Bright Data,
-        secara otomatis menyinkronkan proxy aktif dari HypeProxy API.
-        Juga memeriksa apakah ada proxy baru yang dibeli owner di HypeProxy API.
+        Dijalankan secara non-blocking agar tidak menahan main thread/event loop.
         """
         self.reload_if_modified()
         with self._lock:
@@ -968,39 +1013,108 @@ class ProxyManager:
                 return len(self.parsed_proxies)
 
             if self.is_hypeproxy:
-                # Periksa apakah ada proxy baru yang dibeli owner di dashboard
-                threading.Thread(target=self.sync_from_hypeproxy, daemon=True).start()
-                threading.Thread(target=HypeProxyClient.auto_recover_proxies, daemon=True).start()
                 if len(self.parsed_proxies) >= min_count:
                     return len(self.parsed_proxies)
+                threading.Thread(target=self.sync_from_hypeproxy, daemon=True).start()
+                threading.Thread(target=HypeProxyClient.auto_recover_proxies, daemon=True).start()
+                return len(self.parsed_proxies)
 
             if len(self.parsed_proxies) >= min_count:
                 return len(self.parsed_proxies)
 
-            if self.verbose:
-                console.print(
-                    f"\n[bold magenta][HYPEPROXY-SYNC] Sinkronisasi proxy aktif dari HypeProxy API...[/]"
-                )
+        def _bg_sync():
             try:
-                HypeProxyClient.sync_proxies_to_file(
-                    output_file=str(self.proxy_file),
-                    user_only=True,
-                    verbose=self.verbose,
-                )
+                HypeProxyClient.sync_proxies_to_file(output_file=str(self.proxy_file), user_only=True)
                 self.load_proxies()
-                if self.verbose:
-                    console.print(
-                        f"[bold green][HYPEPROXY-SYNC] Selesai! {len(self.parsed_proxies)} proxy HypeProxy siap digunakan.[/]\n"
-                    )
-                return len(self.parsed_proxies)
             except Exception as exc:
-                logger.error(f"[HypeProxy-Sync] Gagal sinkronisasi proxy otomatis: {exc}")
-                return len(self.parsed_proxies)
+                logger.debug(f"[HypeProxy-Sync] Gagal: {exc}")
+
+        threading.Thread(target=_bg_sync, daemon=True).start()
+        with self._lock:
+            return len(self.parsed_proxies)
+
+    def _find_proxy_info(self, target_raw: str) -> Optional[ProxyInfo]:
+        """Mencari instance ProxyInfo berdasarkan raw URL atau host/port."""
+        if not target_raw:
+            return None
+        try:
+            target_parsed = urlparse(target_raw if "://" in target_raw else f"http://{target_raw}")
+            target_host = target_parsed.hostname
+            target_port = target_parsed.port
+        except Exception:
+            target_host = None
+            target_port = None
+
+        for p in self.parsed_proxies:
+            if p.raw_url == target_raw:
+                return p
+            if target_host and p.host == target_host and (target_port is None or p.port == target_port):
+                return p
+        return None
+
+    def acquire_proxy_slot(
+        self,
+        country_code: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        [SLOT LEASE GOVERNOR]
+        Menyewa (lease) slot proxy yang paling optimal dan minim beban (least-loaded).
+        Mencegah perebutan slot antar-sesi dengan aturan:
+        1. Mengutamakan slot berstatus IDLE (active_sessions == 0).
+        2. Melewati slot yang sedang berstatus ROTATING (cooldown setelah rotasi IP).
+        3. Membagi beban secara merata (least-active sessions) jika seluruh slot sedang terpakai.
+        4. Mengembalikan URL proxy yang siap pakai dan menaikkan active_sessions.
+        """
+        self.reload_if_modified()
+        with self._lock:
+            if not self.parsed_proxies:
+                return None
+
+            now = time.time()
+            # 1. Prioritaskan slot yang tidak sedang dalam masa tenang rotasi
+            eligible = [p for p in self.parsed_proxies if now >= getattr(p, "rotating_until", 0.0)]
+            if not eligible:
+                # Jika semua slot kebetulan sedang rotasi, ambil yang cooldown-nya paling dekat selesai
+                eligible = sorted(self.parsed_proxies, key=lambda p: getattr(p, "rotating_until", 0.0))
+
+            # 2. Cari slot dengan active_sessions terendah (least loaded), lalu tie-break dengan last_used_time
+            chosen = min(
+                eligible,
+                key=lambda p: (getattr(p, "active_sessions", 0), getattr(p, "last_used_time", 0.0))
+            )
+
+            # 3. Naikkan counter sewa aktif
+            chosen.active_sessions = getattr(chosen, "active_sessions", 0) + 1
+            chosen.last_used_time = now
+
+            if chosen.is_brightdata or chosen.is_hypeproxy:
+                return chosen.format_for_country(country_code=country_code, session_id=session_id)
+
+            return chosen.raw_url
+
+    def release_proxy_slot(self, proxy_url: Optional[str]) -> bool:
+        """
+        [SLOT LEASE RELEASE]
+        Melepaskan sewa slot proxy setelah sesi bot selesai membaca / berinteraksi.
+        Menurunkan counter beban active_sessions agar slot dapat disewa oleh worker lain.
+        """
+        if not proxy_url:
+            return False
+
+        with self._lock:
+            p_found = self._find_proxy_info(proxy_url.strip())
+            if p_found:
+                p_found.active_sessions = max(0, getattr(p_found, "active_sessions", 1) - 1)
+                p_found.last_used_time = time.time()
+                return True
+        return False
 
     def remove_proxy(self, proxy_url: Optional[str], reason: str = "failed") -> bool:
         """
         Menangani proxy saat gagal (failed) atau selesai digunakan (used).
-        - Pada HypeProxy: slot tidak dihapus, melainkan memicu rotasi IP instan via API!
+        - SAFE ISOLATED ROTATION: Mencegah rotasi IP jika slot masih digunakan sesi lain!
+        - Menandai slot ROTATING selama 15s agar worker lain tidak berebut slot yang sedang reboot IP.
         - Pada Bright Data: gateway tidak dihapus karena bersifat dynamic session.
         - Pada Legacy Free Proxy: dihapus dari antrean file.
         """
@@ -1008,45 +1122,55 @@ class ProxyManager:
             return False
 
         with self._lock:
-            target_raw = proxy_url.strip()
-            p_found: Optional[ProxyInfo] = None
-
-            try:
-                target_parsed = urlparse(target_raw if "://" in target_raw else f"http://{target_raw}")
-                target_host = target_parsed.hostname
-                target_port = target_parsed.port
-            except Exception:
-                target_host = None
-                target_port = None
-
-            for p in self.parsed_proxies:
-                if p.raw_url == target_raw:
-                    p_found = p
-                    break
-                if target_host and p.host == target_host and (target_port is None or p.port == target_port):
-                    p_found = p
-                    break
-
+            p_found = self._find_proxy_info(proxy_url.strip())
             if not p_found:
                 return False
 
             masked = p_found.get_masked_url()
 
-            # 1. Penanganan Khusus HypeProxy: AUTO-START (MULAI) & ROTASI IP SAAT GAGAL / ERROR
+            if reason == "used":
+                p_found.active_sessions = max(0, getattr(p_found, "active_sessions", 1) - 1)
+                p_found.last_used_time = time.time()
+                logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan (Active: {p_found.active_sessions}).")
+                return True
+
+            # reason == "failed"
+            p_found.failure_count = getattr(p_found, "failure_count", 0) + 1
+
+            # 1. Penanganan Khusus HypeProxy: SAFE ISOLATED AUTO-START & ROTASI
             if p_found.is_hypeproxy:
-                if reason == "failed" and p_found.proxy_id:
-                    def _recover_slot():
-                        # 1. Pastikan slot menyala jika sebelumnya berstatus ERROR / Berhenti (menekan tombol 'Mulai')
-                        HypeProxyClient.start_proxy(p_found.proxy_id)
-                        # 2. Picu rotasi IP instan di thread terpisah
-                        HypeProxyClient.rotate_proxy(p_found.proxy_id)
+                remaining_active = max(0, getattr(p_found, "active_sessions", 1) - 1)
+                p_found.active_sessions = remaining_active
+
+                if p_found.proxy_id:
+                    # SAFE ISOLATED ROTATION:
+                    # Jangan rotasi slot jika masih ada sesi lain yang sedang aktif membaca di port ini!
+                    # Ini mencegah 'cascade disconnection' yang membunuh koneksi worker lain.
+                    if remaining_active > 0:
+                        logger.warning(
+                            f"[HypeProxy] Slot #{p_found.proxy_id} error pada 1 sesi, "
+                            f"tetapi rotasi ditunda karena masih dipakai {remaining_active} sesi lain."
+                        )
+                        return True
+
+                    # Cooldown proteksi rotasi berulang
+                    now = time.time()
+                    if now < getattr(p_found, "rotating_until", 0.0):
+                        logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} masih dalam masa tenang rotasi.")
+                        return True
+
+                    # Kunci slot agar tidak dialokasikan ke sesi baru selama 15 detik masa pemulihan IP
+                    p_found.rotating_until = now + 15.0
+
+                    def _recover_slot(pid=p_found.proxy_id):
+                        try:
+                            HypeProxyClient.start_proxy(pid)
+                            HypeProxyClient.rotate_proxy(pid)
+                        except Exception as r_err:
+                            logger.debug(f"[HypeProxy] Recovery slot #{pid} error: {r_err}")
 
                     threading.Thread(target=_recover_slot, daemon=True).start()
-                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} mengalami limit/error -> Otomatis MEMULAI ULANG (Auto-Start) & rotasi IP.")
-                    if self.verbose:
-                        console.print(f"[dim yellow][HYPEPROXY-RECOVER] Slot #{p_found.proxy_id} otomatis dihidupkan ulang (Auto-Start) & rotasi IP baru![/]")
-                elif reason == "used":
-                    logger.debug(f"[HypeProxy] Slot #{p_found.proxy_id} selesai digunakan.")
+                    logger.warning(f"[HypeProxy] Slot #{p_found.proxy_id} limit/error -> Auto-Start & rotasi IP terisolasi (Cooldown 15s).")
                 return True
 
             # 2. Penanganan Bright Data
@@ -1073,11 +1197,14 @@ class ProxyManager:
             return True
 
     def mark_failed(self, proxy_url: Optional[str], error: Optional[Any] = None) -> bool:
-        """Menandai proxy yang gagal konek / error. Pada HypeProxy memicu rotasi IP instan."""
+        """Menandai proxy yang gagal konek / error. Pada HypeProxy memicu rotasi IP terisolasi aman."""
         return self.remove_proxy(proxy_url, reason="failed")
 
     def mark_used(self, proxy_url: Optional[str]) -> bool:
-        """Menandai proxy yang selesai digunakan."""
+        """Menandai proxy yang selesai digunakan dan melepaskan sewa slot."""
+        if not proxy_url:
+            return False
+        self.release_proxy_slot(proxy_url)
         return self.remove_proxy(proxy_url, reason="used")
 
     def pop_proxy(
@@ -1087,26 +1214,18 @@ class ProxyManager:
         auto_replenish: bool = True,
     ) -> Optional[str]:
         """
-        Mengambil proxy untuk satu sesi kerja secara instan:
-        - HypeProxy dan Bright Data berputar terus menerus (round-robin) antar 8 slot.
-        - Langsung mengembalikan URL proxy tanpa latensi tambahan.
+        Mengambil proxy untuk satu sesi kerja secara instan dan tertib.
+        Menggunakan Slot Lease Governor untuk HypeProxy dan Bright Data.
         """
+        if self.is_brightdata or self.is_hypeproxy:
+            return self.acquire_proxy_slot(country_code=country_code, session_id=session_id)
+
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
                 self.ensure_proxies(min_count=1, target_count=10)
 
             if not self.parsed_proxies:
                 return None
-
-            # HypeProxy dan Bright Data berputar terus menerus (round-robin)
-            if self.is_brightdata or self.is_hypeproxy:
-                proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
-                self._current_index += 1
-
-                if proxy_info.is_brightdata or proxy_info.is_hypeproxy:
-                    return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
-
-                return proxy_info.raw_url
 
             # Legacy free proxy (single-use)
             proxy_info = self.parsed_proxies.pop(0)
@@ -1125,7 +1244,10 @@ class ProxyManager:
         session_id: Optional[str] = None,
         auto_replenish: bool = True,
     ) -> Optional[str]:
-        """Mengambil proxy berikutnya secara round-robin."""
+        """Mengambil proxy berikutnya dengan Slot Lease Governor."""
+        if self.is_brightdata or self.is_hypeproxy:
+            return self.acquire_proxy_slot(country_code=country_code, session_id=session_id)
+
         self.reload_if_modified()
         with self._lock:
             if not self.parsed_proxies and auto_replenish and not self.is_brightdata:
@@ -1136,10 +1258,6 @@ class ProxyManager:
 
             proxy_info = self.parsed_proxies[self._current_index % len(self.parsed_proxies)]
             self._current_index += 1
-
-            if proxy_info.is_brightdata or proxy_info.is_hypeproxy:
-                return proxy_info.format_for_country(country_code=country_code, session_id=session_id)
-
             return proxy_info.raw_url
 
 
