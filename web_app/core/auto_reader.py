@@ -156,9 +156,9 @@ class NovelTargetResolver:
                 if not accounts:
                     continue
 
-                test_proxy = default_proxy_manager.pop_proxy() if default_proxy_manager and default_proxy_manager.has_proxies else None
+                test_proxy = default_proxy_manager.get_proxy() if default_proxy_manager and default_proxy_manager.has_proxies else None
                 client_kwargs: Dict[str, Any] = {
-                    "timeout": 10.0,
+                    "timeout": 15.0,
                     "headers": {"user-agent": "okhttp/4.12.0"},
                 }
                 if test_proxy:
@@ -167,60 +167,64 @@ class NovelTargetResolver:
                 else:
                     client_kwargs["http2"] = True
 
-                for acc in accounts[:5]:
-                    access_token = acc.get("access_token")
-                    if access_token and not force_refresh and not is_jwt_expired(access_token, buffer_seconds=60):
-                        cls._cached_auth_token = access_token
-                        return access_token
+                try:
+                    for acc in accounts[:5]:
+                        access_token = acc.get("access_token")
+                        if access_token and not force_refresh and not is_jwt_expired(access_token, buffer_seconds=60):
+                            cls._cached_auth_token = access_token
+                            return access_token
 
-                    # Coba refresh token
-                    refresh_tok = acc.get("refresh_token")
-                    if refresh_tok:
-                        try:
-                            with httpx.Client(**client_kwargs) as client:
-                                r_ref = client.post(
-                                    f"{cls.BASE_URL}/api/auth/token/refresh",
-                                    json={"refresh_token": refresh_tok},
-                                    timeout=httpx.Timeout(5.0, connect=2.5),
-                                )
-                                if r_ref.status_code == 200:
-                                    data = r_ref.json()
-                                    new_access = data.get("access_token")
-                                    new_refresh = data.get("refresh_token")
-                                    if new_access:
-                                        acc["access_token"] = new_access
-                                        if new_refresh:
-                                            acc["refresh_token"] = new_refresh
-                                        cls._save_account_token_update(candidate_path, acc)
-                                        cls._cached_auth_token = new_access
-                                        return new_access
-                        except Exception:
-                            pass
+                        # Coba refresh token
+                        refresh_tok = acc.get("refresh_token")
+                        if refresh_tok:
+                            try:
+                                with httpx.Client(**client_kwargs) as client:
+                                    r_ref = client.post(
+                                        f"{cls.BASE_URL}/api/auth/token/refresh",
+                                        json={"refresh_token": refresh_tok},
+                                        timeout=httpx.Timeout(12.0, connect=8.0),
+                                    )
+                                    if r_ref.status_code == 200:
+                                        data = r_ref.json()
+                                        new_access = data.get("access_token")
+                                        new_refresh = data.get("refresh_token")
+                                        if new_access:
+                                            acc["access_token"] = new_access
+                                            if new_refresh:
+                                                acc["refresh_token"] = new_refresh
+                                            cls._save_account_token_update(candidate_path, acc)
+                                            cls._cached_auth_token = new_access
+                                            return new_access
+                            except Exception:
+                                pass
 
-                    # Coba login ulang dengan password
-                    email = acc.get("email")
-                    password = acc.get("password")
-                    if email and password:
-                        try:
-                            with httpx.Client(**client_kwargs) as client:
-                                r_login = client.post(
-                                    f"{cls.BASE_URL}/api/auth/login",
-                                    json={"login_id": email, "password": password},
-                                    timeout=httpx.Timeout(6.0, connect=3.0),
-                                )
-                                if r_login.status_code == 200:
-                                    data = r_login.json()
-                                    new_access = data.get("access_token")
-                                    new_refresh = data.get("refresh_token")
-                                    if new_access:
-                                        acc["access_token"] = new_access
-                                        if new_refresh:
-                                            acc["refresh_token"] = new_refresh
-                                        cls._save_account_token_update(candidate_path, acc)
-                                        cls._cached_auth_token = new_access
-                                        return new_access
-                        except Exception:
-                            pass
+                        # Coba login ulang dengan password
+                        email = acc.get("email")
+                        password = acc.get("password")
+                        if email and password:
+                            try:
+                                with httpx.Client(**client_kwargs) as client:
+                                    r_login = client.post(
+                                        f"{cls.BASE_URL}/api/auth/login",
+                                        json={"login_id": email, "password": password},
+                                        timeout=httpx.Timeout(15.0, connect=10.0),
+                                    )
+                                    if r_login.status_code == 200:
+                                        data = r_login.json()
+                                        new_access = data.get("access_token")
+                                        new_refresh = data.get("refresh_token")
+                                        if new_access:
+                                            acc["access_token"] = new_access
+                                            if new_refresh:
+                                                acc["refresh_token"] = new_refresh
+                                            cls._save_account_token_update(candidate_path, acc)
+                                            cls._cached_auth_token = new_access
+                                            return new_access
+                            except Exception:
+                                pass
+                finally:
+                    if test_proxy and default_proxy_manager:
+                        default_proxy_manager.release_proxy_slot(test_proxy)
         return None
 
     @classmethod
@@ -255,15 +259,15 @@ class NovelTargetResolver:
         url = f"{cls.BASE_URL}/api/v1/novels/{novel_id}"
         data = None
         last_exc = None
-        active_token = auth_token or cls._cached_auth_token
+        active_token = auth_token or cls._cached_auth_token or cls.get_auth_token(force_refresh=False)
 
-        # Jika proxy tidak ditentukan secara spesifik, coba direct connection terlebih dahulu (instan 0.2s)
+        # 1. Jika proxy tidak ditentukan secara spesifik, coba direct connection terlebih dahulu
         if not proxy:
             try:
                 d_headers = {"user-agent": "okhttp/4.12.0"}
                 if active_token:
                     d_headers["authorization"] = f"Bearer {active_token}"
-                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(6.0, connect=2.5), http2=True) as d_client:
+                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(10.0, connect=6.0), http2=True) as d_client:
                     resp = await d_client.get(url)
                     if resp.status_code == 404 and "adult_access_required" in resp.text:
                         active_token = cls.get_auth_token(force_refresh=False)
@@ -278,11 +282,11 @@ class NovelTargetResolver:
             except Exception as exc:
                 last_exc = exc
 
-        # Jika direct gagal atau proxy ditentukan secara eksplisit, gunakan rotasi proxy
+        # 2. Jika direct gagal atau proxy ditentukan secara eksplisit, gunakan rotasi proxy
         if not data and (proxy or (default_proxy_manager and default_proxy_manager.has_proxies)):
             attempts = 2 if not proxy else 1
             for attempt in range(1, attempts + 1):
-                current_proxy = proxy or default_proxy_manager.pop_proxy()
+                current_proxy = proxy or default_proxy_manager.get_proxy()
                 if not current_proxy:
                     continue
                 headers: Dict[str, str] = {"user-agent": "okhttp/4.12.0"}
@@ -290,7 +294,7 @@ class NovelTargetResolver:
                     headers["authorization"] = f"Bearer {active_token}"
 
                 try:
-                    async with httpx.AsyncClient(headers=headers, proxy=current_proxy, http2=False, timeout=httpx.Timeout(5.0, connect=2.5)) as client:
+                    async with httpx.AsyncClient(headers=headers, proxy=current_proxy, http2=False, timeout=httpx.Timeout(15.0, connect=10.0)) as client:
                         resp = await client.get(url)
                         if resp.status_code == 404 and "adult_access_required" in resp.text:
                             active_token = cls.get_auth_token(force_refresh=False)
@@ -303,23 +307,30 @@ class NovelTargetResolver:
 
                         if resp.status_code == 200:
                             data = resp.json()
-                            if default_proxy_manager:
+                            if default_proxy_manager and not proxy:
                                 default_proxy_manager.mark_used(current_proxy)
                             break
                 except Exception as exc:
                     last_exc = exc
-                    if default_proxy_manager:
+                    if default_proxy_manager and not proxy:
                         default_proxy_manager.mark_failed(current_proxy, exc)
                     continue
+                finally:
+                    if default_proxy_manager and not proxy and current_proxy:
+                        default_proxy_manager.release_proxy_slot(current_proxy)
 
-        # Fallback terakhir jika proxy gagal
+        # 3. Fallback terakhir jika proxy gagal
         if not data:
             try:
                 d_headers = {"user-agent": "okhttp/4.12.0"}
                 if active_token:
                     d_headers["authorization"] = f"Bearer {active_token}"
-                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(8.0, connect=3.0), http2=True) as d_client:
+                async with httpx.AsyncClient(headers=d_headers, timeout=httpx.Timeout(12.0, connect=8.0), http2=True) as d_client:
                     resp = await d_client.get(url)
+                    if resp.status_code == 404 and "adult_access_required" in resp.text:
+                        active_token = cls.get_auth_token(force_refresh=False)
+                        if active_token:
+                            resp = await d_client.get(url, headers={"user-agent": "okhttp/4.12.0", "authorization": f"Bearer {active_token}"})
                     if resp.status_code == 200:
                         data = resp.json()
             except Exception as exc:
@@ -345,7 +356,7 @@ class NovelTargetResolver:
         memfilter hanya bab yang sudah terbit dan non-premium (gratis), lalu mengurutkannya.
         Dilengkapi fallback instan, auto-retry, rotasi proxy, dan otentikasi otomatis jika novel butuh akses 18+.
         """
-        active_token = auth_token or cls._cached_auth_token
+        active_token = auth_token or cls._cached_auth_token or cls.get_auth_token(force_refresh=False)
 
         async def _query_chapters(target_proxy: Optional[str]) -> List[Dict[str, Any]]:
             nonlocal active_token
@@ -357,7 +368,7 @@ class NovelTargetResolver:
 
             client_kwargs: Dict[str, Any] = {
                 "headers": headers,
-                "timeout": httpx.Timeout(6.0, connect=2.5) if target_proxy else httpx.Timeout(10.0, connect=3.0),
+                "timeout": httpx.Timeout(15.0, connect=10.0) if target_proxy else httpx.Timeout(12.0, connect=8.0),
             }
             if target_proxy:
                 client_kwargs["proxy"] = target_proxy
@@ -371,7 +382,7 @@ class NovelTargetResolver:
                     if cur:
                         url += f"&cursor={cur}"
                     resp = await client.get(url)
-                    if resp.status_code == 404 and not active_token:
+                    if resp.status_code == 404 and "adult_access_required" in resp.text:
                         active_token = cls.get_auth_token(force_refresh=False)
                         if active_token:
                             client.headers["authorization"] = f"Bearer {active_token}"
@@ -417,7 +428,7 @@ class NovelTargetResolver:
                     elif origin_country and origin_country.upper() != "ID":
                         curr_proxy = default_proxy_manager.get_proxy(country_code=origin_country)
                     else:
-                        curr_proxy = default_proxy_manager.pop_proxy()
+                        curr_proxy = default_proxy_manager.get_proxy()
                 else:
                     curr_proxy = None
 
@@ -426,14 +437,17 @@ class NovelTargetResolver:
 
                 try:
                     res = await _query_chapters(curr_proxy)
-                    if default_proxy_manager:
+                    if default_proxy_manager and not proxy:
                         default_proxy_manager.mark_used(curr_proxy)
                     return res
                 except Exception as exc:
                     last_exc = exc
-                    if default_proxy_manager:
+                    if default_proxy_manager and not proxy:
                         default_proxy_manager.mark_failed(curr_proxy, exc)
                     continue
+                finally:
+                    if default_proxy_manager and not proxy and curr_proxy:
+                        default_proxy_manager.release_proxy_slot(curr_proxy)
 
         # Fallback terakhir jika proxy gagal: coba direct connection
         try:
