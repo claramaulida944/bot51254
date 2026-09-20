@@ -138,7 +138,8 @@ class FullAutoWorker:
         self.do_follow = do_follow
         self.skip_already_read = skip_already_read
         self.inter_chapter_delay = max(0.0, inter_chapter_delay)
-        self.timeout = 25.0
+        self.timeout = 12.0
+        self._client: Optional[httpx.AsyncClient] = None
 
         self.like_result = "-"
         self.bookmark_result = "-"
@@ -146,11 +147,45 @@ class FullAutoWorker:
         self.chapters_read = 0
         self.status = "Inisialisasi"
 
+    async def get_client(self) -> httpx.AsyncClient:
+        """Menginisialisasi atau mengembalikan httpx.AsyncClient terhubung via proxy."""
+        if self._client is None or self._client.is_closed:
+            kwargs: Dict[str, Any] = {
+                "base_url": self.BASE_URL,
+                "http2": False,
+                "headers": self.build_headers(),
+                "timeout": httpx.Timeout(self.timeout, connect=5.0),
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
+
+    async def close_client(self) -> None:
+        """Menutup koneksi client HTTP secara bersih."""
+        if self._client and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+        self._client = None
+
+    async def rotate_proxy(self, reason: Optional[Any] = None) -> Optional[str]:
+        """Merotasi proxy yang bermasalah dan melepaskan slot secara aman tanpa jatuh ke Direct IP."""
+        old_proxy = self.proxy
+        if old_proxy and self.proxy_manager:
+            self.proxy_manager.mark_failed(old_proxy, reason)
+            self.proxy_manager.release_proxy_slot(old_proxy)
+        new_proxy = self.proxy_manager.pop_proxy(country_code=self.country) if self.proxy_manager else None
+        self.proxy = new_proxy
+        await self.close_client()
+        return new_proxy
+
     async def get_read_chapter_ids(self, client: httpx.AsyncClient) -> set:
         """
         Mengambil daftar ID bab (dan nomor bab) yang sudah pernah dibaca oleh akun ini.
         Endpoint: GET /api/v1/novels/{novel_id}/chapters?order=asc&include_read_progress=true
-        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca.
+        Mengembalikan set yang berisi hash_id dan chapter_num dari bab yang sudah dibaca (is_read=True atau reading_progress >= 0.95).
         """
         read_set = set()
         url = f"/api/v1/novels/{self.novel_id}/chapters"
@@ -161,7 +196,7 @@ class FullAutoWorker:
             "include_read_progress": "true",
         }
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, timeout=httpx.Timeout(10.0, connect=4.0))
             if resp.status_code == 200:
                 data = resp.json()
                 items = data.get("items", [])
@@ -240,11 +275,13 @@ class FullAutoWorker:
 
     async def refresh_access_token(self, client: Optional[httpx.AsyncClient] = None) -> bool:
         refresh_token = self.account.get("refresh_token")
-        if not refresh_token:
+        if not refresh_token or not self.proxy:
             return False
         try:
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
+                "http2": False,
+                "proxy": self.proxy,
                 "timeout": httpx.Timeout(20.0),
                 "headers": {
                     "user-agent": self.user_agent,
@@ -253,8 +290,6 @@ class FullAutoWorker:
                     "accept": "application/json",
                 },
             }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
 
             async with httpx.AsyncClient(**kwargs) as refresh_client:
                 resp = await refresh_client.post("/api/auth/token/refresh", json={"refresh_token": refresh_token})
@@ -279,11 +314,15 @@ class FullAutoWorker:
         password = self.account.get("password")
         if not self.email or not password:
             return False
+        if not self.proxy:
+            logger.warning("[%s] Login dibatalkan: Proxy WAJIB digunakan untuk akun ini!", self.worker_id)
+            return False
 
         for attempt in range(1, max_retries + 1):
             kwargs: Dict[str, Any] = {
                 "base_url": self.BASE_URL,
-                "http2": False if self.proxy else True,
+                "http2": False,
+                "proxy": self.proxy,
                 "timeout": httpx.Timeout(15.0),
                 "headers": {
                     "user-agent": self.user_agent,
@@ -295,8 +334,6 @@ class FullAutoWorker:
                     "accept": "application/json",
                 },
             }
-            if self.proxy:
-                kwargs["proxy"] = self.proxy
 
             try:
                 async with httpx.AsyncClient(**kwargs) as login_client:
@@ -316,27 +353,18 @@ class FullAutoWorker:
                             logger.info("[%s] Akun sesi habis berhasil Login Ulang secara otomatis & token tersimpan ke akun.txt!", self.worker_id)
                             return True
                     elif resp.status_code in (403, 429, 500, 502, 503, 504):
-                        logger.warning("[%s] Login terhalang Cloudflare/Proxy (HTTP %d). Rotasi proxy (%d/%d)...", self.worker_id, resp.status_code, attempt, max_retries)
-                        if self.proxy:
-                            self.proxy_manager.mark_failed(self.proxy, f"HTTP {resp.status_code} on login")
-                        new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
-                        self.proxy = new_proxy
+                        logger.debug("[%s] Login terhalang Cloudflare/Proxy (HTTP %d). Rotasi proxy (%d/%d)...", self.worker_id, resp.status_code, attempt, max_retries)
+                        await self.rotate_proxy(f"HTTP {resp.status_code} on login")
                         continue
                     elif resp.status_code in (400, 401, 404, 422):
-                        logger.warning("[%s] Login ditolak server (HTTP %d, mencoba proxy lain %d/%d): %s", self.worker_id, resp.status_code, attempt, max_retries, resp.text[:100])
+                        logger.debug("[%s] Login ditolak server (HTTP %d, mencoba proxy lain %d/%d): %s", self.worker_id, resp.status_code, attempt, max_retries, resp.text[:100])
                         if attempt < max_retries:
-                            if self.proxy:
-                                self.proxy_manager.mark_failed(self.proxy, f"HTTP {resp.status_code}")
-                            new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
-                            self.proxy = new_proxy
+                            await self.rotate_proxy(f"HTTP {resp.status_code}")
                             continue
                         return False
             except Exception as exc:
                 if is_dead_or_proxy_error(exc) or "timeout" in str(exc).lower():
-                    if self.proxy:
-                        self.proxy_manager.mark_failed(self.proxy, exc)
-                    new_proxy = self.proxy_manager.pop_proxy(country_code=self.country)
-                    self.proxy = new_proxy
+                    await self.rotate_proxy(exc)
                     continue
                 logger.debug("[%s] Gagal login ulang: %s", self.worker_id, exc)
 
@@ -346,7 +374,7 @@ class FullAutoWorker:
         """Memverifikasi validitas token worker via /api/auth/profile; auto refresh atau login ulang jika sesi kedaluwarsa."""
         if self.access_token and not is_jwt_expired(self.access_token, buffer_seconds=60):
             try:
-                profile_resp = await client.get("/api/auth/profile", timeout=httpx.Timeout(5.0, connect=3.0))
+                profile_resp = await client.get("/api/auth/profile", timeout=httpx.Timeout(6.0, connect=3.5))
                 if profile_resp.status_code == 200:
                     return True
             except Exception:
@@ -360,290 +388,297 @@ class FullAutoWorker:
         return relogged
 
     async def execute(self, progress: Progress, task_id: TaskID) -> Dict[str, Any]:
-        short_email = self.email.split("@")[0][:12]
-        headers = self.build_headers()
-
-        client_kwargs: Dict[str, Any] = {
-            "base_url": self.BASE_URL,
-            "http2": False if self.proxy else True,
-            "headers": headers,
-            "timeout": httpx.Timeout(25.0),
-        }
-        if self.proxy:
-            client_kwargs["proxy"] = self.proxy
+        if not self.proxy:
+            self.status = "[red]Ditolak (Wajib Proxy)[/]"
+            progress.update(task_id, description="[bold red]Gagal: Wajib Proxy![/]")
+            return self._build_summary()
 
         try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                # -------------------------------------------------------------
-                # TAHAP 1: DETEKSI & INTERAKSI SOSIAL (Like, Bookmark, Follow)
-                # -------------------------------------------------------------
-                progress.update(
-                    task_id,
-                    role=f"[cyan]{self.worker_id}[/]",
-                    description="[dim]Cek profil & validasi sesi...[/]",
-                )
+            client = await self.get_client()
 
-                session_valid = await self.ensure_valid_session(client)
-                if not session_valid:
-                    progress.update(task_id, description="[yellow]Sesi exp, login ulang...[/]")
-                    session_valid = await self.login_with_password(client, max_retries=5)
+            # -------------------------------------------------------------
+            # TAHAP 1: DETEKSI & INTERAKSI SOSIAL (Like, Bookmark, Follow)
+            # -------------------------------------------------------------
+            progress.update(
+                task_id,
+                role=f"[cyan]{self.worker_id}[/]",
+                description="[dim]Cek profil & validasi sesi...[/]",
+            )
 
-                if not session_valid:
-                    self.status = "Gagal Login (Skip)"
-                    progress.update(task_id, description="[bold red]Gagal Login (Skip)[/]")
-                    return self._build_summary()
+            session_valid = await self.ensure_valid_session(client)
+            if not session_valid:
+                progress.update(task_id, description="[yellow]Sesi exp, login ulang...[/]")
+                session_valid = await self.login_with_password(client, max_retries=5)
 
-                novel_status_data: Optional[Dict[str, Any]] = None
-                try:
-                    resp = await client.get(f"/api/v1/novels/{self.novel_id}")
-                    if resp.status_code == 200:
-                        novel_status_data = resp.json()
-                except Exception as exc:
-                    logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
+            if not session_valid:
+                self.status = "Gagal Login (Skip)"
+                progress.update(task_id, description="[bold red]Gagal Login (Skip)[/]")
+                return self._build_summary()
 
-                # 1.A. Auto Like (dengan deteksi, skip, & toggle proteksi)
-                if self.do_like:
-                    is_liked = novel_status_data.get("is_liked", False) if novel_status_data else False
-                    if is_liked:
-                        self.like_result = "[yellow]SKIP (Sudah)[/]"
-                    else:
-                        try:
-                            like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like")
-                            if like_resp.status_code == 401:
-                                if await self.login_with_password(client):
-                                    like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like")
+            novel_status_data: Optional[Dict[str, Any]] = None
+            try:
+                resp = await client.get(f"/api/v1/novels/{self.novel_id}", timeout=httpx.Timeout(8.0, connect=4.0))
+                if resp.status_code == 200:
+                    novel_status_data = resp.json()
+            except Exception as exc:
+                logger.debug("[%s] Gagal fetch status novel: %s", self.worker_id, exc)
 
-                            if like_resp.status_code == 200:
-                                res_data = like_resp.json()
-                                if not res_data.get("is_liked", True):
-                                    await asyncio.sleep(0.4)
-                                    await client.post(f"/api/v1/novels/{self.novel_id}/like")
-                                AccountHistoryManager.record_interaction(self.account, self.novel_id, liked=True)
-                                self.like_result = "[green]OK (Baru)[/]"
-                            else:
-                                self.like_result = f"[red]Gagal ({like_resp.status_code})[/]"
-                        except Exception:
-                            self.like_result = "[red]Error[/]"
-
-                # 1.B. Auto Bookmark / Simpan (dengan deteksi, skip, & toggle proteksi)
-                if self.do_bookmark:
-                    is_saved = novel_status_data.get("is_saved", False) if novel_status_data else False
-                    if is_saved:
-                        self.bookmark_result = "[yellow]SKIP (Sudah)[/]"
-                    else:
-                        try:
-                            bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
-                            if bm_resp.status_code == 401:
-                                if await self.login_with_password(client):
-                                    bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
-
-                            if bm_resp.status_code == 200:
-                                res_data = bm_resp.json()
-                                if not res_data.get("is_saved", True):
-                                    await asyncio.sleep(0.4)
-                                    await client.post(f"/api/v1/novels/{self.novel_id}/bookmark")
-                                AccountHistoryManager.record_interaction(self.account, self.novel_id, bookmarked=True)
-                                self.bookmark_result = "[green]OK (Baru)[/]"
-                            else:
-                                self.bookmark_result = f"[red]Gagal ({bm_resp.status_code})[/]"
-                        except Exception:
-                            self.bookmark_result = "[red]Error[/]"
-
-                # 1.C. Auto Follow Author (dengan deteksi & skip)
-                if self.do_follow and self.author_hash_id:
+            # 1.A. Auto Like (dengan deteksi, skip, & toggle proteksi)
+            if self.do_like:
+                is_liked = novel_status_data.get("is_liked", False) if novel_status_data else False
+                if is_liked:
+                    self.like_result = "[yellow]SKIP (Sudah)[/]"
+                else:
                     try:
-                        rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship")
-                        if rel_resp.status_code == 401:
+                        like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like", timeout=httpx.Timeout(8.0, connect=4.0))
+                        if like_resp.status_code == 401:
                             if await self.login_with_password(client):
-                                rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship")
+                                like_resp = await client.post(f"/api/v1/novels/{self.novel_id}/like", timeout=httpx.Timeout(8.0, connect=4.0))
 
-                        if rel_resp.status_code == 200:
-                            is_following = rel_resp.json().get("is_following", False)
-                            if is_following:
-                                self.follow_result = "[yellow]SKIP (Sudah)[/]"
-                            else:
-                                f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow")
-                                if f_resp.status_code == 401:
-                                    if await self.login_with_password(client):
-                                        f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow")
-
-                                if f_resp.status_code == 200:
-                                    self.follow_result = "[green]OK (Baru)[/]"
-                                else:
-                                    self.follow_result = f"[red]Gagal ({f_resp.status_code})[/]"
+                        if like_resp.status_code == 200:
+                            res_data = like_resp.json()
+                            if not res_data.get("is_liked", True):
+                                await asyncio.sleep(0.4)
+                                await client.post(f"/api/v1/novels/{self.novel_id}/like", timeout=httpx.Timeout(8.0, connect=4.0))
+                            AccountHistoryManager.record_interaction(self.account, self.novel_id, liked=True)
+                            self.like_result = "[green]OK (Baru)[/]"
                         else:
-                            self.follow_result = f"[red]Gagal ({rel_resp.status_code})[/]"
+                            self.like_result = f"[red]Gagal ({like_resp.status_code})[/]"
                     except Exception:
-                        self.follow_result = "[red]Error[/]"
+                        self.like_result = "[red]Error[/]"
 
-                # -------------------------------------------------------------
-                # TAHAP 2: SIMULASI MEMBACA (Chapters & Royalty Post-View)
-                # -------------------------------------------------------------
-                if self.chapters:
-                    read_ids = set()
-                    if self.skip_already_read:
-                        progress.update(task_id, description="[dim]Cek riwayat baca...[/]")
-                        read_ids = await self.get_read_chapter_ids(client)
+            # 1.B. Auto Bookmark / Simpan (dengan deteksi, skip, & toggle proteksi)
+            if self.do_bookmark:
+                is_saved = novel_status_data.get("is_saved", False) if novel_status_data else False
+                if is_saved:
+                    self.bookmark_result = "[yellow]SKIP (Sudah)[/]"
+                else:
+                    try:
+                        bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark", timeout=httpx.Timeout(8.0, connect=4.0))
+                        if bm_resp.status_code == 401:
+                            if await self.login_with_password(client):
+                                bm_resp = await client.post(f"/api/v1/novels/{self.novel_id}/bookmark", timeout=httpx.Timeout(8.0, connect=4.0))
 
-                    for ch_idx, ch in enumerate(self.chapters, start=1):
-                        ch_num = ch.get("chapter_num", 1)
-                        ch_id = ch.get("hash_id", "")
-                        ch_title = ch.get("title", f"Bab {ch_num}")[:15]
+                        if bm_resp.status_code == 200:
+                            res_data = bm_resp.json()
+                            if not res_data.get("is_saved", True):
+                                await asyncio.sleep(0.4)
+                                await client.post(f"/api/v1/novels/{self.novel_id}/bookmark", timeout=httpx.Timeout(8.0, connect=4.0))
+                            AccountHistoryManager.record_interaction(self.account, self.novel_id, bookmarked=True)
+                            self.bookmark_result = "[green]OK (Baru)[/]"
+                        else:
+                            self.bookmark_result = f"[red]Gagal ({bm_resp.status_code})[/]"
+                    except Exception:
+                        self.bookmark_result = "[red]Error[/]"
 
-                        # Deteksi apakah bab sudah pernah dibaca sebelumnya
-                        if self.skip_already_read and (ch_id in read_ids or ch_num in read_ids):
+            # 1.C. Auto Follow Author (dengan deteksi & skip)
+            if self.do_follow and self.author_hash_id:
+                try:
+                    rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship", timeout=httpx.Timeout(8.0, connect=4.0))
+                    if rel_resp.status_code == 401:
+                        if await self.login_with_password(client):
+                            rel_resp = await client.get(f"/api/v1/social/profiles/{self.author_hash_id}/relationship", timeout=httpx.Timeout(8.0, connect=4.0))
+
+                    if rel_resp.status_code == 200:
+                        is_following = rel_resp.json().get("is_following", False)
+                        if is_following:
+                            self.follow_result = "[yellow]SKIP (Sudah)[/]"
+                        else:
+                            f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow", timeout=httpx.Timeout(8.0, connect=4.0))
+                            if f_resp.status_code == 401:
+                                if await self.login_with_password(client):
+                                    f_resp = await client.put(f"/api/v1/social/profiles/{self.author_hash_id}/follow", timeout=httpx.Timeout(8.0, connect=4.0))
+
+                            if f_resp.status_code == 200:
+                                self.follow_result = "[green]OK (Baru)[/]"
+                            else:
+                                self.follow_result = f"[red]Gagal ({f_resp.status_code})[/]"
+                    else:
+                        self.follow_result = f"[red]Gagal ({rel_resp.status_code})[/]"
+                except Exception:
+                    self.follow_result = "[red]Error[/]"
+
+            # -------------------------------------------------------------
+            # TAHAP 2: SIMULASI MEMBACA (Chapters & Royalty Post-View)
+            # -------------------------------------------------------------
+            if self.chapters:
+                read_ids = set()
+                if self.skip_already_read:
+                    progress.update(task_id, description="[dim]Cek riwayat baca...[/]")
+                    read_ids = await self.get_read_chapter_ids(client)
+
+                for ch_idx, ch in enumerate(self.chapters, start=1):
+                    ch_num = ch.get("chapter_num", 1)
+                    ch_id = ch.get("hash_id", "")
+                    ch_title = ch.get("title", f"Bab {ch_num}")[:15]
+
+                    # Deteksi apakah bab sudah pernah dibaca sebelumnya
+                    if self.skip_already_read and (ch_id in read_ids or ch_num in read_ids):
+                        progress.update(
+                            task_id,
+                            description=f"[dim]Bab {ch_num} (Skip - Sudah Dibaca)[/]",
+                        )
+                        progress.advance(task_id, 1)
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    progress.update(
+                        task_id,
+                        description=f"[yellow]Bab {ch_num} ({ch_idx}/{len(self.chapters)})[/]",
+                    )
+
+                    # 2.A. Fetch isi bab secara dinamis dengan proteksi retry & rotasi proxy (TIDAK BOLEH KE DIRECT)
+                    ch_url = f"/api/v1/novels/{self.novel_id}/chapters/{ch_id}"
+                    ch_resp = None
+                    try:
+                        ch_resp = await client.get(ch_url, timeout=httpx.Timeout(8.0, connect=4.0))
+                        if ch_resp.status_code == 404:
+                            clean_headers = {
+                                "user-agent": self.user_agent,
+                                "x-device-id": self.device_id,
+                                "accept": "application/json",
+                            }
+                            ch_resp = await client.get(ch_url, headers=clean_headers, timeout=httpx.Timeout(8.0, connect=4.0))
+                        ch_resp.raise_for_status()
+                    except Exception as get_err:
+                        if is_dead_or_proxy_error(get_err) and self.proxy_manager:
+                            if await self.rotate_proxy(get_err):
+                                client = await self.get_client()
+                                try:
+                                    ch_resp = await client.get(ch_url, timeout=httpx.Timeout(8.0, connect=4.0))
+                                    ch_resp.raise_for_status()
+                                except Exception:
+                                    ch_resp = None
+                        if not ch_resp or ch_resp.status_code != 200:
+                            logger.debug("[%s] Gagal fetch bab %d (%s), lewati ke bab berikutnya...", self.worker_id, ch_num, get_err)
                             progress.update(
                                 task_id,
-                                description=f"[dim]Bab {ch_num} (Skip - Sudah Dibaca)[/]",
+                                description=f"[dim]Bab {ch_num} (Skip - Gagal Load)[/]",
                             )
-                            progress.advance(task_id, 1)
-                            await asyncio.sleep(0.3)
                             continue
+
+                    # 2.B. Simulasi scrolling membaca bertahap (per ~3 detik & per persen progres)
+                    read_delay = max(4.0, random.uniform(self.base_delay * 0.8, self.base_delay * 1.25))
+                    step_interval = random.uniform(2.5, 3.5)
+                    num_steps = max(3, int(read_delay / step_interval))
+                    step_time = read_delay / num_steps
+
+                    for step in range(1, num_steps + 1):
+                        await asyncio.sleep(step_time)
+                        current_pct = min(1.0, round(step / num_steps, 2))
+                        current_pct_display = int(current_pct * 100)
 
                         progress.update(
                             task_id,
-                            description=f"[yellow]Bab {ch_num} ({ch_idx}/{len(self.chapters)})[/]",
+                            description=f"[yellow]Bab {ch_num}/{len(self.chapters)} ({current_pct_display}%)[/]",
                         )
 
-                        # 2.A. Fetch isi bab secara dinamis dengan smart fallback unauthenticated jika region isolasi
                         try:
-                            ch_url = f"/api/v1/novels/{self.novel_id}/chapters/{ch_id}"
-                            ch_resp = await client.get(ch_url)
-                            if ch_resp.status_code == 404:
-                                clean_kwargs: Dict[str, Any] = {
-                                    "base_url": self.BASE_URL,
-                                    "timeout": httpx.Timeout(self.timeout),
-                                    "headers": {
-                                        "user-agent": self.user_agent,
-                                        "x-device-id": self.device_id,
-                                        "accept": "application/json",
-                                    },
-                                }
-                                if self.proxy:
-                                    clean_kwargs["proxy"] = self.proxy
-                                async with httpx.AsyncClient(**clean_kwargs) as clean_client:
-                                    ch_resp = await clean_client.get(ch_url)
-                            ch_resp.raise_for_status()
-                        except Exception as get_err:
-                            if self.proxy and ("407" in str(get_err) or "proxy" in str(get_err).lower() or isinstance(get_err, (httpx.ProxyError, httpx.ConnectError))):
-                                logger.warning("[%s] Proxy bermasalah (%s), beralih ke Direct Connection...", self.worker_id, get_err)
-                                self.proxy = None
-                                if client and not client.is_closed:
-                                    await client.aclose()
-                                client = httpx.AsyncClient(headers=self.build_headers(), timeout=httpx.Timeout(self.timeout), http2=True, base_url=self.BASE_URL)
-                            logger.debug("[%s] Gagal GET bab %d: %s", self.worker_id, ch_num, get_err)
+                            prog_payload = {
+                                "novel_id": self.novel_id,
+                                "chapter_id": ch_id,
+                                "scroll_percent": current_pct,
+                                "reading_progress": current_pct,
+                                "read_mode": "scroll",
+                            }
+                            await client.post("/api/reading/progress", json=prog_payload, timeout=httpx.Timeout(6.0, connect=3.0))
+                        except Exception as prog_err:
+                            logger.debug("[%s] Gagal update progress bab %d (%d%%): %s", self.worker_id, ch_num, current_pct_display, prog_err)
 
-                        # 2.B. Simulasi scrolling membaca bertahap / heartbeat (per ~3 detik & per persen progres)
-                        read_delay = max(4.0, random.uniform(self.base_delay * 0.8, self.base_delay * 1.25))
-                        step_interval = random.uniform(2.5, 3.5)
-                        num_steps = max(3, int(read_delay / step_interval))
-                        step_time = read_delay / num_steps
+                    # Kirim heartbeat sesi membaca dengan dwell 3-7 menit (180s - 420s)
+                    target_dwell = random.uniform(180.0, 420.0)
+                    reading_session_id = f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}"
+                    hb_payload = {
+                        "session_id": reading_session_id,
+                        "novel_id": self.novel_id,
+                        "chapter_id": ch_id,
+                        "active_seconds": int(target_dwell),
+                        "scroll_percent": 1.0,
+                        "reading_progress": 1.0,
+                        "chapter_num": ch_num,
+                        "novel_title": self.novel_title,
+                        "chapter_title": ch_title,
+                        "source": "chapter_route",
+                        "ended": True,
+                        "completed": True,
+                    }
+                    try:
+                        await client.post("/api/reading/sessions/heartbeat", json=hb_payload, timeout=httpx.Timeout(6.0, connect=3.0))
+                    except Exception as hb_err:
+                        logger.debug("[%s] Gagal heartbeat member bab %d: %s", self.worker_id, ch_num, hb_err)
 
-                        for step in range(1, num_steps + 1):
-                            await asyncio.sleep(step_time)
-                            current_pct = min(1.0, round(step / num_steps, 2))
-                            current_pct_display = int(current_pct * 100)
-
-                            progress.update(
-                                task_id,
-                                description=f"[yellow]Bab {ch_num}/{len(self.chapters)} ({current_pct_display}%)[/]",
-                            )
-
-                            # Kirim progres membaca berkala layaknya user scrolling (tiap ~3 detik / per progress)
-                            try:
-                                prog_payload = {
-                                    "novel_id": self.novel_id,
-                                    "chapter_id": ch_id,
-                                    "scroll_percent": current_pct,
-                                    "reading_progress": current_pct,
-                                    "read_mode": "scroll",
-                                }
-                                await client.post("/api/reading/progress", json=prog_payload)
-                            except Exception as prog_err:
-                                logger.debug("[%s] Gagal update progress bab %d (%d%%): %s", self.worker_id, ch_num, current_pct_display, prog_err)
-
-                        # Kirim heartbeat sesi membaca dengan dwell 3-7 menit (180s - 420s)
-                        target_dwell = random.uniform(180.0, 420.0)
-                        reading_session_id = f"reading:{self.novel_id}:{ch_id}:{int(time.time()*1000)}:{secrets.token_hex(4)}"
-                        hb_payload = {
-                            "session_id": reading_session_id,
-                            "novel_id": self.novel_id,
-                            "chapter_id": ch_id,
-                            "active_seconds": int(target_dwell),
-                            "scroll_percent": 1.0,
-                            "reading_progress": 1.0,
-                            "chapter_num": ch_num,
-                            "novel_title": self.novel_title,
-                            "chapter_title": ch_title,
-                            "source": "chapter_route",
-                            "ended": True,
-                            "completed": True,
-                        }
-                        try:
-                            await client.post("/api/reading/sessions/heartbeat", json=hb_payload)
-                        except Exception as hb_err:
-                            logger.debug("[%s] Gagal heartbeat member bab %d: %s", self.worker_id, ch_num, hb_err)
-
-                        # 2.C. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        year_month = datetime.now().strftime("%Y-%m")
-                        post_view_payload = {
-                            "novel_hash_id": self.novel_id,
-                            "post_hash_id": ch_id,
-                            "post_title": ch_title,
-                            "novel_title": self.novel_title,
-                            "attribution": {
-                                "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
-                                "work_id": self.novel_id,
-                                "first_touch": {
-                                    "discovery_method": "direct",
-                                    "source_screen": "chapter_route",
-                                    "touched_at": now_iso,
-                                    "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
-                                },
-                                "last_touch": {
-                                    "discovery_method": "direct",
-                                    "source_screen": "chapter_route",
-                                    "touched_at": now_iso,
-                                    "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
-                                },
+                    # 2.C. Kirim Post-View Royalti Telemetri (Setelah tuntas 100%)
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    year_month = datetime.now().strftime("%Y-%m")
+                    post_view_payload = {
+                        "novel_hash_id": self.novel_id,
+                        "post_hash_id": ch_id,
+                        "post_title": ch_title,
+                        "novel_title": self.novel_title,
+                        "attribution": {
+                            "attribution_session_id": IdentifierGenerator.generate_session_id("attr", random_len=8),
+                            "work_id": self.novel_id,
+                            "first_touch": {
+                                "discovery_method": "direct",
+                                "source_screen": "chapter_route",
+                                "touched_at": now_iso,
+                                "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
                             },
-                            "callback_contract": "telemetry_v2",
-                            "source_event_id": f"member:{self.user_id}:{ch_id}:{year_month}",
-                        }
+                            "last_touch": {
+                                "discovery_method": "direct",
+                                "source_screen": "chapter_route",
+                                "touched_at": now_iso,
+                                "entry_event_id": IdentifierGenerator.generate_session_id("entry", random_len=8),
+                            },
+                        },
+                        "callback_contract": "telemetry_v2",
+                        "source_event_id": f"member:{self.user_id}:{ch_id}:{year_month}",
+                    }
 
-                        try:
-                            post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload)
-                            if post_resp.status_code in (200, 201):
-                                self.chapters_read += 1
-                                AccountHistoryManager.record_interaction(self.account, self.novel_id, read=True, chapter_num=ch_num)
-                                progress.advance(task_id, 1)
-                        except Exception as log_err:
-                            logger.debug("[%s] Gagal post-view bab %d: %s", self.worker_id, ch_num, log_err)
+                    try:
+                        post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload, timeout=httpx.Timeout(8.0, connect=4.0))
+                        if post_resp.status_code in (200, 201):
+                            self.chapters_read += 1
+                            AccountHistoryManager.record_interaction(self.account, self.novel_id, read=True, chapter_num=ch_num)
+                            progress.advance(task_id, 1)
+                        elif post_resp.status_code == 401:
+                            if await self.ensure_valid_session(client):
+                                post_resp = await client.post("/api/reading/v2/logs/post-view", json=post_view_payload, timeout=httpx.Timeout(8.0, connect=4.0))
+                                if post_resp.status_code in (200, 201):
+                                    self.chapters_read += 1
+                                    AccountHistoryManager.record_interaction(self.account, self.novel_id, read=True, chapter_num=ch_num)
+                                    progress.advance(task_id, 1)
+                    except Exception as log_err:
+                        logger.debug("[%s] Gagal post-view bab %d: %s", self.worker_id, ch_num, log_err)
+                        if is_dead_or_proxy_error(log_err) and self.proxy_manager:
+                            await self.rotate_proxy(log_err)
+                            client = await self.get_client()
 
-                        # 2.D. Jeda istirahat antar-bab sesuai konfigurasi user
-                        if ch_idx < len(self.chapters) and self.inter_chapter_delay > 0:
-                            next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
-                            progress.update(
-                                task_id,
-                                description=f"[cyan]Jeda Bab {ch_num}->{next_ch_num} ({self.inter_chapter_delay:.1f}s)[/]",
-                            )
-                            await asyncio.sleep(self.inter_chapter_delay)
+                    # 2.D. Jeda istirahat antar-bab sesuai konfigurasi user
+                    if ch_idx < len(self.chapters) and self.inter_chapter_delay > 0:
+                        next_ch_num = self.chapters[ch_idx].get("chapter_num", ch_num + 1)
+                        progress.update(
+                            task_id,
+                            description=f"[cyan]Jeda Bab {ch_num}->{next_ch_num} ({self.inter_chapter_delay:.1f}s)[/]",
+                        )
+                        await asyncio.sleep(self.inter_chapter_delay)
 
-                self.status = "[green]Sukses Selesai[/]"
-                progress.update(
-                    task_id,
-                    description="[bold green]Selesai Semua Aksi [OK][/]",
-                )
+            self.status = "[green]Sukses Selesai[/]"
+            progress.update(
+                task_id,
+                description="[bold green]Selesai Semua Aksi [OK][/]",
+            )
 
         except Exception as main_exc:
-            if self.proxy and is_dead_or_proxy_error(main_exc):
-                default_proxy_manager.mark_failed(self.proxy, main_exc)
+            if self.proxy and is_dead_or_proxy_error(main_exc) and self.proxy_manager:
+                self.proxy_manager.mark_failed(self.proxy, main_exc)
             self.status = f"[red]Error: {str(main_exc)[:30]}[/]"
             progress.update(
                 task_id,
                 description=f"[bold red]Error: {str(main_exc)[:15]}[/]",
             )
+        finally:
+            await self.close_client()
 
         return self._build_summary()
 
@@ -713,7 +748,30 @@ class FullAutoOrchestrator:
             try:
                 acc_country = account.get("country", "ID")
                 sess_id = f"fa_{worker_idx}_{secrets.token_hex(4)}"
-                proxy = self.proxy_manager.pop_proxy(country_code=acc_country, session_id=sess_id)
+                acc_proxy = account.get("proxy")
+                if acc_proxy:
+                    proxy = acc_proxy
+                else:
+                    proxy = self.proxy_manager.pop_proxy(country_code=acc_country, session_id=sess_id)
+
+                if not proxy:
+                    progress.reset(tid, total=total_steps)
+                    progress.update(
+                        tid,
+                        role=f"[red]Akun-{worker_idx:02d}[/]",
+                        description="[bold red]Gagal (Wajib Proxy)[/]",
+                    )
+                    return {
+                        "worker_id": f"Akun-{worker_idx:02d}",
+                        "email": account.get("email", "-"),
+                        "country": acc_country,
+                        "like": "[red]NO PROXY[/]",
+                        "bookmark": "[red]NO PROXY[/]",
+                        "follow": "[red]NO PROXY[/]",
+                        "chapters_read": 0,
+                        "status": "[red]Gagal (Wajib Proxy)[/]",
+                    }
+
                 progress.reset(tid, total=total_steps)
                 progress.update(
                     tid,
@@ -737,13 +795,11 @@ class FullAutoOrchestrator:
                     proxy_manager=self.proxy_manager,
                 )
                 res = await worker.execute(progress, tid)
-                if proxy:
-                    if "sukses" in str(res.get("status", "")).lower() or res.get("chapters_read", 0) > 0:
-                        self.proxy_manager.mark_used(proxy)
                 return res
             finally:
-                if proxy:
-                    self.proxy_manager.release_proxy_slot(proxy)
+                active_p = getattr(worker, "proxy", None) if 'worker' in locals() else proxy
+                if active_p and self.proxy_manager:
+                    self.proxy_manager.release_proxy_slot(active_p)
                 progress.advance(overall_task, 1)
                 slot_queue.put_nowait((slot_idx, tid))
 
@@ -899,6 +955,13 @@ async def run_full_auto_cli(preset_target: Optional[str] = None) -> None:
     if not accounts:
         console.print("[bold red][ERROR] Belum ada akun terdaftar di 'akun.txt'![/]")
         console.print("[yellow]Silakan buat akun terlebih dahulu menggunakan Menu [2] Auto Signup Generator.[/]")
+        return
+
+    default_proxy_manager.load_proxies()
+    if not default_proxy_manager.has_proxies:
+        console.print("[bold red][ERROR] PROXY TIDAK DITEMUKAN / KOSONG DI 'proxies.txt'![/]")
+        console.print("[yellow]Sesuai aturan keamanan, setiap akun memiliki negara/proxy berbeda dan WAJIB menggunakan proxy.[/]")
+        console.print("[yellow]Koneksi langsung tanpa proxy (Direct IP) DILARANG KERAS.[/]")
         return
 
     # 1. Input Target URL / Novel ID

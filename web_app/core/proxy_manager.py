@@ -148,6 +148,7 @@ def get_weighted_royalty_country(candidate_countries: Optional[List[str]] = None
     return random.choices(pool, weights=weights, k=1)[0]
 
 
+
 def sanitize_proxy_url(raw_proxy: str) -> Optional[str]:
     """
     Membersihkan dan menormalisasi URL proxy dari format kotor seperti:
@@ -307,6 +308,7 @@ class ProxyInfo:
         """
         if not self.is_brightdata:
             return self.raw_url
+
 
         new_username = self.username
 
@@ -1258,6 +1260,7 @@ class ProxyManager:
             self._current_index += 1
             return proxy_info.raw_url
 
+
     def get_base_fallback_proxy(self) -> Optional[str]:
         """Mengambil base proxy tanpa targeting negara spesifik."""
         with self._lock:
@@ -1412,6 +1415,11 @@ def is_dead_or_proxy_error(exc: Optional[Any]) -> bool:
         "proxy",
         "407",
         "socks",
+        "10054",
+        "forcibly closed",
+        "remote host",
+        "winerror",
+        "reset by peer",
         "connection reset",
         "connection refused",
         "actively refused",
