@@ -21,6 +21,36 @@ def extract_base_username(email_addr: str) -> str:
     user = user.replace(".", "")
     return user
 
+
+def format_natural_email(email_addr: str) -> str:
+    """Merapikan email agar memiliki format titik yang wajar (maksimal 1 titik alami)."""
+    email_addr = email_addr.strip().lower()
+    if "@gmail.com" in email_addr:
+        user_part = email_addr.split("@")[0].replace(".", "")
+        KNOWN_SPLITS = {
+            "alacatarik177": "alaca.tarik177",
+            "mansurkurtaran5": "mansur.kurtaran5",
+            "yavashuseyin15": "yavas.huseyin15",
+            "balatcemre": "balat.cemre",
+        }
+        if user_part in KNOWN_SPLITS:
+            return f"{KNOWN_SPLITS[user_part]}@gmail.com"
+
+        m = re.match(r"^([a-z]+)(\d+)$", user_part)
+        if m:
+            letters, numbers = m.group(1), m.group(2)
+            if len(letters) >= 6:
+                mid = len(letters) // 2
+                return f"{letters[:mid]}.{letters[mid:]}{numbers}@gmail.com"
+            else:
+                return f"{letters}.{numbers}@gmail.com"
+        elif len(user_part) >= 6:
+            mid = len(user_part) // 2
+            return f"{user_part[:mid]}.{user_part[mid:]}@gmail.com"
+        else:
+            return f"{user_part}@gmail.com"
+    return email_addr
+
 from .config import (
     ACCOUNTS_FILE,
     MIN_SIGNUP_INTERVAL_SEC,
@@ -113,9 +143,9 @@ class StealthScheduler:
             
             temp_email = None
             if verifier:
-                # 2. Resolusi Provider Email Wajar (Outlook / Hotmail - Bebas Edu & Bebas Daur Ulang Nama)
+                # 2. Resolusi Provider Email Wajar (Gmail / Outlook / Hotmail - Bebas Edu & Bebas Daur Ulang Nama)
                 if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                    chosen_provider = random.choice(["outlook", "hotmail"])
+                    chosen_provider = random.choice(["gmail", "outlook", "hotmail"])
                 else:
                     chosen_provider = email_provider.lower().strip()
 
@@ -134,33 +164,26 @@ class StealthScheduler:
                     if candidate:
                         # Tolak jika domain edu
                         if "@high.edu.pl" in candidate or candidate.endswith(".edu"):
-                            provider_key = random.choice(["outlook", "hotmail"])
-                            use_dot = False
-                            use_plus = True
+                            provider_key = random.choice(["gmail", "outlook", "hotmail"])
+                            use_dot = (provider_key == "gmail")
+                            use_plus = (provider_key != "gmail")
                             await asyncio.sleep(0.4)
                             continue
 
+                        # Format email agar titik wajar & natural (maks 1 titik, bukan rentetan aneh)
+                        candidate = format_natural_email(candidate)
                         base_u = extract_base_username(candidate)
 
                         # Tolak jika base user sudah pernah terdaftar (mencegah dot trick berulang dari nama yang sama)
                         if base_u in existing_base_users or candidate.lower() in existing_emails:
                             self.log(f"[dim yellow]Nama akun dasar '{base_u}' sudah pernah dipakai, meminta nama baru...[/]")
                             if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                                chosen_provider = random.choice(["outlook", "hotmail"])
+                                chosen_provider = random.choice(["gmail", "outlook", "hotmail"])
                                 provider_key = chosen_provider
-                                use_dot = False
-                                use_plus = True
+                                use_dot = (provider_key == "gmail")
+                                use_plus = (provider_key != "gmail")
                             await asyncio.sleep(0.5)
                             continue
-
-                        # Jika Gmail, normalkan titik agar wajar (maksimal 1 titik, bukan rentetan titik)
-                        if "@gmail.com" in candidate and candidate.count(".") > 2:
-                            u_part = candidate.split("@")[0].replace(".", "")
-                            if len(u_part) > 5:
-                                mid = len(u_part) // 2
-                                candidate = f"{u_part[:mid]}.{u_part[mid:]}@gmail.com"
-                            else:
-                                candidate = f"{u_part}@gmail.com"
 
                         temp_email = candidate.lower()
                         existing_emails.add(temp_email)
@@ -168,10 +191,10 @@ class StealthScheduler:
                         break
                     else:
                         if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                            chosen_provider = random.choice(["outlook", "hotmail"])
+                            chosen_provider = random.choice(["gmail", "outlook", "hotmail"])
                             provider_key = chosen_provider
-                            use_dot = False
-                            use_plus = True
+                            use_dot = (provider_key == "gmail")
+                            use_plus = (provider_key != "gmail")
                         await asyncio.sleep(0.5)
 
                 if temp_email:
