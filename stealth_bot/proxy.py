@@ -41,6 +41,16 @@ COUNTRY_METADATA: Dict[str, Dict[str, str]] = {
 }
 
 
+import sys
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
+try:
+    from proxy_manager import HypeProxyClient
+except ImportError:
+    HypeProxyClient = None
+
 class ProxyItem:
     def __init__(self, raw_url: str):
         self.raw_url = raw_url.strip()
@@ -48,6 +58,9 @@ class ProxyItem:
         self.fail_count = 0
         self.last_failed = 0.0
         self.cooldown_until = 0.0
+        # Deteksi ID HypeProxy (user4 -> 4)
+        m_uid = re.search(r"user(\d+)", self.raw_url, re.IGNORECASE)
+        self.hypeproxy_id = int(m_uid.group(1)) if m_uid else None
 
     @property
     def is_available(self) -> bool:
@@ -59,6 +72,15 @@ class ProxyItem:
         # Cooldown bertahap (15s s/d 120s)
         backoff = min(15.0 * (2 ** min(self.fail_count - 1, 3)), 120.0)
         self.cooldown_until = time.time() + backoff
+
+        # Picu rotasi IP instan di HypeProxy jika slot terdaftar
+        if HypeProxyClient and self.hypeproxy_id is not None:
+            def _rotate():
+                try:
+                    HypeProxyClient.rotate_proxy(self.hypeproxy_id)
+                except Exception:
+                    pass
+            threading.Thread(target=_rotate, daemon=True).start()
 
     def mark_success(self):
         self.fail_count = max(0, self.fail_count - 1)

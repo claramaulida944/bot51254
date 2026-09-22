@@ -102,7 +102,7 @@ class StealthApiClient:
 
             client_kwargs: Dict[str, Any] = {
                 "base_url": BASE_URL,
-                "timeout": httpx.Timeout(25.0, connect=15.0),
+                "timeout": httpx.Timeout(20.0, connect=3.5, read=15.0),
                 "headers": self.get_headers(),
                 "http2": False if self.current_proxy else True,
             }
@@ -150,12 +150,8 @@ class StealthApiClient:
         2. Kirim POST /api/auth/signup.
         3. Sinkronisasi atribusi AppsFlyer (POST /api/auth/signup-attribution).
         4. Hydration state awal akun (/api/q/account & categories).
+        Dilengkapi multi-proxy auto-retry jika proxy pertama timeout / gagal connect.
         """
-        # 1. Pre-check
-        await self.check_email_availability()
-        await asyncio.sleep(random.uniform(0.6, 1.4))
-
-        # 2. Signup
         meta = COUNTRY_METADATA.get(self.profile.country, COUNTRY_METADATA["ID"])
         payload = {
             "email": self.profile.email,
@@ -170,44 +166,73 @@ class StealthApiClient:
             "signup_market_source": "auto",
         }
 
-        client = await self.get_client()
-        try:
-            resp = await client.post("/api/auth/signup", json=payload)
-            if resp.status_code == 201:
-                data = resp.json()
-                self.access_token = data.get("access_token", "")
-                self.refresh_token = data.get("refresh_token", "")
-                user_info = data.get("user", {})
-                login_id = user_info.get("login_id") or self.profile.email
+        max_attempts = 5
+        last_error = ""
 
-                # Perbarui header client dengan access_token baru
-                client.headers["authorization"] = f"Bearer {self.access_token}"
+        for attempt in range(1, max_attempts + 1):
+            client = await self.get_client()
+            try:
+                # 1. Pre-check
+                await self.check_email_availability()
+                await asyncio.sleep(random.uniform(0.3, 0.7))
 
-                # 3. [KRUSIAL] Sinkronisasi Atribusi AppsFlyer
-                await self._sync_signup_attribution()
+                # 2. Signup
+                resp = await client.post("/api/auth/signup", json=payload)
+                if resp.status_code == 201:
+                    data = resp.json()
+                    self.access_token = data.get("access_token", "")
+                    self.refresh_token = data.get("refresh_token", "")
+                    user_info = data.get("user", {})
+                    login_id = user_info.get("login_id") or self.profile.email
 
-                # 4. [KRUSIAL] Hydration data awal pengguna
-                await self._hydrate_user_state()
+                    # Perbarui header client dengan access_token baru
+                    client.headers["authorization"] = f"Bearer {self.access_token}"
 
-                if self.current_proxy:
-                    self.proxy_manager.mark_used(self.current_proxy)
+                    # 3. [KRUSIAL] Sinkronisasi Atribusi AppsFlyer
+                    await self._sync_signup_attribution()
 
-                return True, "Registrasi & Atribusi AppsFlyer Sukses"
-            elif resp.status_code in (403, 429):
-                await self.rotate_proxy_if_needed(f"HTTP {resp.status_code}")
-                return False, f"Rate limit / Cloudflare (HTTP {resp.status_code})"
-            else:
-                return False, f"Server menolak: HTTP {resp.status_code} ({resp.text[:80]})"
-        except Exception as exc:
-            err_msg = str(exc) or repr(exc)
-            if "Proxy" in type(exc).__name__ or "407" in err_msg:
-                err_desc = f"Proxy Bermasalah ({type(exc).__name__}: {err_msg})"
-            elif "Timeout" in type(exc).__name__:
-                err_desc = f"Proxy Timeout ({type(exc).__name__}: {err_msg})"
-            else:
-                err_desc = f"{type(exc).__name__}: {err_msg}"
-            await self.rotate_proxy_if_needed(err_desc)
-            return False, f"Koneksi gagal: {err_desc}"
+                    # 4. [KRUSIAL] Hydration data awal pengguna
+                    await self._hydrate_user_state()
+
+                    if self.current_proxy:
+                        self.proxy_manager.mark_used(self.current_proxy)
+
+                    return True, "Registrasi & Atribusi AppsFlyer Sukses"
+
+                elif resp.status_code in (403, 429):
+                    last_error = f"Rate limit / Cloudflare (HTTP {resp.status_code})"
+                    logger.warning("[Proxy 429/403] Percobaan %d/%d: %s. Memutar proxy...", attempt, max_attempts, last_error)
+                    await self.rotate_proxy_if_needed(last_error)
+                    if attempt < max_attempts:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return False, last_error
+
+                else:
+                    return False, f"Server menolak: HTTP {resp.status_code} ({resp.text[:80]})"
+
+            except Exception as exc:
+                err_msg = str(exc) or repr(exc)
+                if "Proxy" in type(exc).__name__ or "407" in err_msg:
+                    err_desc = f"Proxy Bermasalah ({type(exc).__name__}: {err_msg})"
+                elif "Timeout" in type(exc).__name__:
+                    err_desc = f"Proxy Timeout ({type(exc).__name__}: {err_msg})"
+                else:
+                    err_desc = f"{type(exc).__name__}: {err_msg}"
+
+                last_error = err_desc
+                logger.warning(
+                    "[Proxy Error] Percobaan %d/%d via proxy gagal (%s). Mencoba slot proxy berikutnya...",
+                    attempt,
+                    max_attempts,
+                    err_desc,
+                )
+                await self.rotate_proxy_if_needed(err_desc)
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5)
+                    continue
+
+        return False, f"Koneksi gagal setelah {max_attempts} proxy ({last_error})"
 
     async def _sync_signup_attribution(self):
         """Mengirimkan konfirmasi atribusi instalasi AppsFlyer ke server."""
@@ -239,35 +264,60 @@ class StealthApiClient:
         """
         Mengirim permintaan kode verifikasi ke email akun terdaftar.
         Backend otomatis membaca alamat email dari token JWT Bearer.
+        Mendukung retry dengan rotasi proxy jika socket gagal.
         """
         if not self.access_token:
             return False, "Belum memiliki access_token"
-        client = await self.get_client()
-        try:
-            resp = await client.post("/api/auth/email/send-verification")
-            if resp.status_code == 200:
-                return True, "Kode verifikasi berhasil dikirim"
-        except Exception as exc:
-            return False, f"Koneksi gagal: {exc}"
+
+        for attempt in range(1, 4):
+            client = await self.get_client()
+            try:
+                resp = await client.post("/api/auth/email/send-verification")
+                if resp.status_code == 200:
+                    return True, "Kode verifikasi berhasil dikirim"
+                elif resp.status_code in (403, 429):
+                    await self.rotate_proxy_if_needed(f"HTTP {resp.status_code}")
+                    await asyncio.sleep(0.5)
+                    continue
+                return False, f"Server menolak: HTTP {resp.status_code} ({resp.text[:80]})"
+            except Exception as exc:
+                await self.rotate_proxy_if_needed(str(exc))
+                if attempt < 3:
+                    await asyncio.sleep(0.5)
+                    continue
+                return False, f"Koneksi gagal: {exc}"
+        return False, "Gagal request verifikasi email"
 
     async def verify_email_code(self, code: str) -> Tuple[bool, str]:
         """
         Mengirim kode OTP 6-digit untuk memverifikasi email akun.
         Mengubah status akun menjadi is_email_verified = True.
+        Mendukung retry dengan rotasi proxy jika socket gagal.
         """
         if not self.access_token:
             return False, "Belum memiliki access_token"
-        client = await self.get_client()
-        try:
-            resp = await client.post(
-                "/api/auth/email/verify",
-                json={"code": str(code).strip()},
-            )
-            if resp.status_code == 200:
-                return True, "Email berhasil diverifikasi!"
-            return False, f"Kode ditolak: HTTP {resp.status_code} ({resp.text[:80]})"
-        except Exception as exc:
-            return False, f"Koneksi gagal: {exc}"
+
+        for attempt in range(1, 4):
+            client = await self.get_client()
+            try:
+                resp = await client.post(
+                    "/api/auth/email/verify",
+                    json={"code": str(code).strip()},
+                )
+                if resp.status_code == 200:
+                    return True, "Email berhasil diverifikasi!"
+                elif resp.status_code in (403, 429):
+                    await self.rotate_proxy_if_needed(f"HTTP {resp.status_code}")
+                    await asyncio.sleep(0.5)
+                    continue
+                return False, f"Kode ditolak: HTTP {resp.status_code} ({resp.text[:80]})"
+            except Exception as exc:
+                await self.rotate_proxy_if_needed(str(exc))
+                if attempt < 3:
+                    await asyncio.sleep(0.5)
+                    continue
+                return False, f"Koneksi gagal: {exc}"
+        return False, "Gagal verifikasi kode OTP"
 
     # =========================================================================
     # PEMBACAAN NOVEL & TELEMETRI AKTIF
