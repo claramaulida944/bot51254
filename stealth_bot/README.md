@@ -47,9 +47,11 @@ python3 main.py
 ```
 
 ### Menu Utama:
-1. **`[1] Jalankan Organic Stealth Reader`**:
-   Menjalankan akun pembaca dengan penyamaran katalog, durasi membaca berbasis panjang kata, dan telemetri resmi.
-2. **`[2] Registrasi Akun Halus (Spaced / Anti-Clustering Signup)`**:
+1. **`[1] Jalankan Member Stealth Reader`**:
+   Menjalankan akun terdaftar dengan penyamaran katalog, durasi membaca WPM dinamis, dan telemetri pembayaran royalti resmi.
+2. **`[2] Jalankan Guest Stealth Reader`**:
+   Menjalankan sesi membaca tamu (*Guest Mode*) tanpa memerlukan akun. Bebas 100% dari resiko *Registration Clustering*, dilengkapi cold-start resmi Android dan pengiriman heartbeat `PUT /api/guest-reading/progress`.
+3. **`[3] Registrasi Akun Halus (Spaced / Anti-Clustering Signup)`**:
    Mendaftarkan akun baru secara bertahap dengan jeda acak dan sinkronisasi atribusi AppsFlyer.
-3. **`[3] Inspeksi Akun`**:
+4. **`[4] Inspeksi Akun`**:
    Melihat daftar akun yang tersimpan di `akun_stealth.txt`.

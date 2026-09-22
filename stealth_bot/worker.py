@@ -149,3 +149,104 @@ class StealthWorker:
 
         self.log(f"[bold cyan]Selesai sesi! Total {target_read_count} bab novel target terselesaikan secara organik.[/]")
         return target_read_count
+
+
+class StealthGuestWorker:
+    """Pekerja yang mereplikasi pembaca tamu (Guest Reader) yang baru instal aplikasi."""
+
+    def __init__(
+        self,
+        guest_index: int,
+        client: StealthApiClient,
+        target_novel_id: str,
+        status_cb: Optional[Callable[[str], None]] = None,
+    ):
+        self.guest_index = guest_index
+        self.client = client
+        self.target_novel_id = target_novel_id
+        self.status_cb = status_cb or (lambda msg: None)
+        self.timing = ReadingSimulator()
+        self.camouflage = CamouflageEngine(target_novel_id)
+
+    def log(self, text: str):
+        self.status_cb(f"[Guest-{self.guest_index:02d}] {text}")
+
+    async def run_guest_session(self, max_chapters: int = 3) -> int:
+        """
+        Menjalankan 1 siklus pembaca tamu organik:
+        1. Inisiasi sesi tamu resmi (Cold Start -> /api/guest-reading/session).
+        2. Eksplorasi katalog & rekomendasi (Warm-up).
+        3. Membaca bab novel target dengan durasi WPM dinamis.
+        4. Mengirimkan heartbeat progres PUT /api/guest-reading/progress.
+        """
+        self.log("[cyan]Menginisiasi sesi tamu resmi (Cold Start Android)...[/]")
+        ok, msg = await self.client.init_guest_session()
+        if not ok:
+            self.log(f"[red]Gagal inisiasi tamu: {msg}[/]")
+            return 0
+
+        self.log("[green]✓ Sesi tamu aktif & Cookie qf_guest_reader disematkan.[/]")
+
+        # 1. Warm-up di beranda (2 - 5 detik)
+        self.log("[dim]Membuka Beranda & Jelajah Katalog (Warm-up)...[/]")
+        await self.camouflage.fetch_catalog_novels(await self.client.get_client())
+        await asyncio.sleep(random.uniform(2.0, 5.0))
+
+        # 2. Buka daftar bab
+        chapters = await self.client.get_novel_chapters(self.target_novel_id)
+        if not chapters:
+            self.log("[red]Gagal mengambil bab novel target.[/]")
+            return 0
+
+        read_count = 0
+        limit = min(max_chapters, len(chapters))
+
+        for idx in range(limit):
+            ch = chapters[idx]
+            ch_id = ch.get("hash_id") or ch.get("id")
+            ch_num = ch.get("chapter_num", idx + 1)
+            ch_title = ch.get("title", f"Bab {ch_num}")
+
+            self.log(f"[yellow]Membuka Bab {ch_num}: '{ch_title[:25]}'[/]")
+            detail = await self.client.get_chapter_detail(self.target_novel_id, ch_id)
+            if not detail:
+                self.log(f"[red]Gagal memuat teks bab {ch_num}.[/]")
+                continue
+
+            content = detail.get("content", "")
+            duration, pace_pct = self.timing.calculate_reading_duration(content)
+            pace_str = f"({'+' if pace_pct > 0 else ''}{pace_pct}% vs sblm)" if pace_pct != 0 else ""
+
+            self.log(f"[green]Membaca Bab {ch_num} (WPM: {len(content.split())} kata, durasi: {int(duration)}s {pace_str})...[/]")
+
+            # Kirim heartbeat bertahap PUT /api/guest-reading/progress
+            def on_guest_progress(pct: int, el: float):
+                if pct < 100:
+                    self.log(f"[dim]  Bab {ch_num} progres: {pct}% ({int(el)}s)[/]")
+                    asyncio.create_task(
+                        self.client.send_guest_progress(
+                            self.target_novel_id, ch_id, el, scroll_percent=(pct / 100.0), completed=False
+                        )
+                    )
+
+            await self.timing.simulate_human_reading(duration, on_progress=on_guest_progress)
+
+            # Kirim penyelesaian bab resmi
+            await self.client.send_guest_progress(
+                self.target_novel_id, ch_id, duration, scroll_percent=1.0, completed=True
+            )
+
+            read_count += 1
+            self.log(f"[bold green]✓ Selesai Bab {ch_num} sebagai Tamu![/]")
+
+            # Jeda antar bab (3 - 7 detik)
+            if idx < limit - 1:
+                await asyncio.sleep(random.uniform(3.0, 7.0))
+
+            # Drop-off alami pembaca tamu (sebagian tamu tidak membaca tuntas seluruh bab gratis)
+            if read_count >= 2 and random.random() < 0.30:
+                self.log(f"[yellow]Simulasi tamu menutup aplikasi setelah Bab {ch_num} (Natural Drop-off).[/]")
+                break
+
+        self.log(f"[bold cyan]Selesai sesi tamu! Total {read_count} bab terselesaikan dengan aman.[/]")
+        return read_count

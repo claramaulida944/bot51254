@@ -49,6 +49,8 @@ class StealthApiClient:
         self.profile = profile
         self.access_token = access_token or ""
         self.refresh_token = refresh_token or ""
+        self.guest_id: Optional[str] = None
+        self.guest_token: Optional[str] = None
         self.proxy_manager = proxy_manager or default_proxy_manager
         self.current_proxy = current_proxy
         self.session_id = ProfileGenerator.generate_session_id()
@@ -86,6 +88,9 @@ class StealthApiClient:
 
         if self.access_token:
             headers["authorization"] = f"Bearer {self.access_token}"
+        elif self.guest_token:
+            headers["x-guest-token"] = self.guest_token
+            headers["cookie"] = f"qf_guest_reader={self.guest_token}"
 
         return headers
 
@@ -333,5 +338,74 @@ class StealthApiClient:
                 }
             ]
             await client.post("/api/v1/analytics/events", json={"events": events})
+        except Exception:
+            pass
+
+    # =========================================================================
+    # SIKLUS HIDUP SESI TAMU RESMI (GUEST READING SESSION)
+    # =========================================================================
+
+    async def init_guest_session(self) -> Tuple[bool, str]:
+        """
+        Inisialisasi sesi tamu resmi dengan alur Cold Start Android:
+        1. Cek app-version & flags aplikasi layaknya user baru instal.
+        2. Kirim POST /api/guest-reading/session.
+        3. Simpan guest_id & guest_token ke client headers dan cookies.
+        """
+        client = await self.get_client()
+        try:
+            # 1. Cold Start: app-version & flags
+            await client.get("/api/auth/app-version")
+            await asyncio.sleep(0.3)
+            await client.get("/api/auth/flags")
+            await asyncio.sleep(0.3)
+            await client.get(f"/api/auth/public-flags?anonymous_id={self.profile.anonymous_id}")
+            await asyncio.sleep(0.4)
+
+            # 2. Inisiasi Sesi Tamu Resmi
+            resp = await client.post("/api/guest-reading/session", content=b"")
+            if resp.status_code == 200:
+                data = resp.json()
+                self.guest_id = data.get("guest_id")
+                self.guest_token = data.get("guest_token") or resp.cookies.get("qf_guest_reader")
+                if self.guest_token:
+                    client.headers["x-guest-token"] = self.guest_token
+                    client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
+                    return True, "Sesi Tamu Berhasil Diinisiasi"
+            return False, f"Server menolak sesi tamu: HTTP {resp.status_code}"
+        except Exception as exc:
+            return False, f"Error inisiasi sesi tamu: {exc}"
+
+    async def send_guest_progress(
+        self,
+        novel_id: str,
+        chapter_id: str,
+        active_reading_seconds: float,
+        scroll_percent: float = 1.0,
+        completed: bool = True,
+    ):
+        """
+        Mengirimkan heartbeat progres membaca tamu resmi:
+        1. PUT /api/guest-reading/progress dengan active_reading_seconds & scroll_percent.
+        2. Mengirim header x-guest-event-id yang sah.
+        """
+        client = await self.get_client()
+        now_ms = int(time.time() * 1000)
+        rnd = ProfileGenerator.generate_base36(now_ms)
+        guest_event_id = f"guest-open:{chapter_id}:{now_ms}:{rnd}"
+
+        headers = {
+            "x-guest-event-id": guest_event_id,
+        }
+        if self.guest_token:
+            headers["x-guest-token"] = self.guest_token
+
+        payload = {
+            "active_reading_seconds": int(active_reading_seconds),
+            "scroll_percent": scroll_percent,
+            "completed": completed,
+        }
+        try:
+            await client.put("/api/guest-reading/progress", json=payload, headers=headers)
         except Exception:
             pass

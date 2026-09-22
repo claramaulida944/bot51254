@@ -29,10 +29,10 @@ from stealth_bot.config import (
     APP_VERSION,
 )
 from stealth_bot.client import StealthApiClient
-from stealth_bot.profile import AccountProfile
+from stealth_bot.profile import AccountProfile, ProfileGenerator
 from stealth_bot.proxy import default_proxy_manager
 from stealth_bot.scheduler import StealthScheduler
-from stealth_bot.worker import StealthWorker
+from stealth_bot.worker import StealthWorker, StealthGuestWorker
 
 console = Console()
 
@@ -128,6 +128,54 @@ async def run_organic_reading_flow(scheduler: StealthScheduler):
     Prompt.ask("\nTekan Enter untuk kembali")
 
 
+async def run_guest_reading_flow():
+    console.print("\n[bold cyan]>>> Sesi Pembaca Tamu Organik (Guest Mode)[/]\n")
+    console.print("[dim]Keunggulan Mode Tamu: Tidak memerlukan akun (Bebas 100% dari 'Registration Clustering').[/]")
+    console.print("[dim]Setiap tamu menggunakan profil, proxy terisolasi & cold-start resmi Android.[/]\n")
+
+    target_novel = Prompt.ask("Masukkan Novel ID Target", default=DEFAULT_TARGET_NOVEL_ID)
+    guest_count = IntPrompt.ask("Berapa sesi tamu yang ingin dijalankan bergantian?", default=5)
+    chapters_per_guest = IntPrompt.ask("Maksimal Bab yang Dibaca per Tamu", default=3)
+    country = Prompt.ask("Kode Negara Tamu (contoh: ID, US, KR, JP)", default="ID").upper()
+
+    console.print(f"\n[bold green]Memulai {guest_count} sesi pembaca tamu untuk novel '{target_novel}'...[/]\n")
+
+    import random
+
+    for i in range(1, guest_count + 1):
+        profile = ProfileGenerator.generate_profile(country_code=country)
+        proxy = default_proxy_manager.pop_proxy(country)
+        client = StealthApiClient(
+            profile=profile,
+            proxy_manager=default_proxy_manager,
+            current_proxy=proxy,
+        )
+
+        def log_cb(msg: str):
+            console.print(msg)
+
+        worker = StealthGuestWorker(
+            guest_index=i,
+            client=client,
+            target_novel_id=target_novel,
+            status_cb=log_cb,
+        )
+
+        try:
+            await worker.run_guest_session(max_chapters=chapters_per_guest)
+        finally:
+            await client.close()
+
+        # Jeda natural antar tamu berikutnya (10 - 25 detik)
+        if i < guest_count:
+            delay = random.uniform(10.0, 25.0)
+            console.print(f"\n[dim]Menunggu jeda kedatangan tamu berikutnya ({int(delay)}s)...[/]\n")
+            await asyncio.sleep(delay)
+
+    console.print("\n[bold green]Semua sesi pembaca tamu telah selesai secara alami![/]")
+    Prompt.ask("\nTekan Enter untuk kembali")
+
+
 async def run_spaced_signup_flow(scheduler: StealthScheduler):
     console.print("\n[bold cyan]>>> Registrasi Akun Halus (Spaced / Throttled Signup)[/]\n")
     console.print("[dim]Mencegah deteksi 'Registration Clustering' dengan jeda acak 60-180 detik per akun.[/]\n")
@@ -184,19 +232,22 @@ async def async_main():
 
         console.print(
             "\n[bold white]Pilihan Menu Utama:[/]\n"
-            " [bold green][1][/] Jalankan Organic Stealth Reader (Multi-Worker Anti-Fraud)\n"
-            " [bold green][2][/] Registrasi Akun Halus (Spaced / Anti-Clustering Signup)\n"
-            " [bold green][3][/] Inspeksi Akun di 'akun_stealth.txt'\n"
+            " [bold green][1][/] Jalankan Member Stealth Reader (Dengan Akun Terdaftar)\n"
+            " [bold green][2][/] Jalankan Guest Stealth Reader (Mode Tamu Organik - Tanpa Akun)\n"
+            " [bold green][3][/] Registrasi Akun Halus (Spaced / Anti-Clustering Signup)\n"
+            " [bold green][4][/] Inspeksi Akun di 'akun_stealth.txt'\n"
             " [bold red][0][/] Keluar ke Terminal\n"
         )
 
-        choice = Prompt.ask("Pilih Menu", choices=["0", "1", "2", "3"], default="1")
+        choice = Prompt.ask("Pilih Menu", choices=["0", "1", "2", "3", "4"], default="1")
 
         if choice == "1":
             await run_organic_reading_flow(scheduler)
         elif choice == "2":
-            await run_spaced_signup_flow(scheduler)
+            await run_guest_reading_flow()
         elif choice == "3":
+            await run_spaced_signup_flow(scheduler)
+        elif choice == "4":
             run_inspect_accounts(scheduler)
         elif choice == "0":
             console.print("[yellow]Keluar dari Stealth Bot. Sampai jumpa![/]")
