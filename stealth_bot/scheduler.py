@@ -18,6 +18,7 @@ from .config import (
     MAX_SIGNUP_INTERVAL_SEC,
 )
 from .client import StealthApiClient
+from .email_verifier import TempTfVerifier
 from .profile import AccountProfile, ProfileGenerator
 from .proxy import StealthProxyManager, default_proxy_manager
 
@@ -62,14 +63,22 @@ class StealthScheduler:
         self,
         total_count: int,
         country_code: str = "ID",
+        verify_email: bool = False,
+        email_provider: str = "gmail",
         cancel_event: Optional[asyncio.Event] = None,
     ) -> int:
         """
         Mendaftarkan `total_count` akun baru dengan jeda acak (jittered interval)
         untuk menghindari pola 'Registration Clustering'.
+        Mendukung verifikasi email otomatis via temp.tf (Gmail Dot Trick / Outlook).
         """
-        self.log(f"[bold cyan]Memulai pendaftaran {total_count} akun dengan jeda anti-clustering ({int(MIN_SIGNUP_INTERVAL_SEC)}-{int(MAX_SIGNUP_INTERVAL_SEC)}s)...[/]")
+        mode_str = f"dengan Verifikasi Email Organik ({email_provider})" if verify_email else "mode Standar (Bypass)"
+        self.log(
+            f"[bold cyan]Memulai pendaftaran {total_count} akun [{mode_str}] "
+            f"dengan jeda anti-clustering ({int(MIN_SIGNUP_INTERVAL_SEC)}-{int(MAX_SIGNUP_INTERVAL_SEC)}s)...[/]"
+        )
         success_count = 0
+        verifier = TempTfVerifier() if verify_email else None
 
         for i in range(1, total_count + 1):
             if cancel_event and cancel_event.is_set():
@@ -77,7 +86,19 @@ class StealthScheduler:
                 break
 
             self.log(f"\n[cyan][{i}/{total_count}] Membuat profil & identitas perangkat baru ({country_code})...[/]")
-            profile = ProfileGenerator.generate_profile(country_code=country_code)
+            
+            temp_email = None
+            if verifier:
+                self.log(f"[dim]Mengambil email organik dari temp.tf (provider: {email_provider})...[/]")
+                use_dot = (email_provider == "gmail")
+                use_plus = (email_provider != "gmail")
+                temp_email = await verifier.get_email(provider=email_provider, use_dot=use_dot, use_plus=use_plus)
+                if temp_email:
+                    self.log(f"[bold cyan]Email Organik Didapat:[/] [green]{temp_email}[/]")
+                else:
+                    self.log("[yellow]Gagal mendapatkan email dari temp.tf, fallback ke email sintetis.[/]")
+
+            profile = ProfileGenerator.generate_profile(country_code=country_code, email=temp_email)
 
             # Ambil proxy unik untuk pendaftaran ini
             proxy = self.proxy_manager.pop_proxy(country_code)
@@ -89,6 +110,29 @@ class StealthScheduler:
 
             ok, msg = await client.perform_organic_signup()
             if ok:
+                is_verified = False
+                if verifier and temp_email:
+                    self.log("[cyan]Memicu pengiriman kode OTP verifikasi ke email...[/]")
+                    send_ok, send_msg = await client.send_email_verification()
+                    if send_ok:
+                        otp_code = await verifier.poll_for_otp(
+                            temp_email,
+                            timeout_sec=60,
+                            interval_sec=4,
+                            log_callback=self.log,
+                        )
+                        if otp_code:
+                            v_ok, v_msg = await client.verify_email_code(otp_code)
+                            if v_ok:
+                                is_verified = True
+                                self.log(f"[bold green]✓ EMAIL TERVERIFIKASI RESMI:[/] {temp_email} (Kode: [yellow]{otp_code}[/])")
+                            else:
+                                self.log(f"[yellow]Verifikasi ditolak server: {v_msg}[/]")
+                        else:
+                            self.log("[yellow]Timeout: Kode OTP tidak diterima dalam 60s, akun tetap disimpan.[/]")
+                    else:
+                        self.log(f"[yellow]Gagal request OTP: {send_msg}[/]")
+
                 acc_data = {
                     "email": profile.email,
                     "password": profile.password,
@@ -99,11 +143,13 @@ class StealthScheduler:
                     "device_id": profile.device_id,
                     "anonymous_id": profile.anonymous_id,
                     "user_agent": profile.user_agent,
-                    "created_at": profile.birth_date,  # iso timestamp
+                    "created_at": profile.birth_date,
+                    "is_email_verified": is_verified,
                 }
                 self.save_account(acc_data)
                 success_count += 1
-                self.log(f"[bold green]✓ Berhasil Mendaftar: {profile.email} (Atribusi AppsFlyer Terverifikasi)[/]")
+                verif_badge = "[bold green]VERIFIED[/]" if is_verified else "[dim yellow]UNVERIFIED[/]"
+                self.log(f"[bold green]✓ Berhasil Mendaftar:[/] {profile.email} [{verif_badge}] (Atribusi AppsFlyer OK)")
             else:
                 self.log(f"[red]✗ Gagal: {msg}[/]")
 

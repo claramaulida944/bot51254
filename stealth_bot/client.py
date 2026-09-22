@@ -228,6 +228,41 @@ class StealthApiClient:
         except Exception:
             pass
 
+    async def send_email_verification(self) -> Tuple[bool, str]:
+        """
+        Mengirim permintaan kode verifikasi ke email akun terdaftar.
+        Backend otomatis membaca alamat email dari token JWT Bearer.
+        """
+        if not self.access_token:
+            return False, "Belum memiliki access_token"
+        client = await self.get_client()
+        try:
+            resp = await client.post("/api/auth/email/send-verification")
+            if resp.status_code == 200:
+                return True, "Kode verifikasi berhasil dikirim"
+            return False, f"Gagal kirim verifikasi: HTTP {resp.status_code} ({resp.text[:80]})"
+        except Exception as exc:
+            return False, f"Koneksi gagal: {exc}"
+
+    async def verify_email_code(self, code: str) -> Tuple[bool, str]:
+        """
+        Mengirim kode OTP 6-digit untuk memverifikasi email akun.
+        Mengubah status akun menjadi is_email_verified = True.
+        """
+        if not self.access_token:
+            return False, "Belum memiliki access_token"
+        client = await self.get_client()
+        try:
+            resp = await client.post(
+                "/api/auth/email/verify",
+                json={"code": str(code).strip()},
+            )
+            if resp.status_code == 200:
+                return True, "Email berhasil diverifikasi!"
+            return False, f"Kode ditolak: HTTP {resp.status_code} ({resp.text[:80]})"
+        except Exception as exc:
+            return False, f"Koneksi gagal: {exc}"
+
     # =========================================================================
     # PEMBACAAN NOVEL & TELEMETRI AKTIF
     # =========================================================================

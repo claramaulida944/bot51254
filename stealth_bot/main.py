@@ -182,6 +182,18 @@ async def run_spaced_signup_flow(scheduler: StealthScheduler):
 
     count = IntPrompt.ask("Berapa akun yang ingin didaftarkan?", default=5)
     country = Prompt.ask("Kode Negara (contoh: ID, US, KR, JP, GB)", default="ID").upper()
+    
+    verify_email = Confirm.ask(
+        "Aktifkan Verifikasi Email Organik via temp.tf (Gmail Dot Trick / Outlook)?",
+        default=True,
+    )
+    email_provider = "gmail"
+    if verify_email:
+        email_provider = Prompt.ask(
+            "Pilih Provider Email ([bold green]gmail[/] / [cyan]outlook[/] / [yellow]hotmail[/])",
+            default="gmail",
+            choices=["gmail", "outlook", "hotmail"],
+        )
 
     confirm = Confirm.ask(f"Mulai pendaftaran {count} akun negara {country} sekarang?", default=True)
     if not confirm:
@@ -191,7 +203,12 @@ async def run_spaced_signup_flow(scheduler: StealthScheduler):
         console.print(msg)
 
     scheduler.status_cb = log_cb
-    await scheduler.register_spaced_accounts(total_count=count, country_code=country)
+    await scheduler.register_spaced_accounts(
+        total_count=count,
+        country_code=country,
+        verify_email=verify_email,
+        email_provider=email_provider,
+    )
     Prompt.ask("\nTekan Enter untuk kembali")
 
 
@@ -204,21 +221,25 @@ def run_inspect_accounts(scheduler: StealthScheduler):
         table = Table(show_header=True)
         table.add_column("No", style="dim", width=4)
         table.add_column("Email", style="cyan")
+        table.add_column("Status Verif", justify="center")
         table.add_column("Nickname", style="white")
         table.add_column("Negara", style="yellow")
         table.add_column("Device ID (Prefix)", style="dim")
 
-        for i, acc in enumerate(accounts[:20], start=1):
+        for i, acc in enumerate(accounts[:25], start=1):
+            is_v = acc.get("is_email_verified", False)
+            v_badge = "[bold green]VERIFIED[/]" if is_v else "[dim yellow]UNVERIFIED[/]"
             table.add_row(
                 str(i),
                 acc.get("email", "-"),
+                v_badge,
                 acc.get("nickname", "-"),
                 acc.get("country", "-"),
                 acc.get("device_id", "-")[:12] + "...",
             )
         console.print(table)
-        if len(accounts) > 20:
-            console.print(f"[dim]...dan {len(accounts) - 20} akun lainnya tersimpan di 'akun_stealth.txt'.[/]")
+        if len(accounts) > 25:
+            console.print(f"[dim]...dan {len(accounts) - 25} akun lainnya tersimpan di 'akun_stealth.txt'.[/]")
 
     Prompt.ask("\nTekan Enter untuk kembali")
 

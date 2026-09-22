@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 from .config import PROXIES_FILE, FALLBACK_PROXIES_FILE

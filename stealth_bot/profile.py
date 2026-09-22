@@ -118,7 +118,7 @@ class ProfileGenerator:
         return "".join(pwd_chars)
 
     @classmethod
-    def generate_profile(cls, country_code: str = "ID") -> AccountProfile:
+    def generate_profile(cls, country_code: str = "ID", email: Optional[str] = None) -> AccountProfile:
         country = country_code if country_code in COUNTRY_METADATA else "ID"
         meta = COUNTRY_METADATA[country]
 
@@ -126,11 +126,14 @@ class ProfileGenerator:
         ln = random.choice(cls.LAST_NAMES)
         nick = f"{fn} {ln}".strip()
 
-        # Email realistis dengan variasi numerik/separator
-        sep = random.choice([".", "_", "", "-"])
-        salt = secrets.token_hex(random.randint(2, 4))
-        domain = random.choice(cls.POPULAR_EMAIL_DOMAINS)
-        email = f"{fn.lower()}{sep}{ln.lower()}_{salt}@{domain}"
+        # Email realistis dengan variasi numerik/separator jika tidak disuplai
+        if not email:
+            sep = random.choice([".", "_", "", "-"])
+            salt = secrets.token_hex(random.randint(2, 4))
+            domain = random.choice(cls.POPULAR_EMAIL_DOMAINS)
+            email = f"{fn.lower()}{sep}{ln.lower()}_{salt}@{domain}"
+        else:
+            email = email.strip().lower()
 
         # Usia 18-35 tahun
         birth_year = random.randint(1991, 2007)
