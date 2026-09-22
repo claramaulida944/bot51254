@@ -63,7 +63,7 @@ class TempTfVerifier:
     async def poll_for_otp(
         self,
         email: str,
-        timeout_sec: int = 75,
+        timeout_sec: int = 120,
         interval_sec: int = 4,
         log_callback: Optional[Any] = None,
     ) -> Optional[str]:

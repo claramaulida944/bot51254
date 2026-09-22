@@ -158,7 +158,7 @@ class StealthScheduler:
                     if send_ok:
                         otp_code = await verifier.poll_for_otp(
                             temp_email,
-                            timeout_sec=60,
+                            timeout_sec=120,
                             interval_sec=4,
                             log_callback=self.log,
                         )
@@ -170,27 +170,30 @@ class StealthScheduler:
                             else:
                                 self.log(f"[yellow]Verifikasi ditolak server: {v_msg}[/]")
                         else:
-                            self.log("[yellow]Timeout: Kode OTP tidak diterima dalam 60s, akun tetap disimpan.[/]")
+                            self.log("[yellow]Timeout: Kode OTP tidak diterima dalam 120 detik.[/]")
                     else:
                         self.log(f"[yellow]Gagal request OTP: {send_msg}[/]")
 
-                acc_data = {
-                    "email": profile.email,
-                    "password": profile.password,
-                    "nickname": profile.nickname,
-                    "access_token": client.access_token,
-                    "refresh_token": client.refresh_token,
-                    "country": profile.country,
-                    "device_id": profile.device_id,
-                    "anonymous_id": profile.anonymous_id,
-                    "user_agent": profile.user_agent,
-                    "created_at": profile.birth_date,
-                    "is_email_verified": is_verified,
-                }
-                self.save_account(acc_data)
-                success_count += 1
-                verif_badge = "[bold green]VERIFIED[/]" if is_verified else "[dim yellow]UNVERIFIED[/]"
-                self.log(f"[bold green]✓ Berhasil Mendaftar:[/] {profile.email} [{verif_badge}] (Atribusi AppsFlyer OK)")
+                if verifier and not is_verified:
+                    self.log(f"[bold red]✗ Akun {profile.email} GAGAL diverifikasi (OTP timeout/ditolak). Akun TIDAK disimpan.[/]")
+                else:
+                    acc_data = {
+                        "email": profile.email,
+                        "password": profile.password,
+                        "nickname": profile.nickname,
+                        "access_token": client.access_token,
+                        "refresh_token": client.refresh_token,
+                        "country": profile.country,
+                        "device_id": profile.device_id,
+                        "anonymous_id": profile.anonymous_id,
+                        "user_agent": profile.user_agent,
+                        "created_at": profile.birth_date,
+                        "is_email_verified": is_verified,
+                    }
+                    self.save_account(acc_data)
+                    success_count += 1
+                    verif_badge = "[bold green]VERIFIED[/]" if is_verified else "[dim yellow]UNVERIFIED[/]"
+                    self.log(f"[bold green]✓ Berhasil Mendaftar:[/] {profile.email} [{verif_badge}] (Atribusi AppsFlyer OK)")
             else:
                 self.log(f"[red]✗ Gagal: {msg}[/]")
 
