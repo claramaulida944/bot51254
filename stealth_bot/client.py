@@ -102,7 +102,7 @@ class StealthApiClient:
 
             client_kwargs: Dict[str, Any] = {
                 "base_url": BASE_URL,
-                "timeout": httpx.Timeout(12.0, connect=5.0),
+                "timeout": httpx.Timeout(25.0, connect=15.0),
                 "headers": self.get_headers(),
                 "http2": False if self.current_proxy else True,
             }
@@ -201,7 +201,9 @@ class StealthApiClient:
         except Exception as exc:
             err_msg = str(exc) or repr(exc)
             if "Proxy" in type(exc).__name__ or "407" in err_msg:
-                err_desc = f"Proxy Error (407 Auth / Mati): {err_msg}"
+                err_desc = f"Proxy Bermasalah ({type(exc).__name__}: {err_msg})"
+            elif "Timeout" in type(exc).__name__:
+                err_desc = f"Proxy Timeout ({type(exc).__name__}: {err_msg})"
             else:
                 err_desc = f"{type(exc).__name__}: {err_msg}"
             await self.rotate_proxy_if_needed(err_desc)
@@ -245,7 +247,6 @@ class StealthApiClient:
             resp = await client.post("/api/auth/email/send-verification")
             if resp.status_code == 200:
                 return True, "Kode verifikasi berhasil dikirim"
-            return False, f"Gagal kirim verifikasi: HTTP {resp.status_code} ({resp.text[:80]})"
         except Exception as exc:
             return False, f"Koneksi gagal: {exc}"
 

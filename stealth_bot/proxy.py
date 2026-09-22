@@ -126,4 +126,4 @@ class StealthProxyManager:
                     break
 
 
-default_proxy_manager = StealthProxyManager()
+default_proxy_manager = StealthProxyManager(enabled=True)

@@ -1,0 +1,16 @@
+# =============================================================================
+# DAFTAR PROXY BOT TOODAT / QUARTERFULL
+# Diperbarui secara otomatis melalui HypeProxy API (https://hypeproxy.site)
+# Total Proxy Aktif: 10
+# =============================================================================
+
+http://user4:wbqYx_vcQMwL@proxy.hypeproxy.site:1006
+http://user27:NesNK635XVrT@proxy.hypeproxy.site:1007
+http://user28:ZSNCF6Z5XBpe@proxy.hypeproxy.site:1030
+http://user29:gnWpm5fHd07l@proxy.hypeproxy.site:1031
+http://user31:c93bMolz-sj7@proxy.hypeproxy.site:1032
+http://user33:06FitqMintvB@proxy.hypeproxy.site:1034
+http://user36:q3EAkMsao8LT@proxy.hypeproxy.site:1038
+http://user38:6pOD57wMWDPn@proxy.hypeproxy.site:1041
+http://user42:5ac5zytJdFiw@proxy.hypeproxy.site:1043
+http://user45:8OOj3a2Lc3DV@proxy.hypeproxy.site:1045
