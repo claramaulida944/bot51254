@@ -63,12 +63,13 @@ class TempTfVerifier:
     async def poll_for_otp(
         self,
         email: str,
-        timeout_sec: int = 60,
+        timeout_sec: int = 75,
         interval_sec: int = 4,
         log_callback: Optional[Any] = None,
     ) -> Optional[str]:
         """
         Melakukan polling berkala ke temp.tf inbox untuk mencari kode OTP 6-digit.
+        Khusus memfilter email resmi dari Quarterfull dan mengekstrak kode (termasuk format angka berspasi di HTML).
         Mengembalikan kode OTP jika ditemukan, atau None jika timeout.
         """
         log_fn = log_callback or (lambda msg: None)
@@ -87,17 +88,32 @@ class TempTfVerifier:
                     if resp.status_code == 200:
                         res_json = resp.json()
                         messages: List[Dict[str, Any]] = res_json.get("data", []) if isinstance(res_json, dict) else []
-                        for msg in messages:
+
+                        # 1. Prioritaskan email resmi dari Quarterfull
+                        qf_messages = [
+                            m for m in messages
+                            if "quarterfull" in str(m.get("from", "")).lower()
+                            or "quarterfull" in str(m.get("subject", "")).lower()
+                            or "quarterfull" in str(m.get("body", "")).lower()
+                        ]
+
+                        candidate_messages = qf_messages if qf_messages else messages
+
+                        for msg in candidate_messages:
+                            # Ambil seluruh konten: body (HTML), text, dan subject
+                            body_html = msg.get("body", "") or ""
                             subject = msg.get("subject", "") or ""
                             text_body = msg.get("text", "") or ""
-                            combined = f"{subject}\n{text_body}"
+                            combined = f"{subject}\n{text_body}\n{body_html}"
 
-                            # Cari 6 digit angka kode OTP
-                            match = re.search(r"\b(\d{6})\b", combined)
+                            # Quarterfull memformat OTP dalam HTML seperti: <div ...>0 6 4 6 6 3</div> atau 064663
+                            match = re.search(r"(?:>|\b)((?:\d\s*){6})(?:<|\b)", combined)
                             if match:
-                                code = match.group(1)
-                                log_fn(f"[bold green]✓ Kode OTP Berhasil Ditemukan: [yellow]{code}[/][/]")
-                                return code
+                                raw_match = match.group(1)
+                                code = re.sub(r"\s+", "", raw_match)
+                                if len(code) == 6 and code.isdigit():
+                                    log_fn(f"[bold green]✓ Kode OTP Berhasil Ditemukan:[/] [bold yellow]{code}[/]")
+                                    return code
 
                     elif resp.status_code == 429:
                         log_fn("[yellow]Rate limit temp.tf, menunggu sebentar...[/]")

@@ -80,6 +80,10 @@ class StealthScheduler:
         success_count = 0
         verifier = TempTfVerifier() if verify_email else None
 
+        # Muat daftar email yang sudah pernah terdaftar untuk mencegah duplikasi
+        saved_accs = self.load_accounts()
+        existing_emails = {str(a.get("email", "")).strip().lower() for a in saved_accs if a.get("email")}
+
         for i in range(1, total_count + 1):
             if cancel_event and cancel_event.is_set():
                 self.log("[yellow]Pendaftaran dihentikan oleh pengguna.[/]")
@@ -90,14 +94,26 @@ class StealthScheduler:
             temp_email = None
             if verifier:
                 provider_key = "high.edu.pl" if email_provider == "edu" else email_provider
-                self.log(f"[dim]Mengambil email langsung dari temp.tf (provider: {provider_key})...[/]")
+                self.log(f"[dim]Mengambil email unik dari temp.tf (provider: {provider_key})...[/]")
                 use_dot = (provider_key == "gmail")
                 use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
-                temp_email = await verifier.get_email(provider=provider_key, use_dot=use_dot, use_plus=use_plus)
+                
+                # Coba ambil email yang belum pernah tersimpan di akun_stealth.txt
+                for attempt_email in range(1, 10):
+                    candidate = await verifier.get_email(provider=provider_key, use_dot=use_dot, use_plus=use_plus)
+                    if candidate:
+                        if candidate.lower() not in existing_emails:
+                            temp_email = candidate.lower()
+                            existing_emails.add(temp_email)
+                            break
+                        else:
+                            self.log(f"[dim yellow]Email {candidate} sudah ada di akun_stealth.txt, meminta variasi baru...[/]")
+                            await asyncio.sleep(0.8)
+
                 if temp_email:
                     self.log(f"[bold cyan]Email Langsung dari temp.tf Didapat:[/] [green]{temp_email}[/]")
                 else:
-                    self.log("[yellow]Gagal mendapatkan email dari temp.tf, fallback ke email sintetis.[/]")
+                    self.log("[yellow]Gagal mendapatkan email unik dari temp.tf, fallback ke email sintetis.[/]")
 
             profile = ProfileGenerator.generate_profile(country_code=country_code, email=temp_email)
 
