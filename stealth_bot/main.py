@@ -31,8 +31,9 @@ from stealth_bot.config import (
 from stealth_bot.client import StealthApiClient
 from stealth_bot.profile import AccountProfile, ProfileGenerator
 from stealth_bot.proxy import default_proxy_manager
-from stealth_bot.scheduler import StealthScheduler
+from stealth_bot.scheduler import StealthScheduler, extract_base_username
 from stealth_bot.worker import StealthWorker, StealthGuestWorker
+from stealth_bot.email_verifier import TempTfVerifier
 
 console = Console()
 
@@ -132,21 +133,33 @@ async def run_organic_reading_flow(scheduler: StealthScheduler):
     Prompt.ask("\nTekan Enter untuk kembali")
 
 
-async def run_guest_reading_flow():
+async def run_guest_reading_flow(scheduler: StealthScheduler):
     console.print("\n[bold cyan]>>> Sesi Pembaca Tamu Organik (Multi-Worker Guest Mode)[/]\n")
-    console.print("[dim]Keunggulan Mode Tamu: Tidak memerlukan akun (Bebas 100% dari 'Registration Clustering').[/]")
-    console.print("[dim]Setiap tamu menggunakan profil, proxy terisolasi & cold-start resmi Android.[/]\n")
+    console.print("[dim]Keunggulan: Bebas 100% dari 'Registration Clustering' & pola bot serentak.[/]")
+    console.print("[dim]Didukung konversi organik: Tamu membaca bab gratis -> Lanjut mendaftar & verifikasi OTP resmi.[/]\n")
 
     target_novel = Prompt.ask("Masukkan Novel ID Target", default=DEFAULT_TARGET_NOVEL_ID)
     guest_count = IntPrompt.ask("Total Sesi Tamu yang ingin dijalankan", default=10)
     concurrency = IntPrompt.ask("Jumlah Worker Bersamaan / Paralel (5-10 disarankan)", default=5)
-    chapters_per_guest = IntPrompt.ask("Maksimal Bab yang Dibaca per Tamu", default=3)
+    chapters_per_guest = IntPrompt.ask("Jumlah Bab Dibaca sebagai Tamu", default=2)
+
+    auto_convert = Confirm.ask("Aktifkan Konversi Alami (Tamu lanjut Daftar Akun & Verifikasi OTP)?", default=True)
+    member_chapters_after = 2
+    if auto_convert:
+        member_chapters_after = IntPrompt.ask("Jumlah Bab Dibaca Lanjutan Setelah Jadi Member", default=2)
+
     country_input = Prompt.ask("Negara Tamu (ID/US/KR/JP/GB/DE atau 'RANDOM')", default="RANDOM").upper().strip()
 
+    convert_label = f"+ Konversi Akun ({member_chapters_after} Bab Member)" if auto_convert else "(Tamu Murni)"
     console.print(
-        f"\n[bold green]Memulai {guest_count} sesi tamu ({concurrency} worker paralel, negara: {country_input}) "
+        f"\n[bold green]Memulai {guest_count} sesi tamu {convert_label} ({concurrency} worker paralel, negara: {country_input}) "
         f"untuk novel '{target_novel}'...[/]\n"
     )
+
+    verifier = TempTfVerifier() if auto_convert else None
+    saved_accs = scheduler.load_accounts()
+    existing_emails = {str(a.get("email", "")).strip().lower() for a in saved_accs if a.get("email")}
+    existing_base_users = {extract_base_username(e) for e in existing_emails if e}
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -177,11 +190,19 @@ async def run_guest_reading_flow():
                 client=client,
                 target_novel_id=target_novel,
                 status_cb=log_cb,
+                auto_convert=auto_convert,
+                verifier=verifier,
+                save_account_cb=scheduler.save_account,
+                existing_emails=existing_emails,
+                existing_base_users=existing_base_users,
             )
 
             try:
                 console.print(f"[cyan][Guest-{idx:02d}] Masuk sebagai tamu baru ([yellow]{c_code}[/])...[/]")
-                await worker.run_guest_session(max_chapters=chapters_per_guest)
+                await worker.run_guest_session(
+                    max_chapters=chapters_per_guest,
+                    member_chapters_after=member_chapters_after,
+                )
             finally:
                 await client.close()
 
@@ -270,7 +291,7 @@ async def async_main():
         if choice == "1":
             await run_organic_reading_flow(scheduler)
         elif choice == "2":
-            await run_guest_reading_flow()
+            await run_guest_reading_flow(scheduler)
         elif choice == "3":
             await run_spaced_signup_flow(scheduler)
         elif choice == "4":

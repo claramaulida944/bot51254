@@ -15,6 +15,9 @@ from typing import Any, Callable, Dict, List, Optional
 from .client import StealthApiClient
 from .camouflage import CamouflageEngine
 from .timing import ReadingSimulator
+from .profile import ProfileGenerator
+from .email_verifier import TempTfVerifier
+from .scheduler import extract_base_username, format_natural_email
 
 logger = logging.getLogger("StealthWorker")
 
@@ -152,7 +155,8 @@ class StealthWorker:
 
 
 class StealthGuestWorker:
-    """Pekerja yang mereplikasi pembaca tamu (Guest Reader) yang baru instal aplikasi."""
+    """Pekerja yang mereplikasi pembaca tamu (Guest Reader) yang baru instal aplikasi,
+    dengan kemampuan konversi organik ke Member Terdaftar saat menghadapi gerbang login."""
 
     def __init__(
         self,
@@ -160,6 +164,11 @@ class StealthGuestWorker:
         client: StealthApiClient,
         target_novel_id: str,
         status_cb: Optional[Callable[[str], None]] = None,
+        auto_convert: bool = False,
+        verifier: Optional[TempTfVerifier] = None,
+        save_account_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        existing_emails: Optional[set] = None,
+        existing_base_users: Optional[set] = None,
     ):
         self.guest_index = guest_index
         self.client = client
@@ -167,17 +176,28 @@ class StealthGuestWorker:
         self.status_cb = status_cb or (lambda msg: None)
         self.timing = ReadingSimulator()
         self.camouflage = CamouflageEngine(target_novel_id)
+        self.auto_convert = auto_convert
+        self.verifier = verifier
+        self.save_account_cb = save_account_cb
+        self.existing_emails = existing_emails if existing_emails is not None else set()
+        self.existing_base_users = existing_base_users if existing_base_users is not None else set()
 
     def log(self, text: str):
         self.status_cb(f"[Guest-{self.guest_index:02d}] {text}")
 
-    async def run_guest_session(self, max_chapters: int = 3) -> int:
+    async def run_guest_session(
+        self,
+        max_chapters: int = 3,
+        member_chapters_after: int = 2,
+    ) -> int:
         """
         Menjalankan 1 siklus pembaca tamu organik:
         1. Inisiasi sesi tamu resmi (Cold Start -> /api/guest-reading/session).
         2. Eksplorasi katalog & rekomendasi (Warm-up).
-        3. Membaca bab novel target dengan durasi WPM dinamis.
-        4. Mengirimkan heartbeat progres PUT /api/guest-reading/progress.
+        3. Membaca bab novel target secara gratis (Guest Phase).
+        4. Jika mode konversi aktif: Mendaftar akun resmi & verifikasi OTP 120s langsung
+           dari sesi, device_id, dan proxy yang sama persis (Guest-to-Member Conversion).
+        5. Melanjutkan membaca bab-bab berikutnya sebagai Member Resmi dengan telemetri royalty.
         """
         self.log("[cyan]Menginisiasi sesi tamu resmi (Cold Start Android)...[/]")
         ok, msg = await self.client.init_guest_session()
@@ -201,17 +221,18 @@ class StealthGuestWorker:
         read_count = 0
         limit = min(max_chapters, len(chapters))
 
+        # 3. FASE TAMU: Membaca bab-bab gratis
         for idx in range(limit):
             ch = chapters[idx]
             ch_id = ch.get("hash_id") or ch.get("id")
             ch_num = ch.get("chapter_num", idx + 1)
             ch_title = ch.get("title", f"Bab {ch_num}")
 
-            self.log(f"[yellow]Membuka Bab {ch_num}: '{ch_title[:25]}'[/]")
+            self.log(f"[yellow]Membuka Bab {ch_num}: '{ch_title[:25]}' sebagai Tamu[/]")
             detail = await self.client.get_chapter_detail(self.target_novel_id, ch_id)
             if not detail:
-                self.log(f"[red]Gagal memuat teks bab {ch_num}.[/]")
-                continue
+                self.log(f"[yellow]Bab {ch_num} terhalang/terkunci untuk Tamu.[/]")
+                break
 
             content = detail.get("content", "")
             duration, pace_pct = self.timing.calculate_reading_duration(content)
@@ -243,10 +264,114 @@ class StealthGuestWorker:
             if idx < limit - 1:
                 await asyncio.sleep(random.uniform(3.0, 7.0))
 
-            # Drop-off alami pembaca tamu (sebagian tamu tidak membaca tuntas seluruh bab gratis)
-            if read_count >= 2 and random.random() < 0.30:
-                self.log(f"[yellow]Simulasi tamu menutup aplikasi setelah Bab {ch_num} (Natural Drop-off).[/]")
-                break
+        # 4. FASE KONVERSI ALAMI KE MEMBER (JIKA DIAKTIFKAN)
+        if self.auto_convert and self.verifier:
+            self.log(f"[bold cyan]Menghadapi gerbang pendaftaran akun (Konversi Alami Tamu -> Member)...[/]")
+            
+            # Dapatkan email wajar & belum pernah dipakai
+            temp_email = None
+            for _ in range(15):
+                prov = random.choice(["outlook", "hotmail", "gmail"])
+                cand = await self.verifier.get_email(provider=prov, use_dot=(prov == "gmail"), use_plus=(prov != "gmail"))
+                if cand:
+                    cand = format_natural_email(cand)
+                    base_u = extract_base_username(cand)
+                    if base_u not in self.existing_base_users and cand.lower() not in self.existing_emails:
+                        temp_email = cand.lower()
+                        self.existing_emails.add(temp_email)
+                        self.existing_base_users.add(base_u)
+                        break
+                await asyncio.sleep(0.5)
 
-        self.log(f"[bold cyan]Selesai sesi tamu! Total {read_count} bab terselesaikan dengan aman.[/]")
+            if temp_email:
+                self.client.profile.email = temp_email
+                self.client.profile.password = ProfileGenerator.generate_password()
+                self.log(f"[cyan]Mendaftarkan akun resmi dari sesi tamu:[/] [green]{temp_email}[/]...")
+
+                signup_ok, signup_msg = await self.client.perform_organic_signup()
+                if signup_ok:
+                    is_verified = False
+                    self.log("[cyan]Memicu pengiriman kode OTP verifikasi...[/]")
+                    send_ok, send_msg = await self.client.send_email_verification()
+                    if send_ok:
+                        otp_code = await self.verifier.poll_for_otp(
+                            temp_email, timeout_sec=120, interval_sec=4, log_callback=self.log
+                        )
+                        if otp_code:
+                            v_ok, v_msg = await self.client.verify_email_code(otp_code)
+                            if v_ok:
+                                is_verified = True
+                                self.log(f"[bold green]✓ EMAIL TERVERIFIKASI RESMI:[/] {temp_email} (Kode: [yellow]{otp_code}[/])")
+                            else:
+                                self.log(f"[yellow]Verifikasi OTP ditolak server: {v_msg}[/]")
+                        else:
+                            self.log("[yellow]Timeout: OTP tidak diterima dalam 120s.[/]")
+
+                    # Simpan akun HANYA jika terverifikasi
+                    if is_verified:
+                        if self.save_account_cb:
+                            acc_data = {
+                                "email": self.client.profile.email,
+                                "password": self.client.profile.password,
+                                "nickname": self.client.profile.nickname,
+                                "access_token": self.client.access_token,
+                                "refresh_token": self.client.refresh_token,
+                                "country": self.client.profile.country,
+                                "device_id": self.client.profile.device_id,
+                                "anonymous_id": self.client.profile.anonymous_id,
+                                "user_agent": self.client.profile.user_agent,
+                                "created_at": self.client.profile.birth_date,
+                                "is_email_verified": True,
+                            }
+                            self.save_account_cb(acc_data)
+                        self.log(f"[bold green]✓ KONVERSI SUKSES: Tamu resmi menjadi Member Terdaftar ([bold green]VERIFIED[/])![/]")
+
+                        # 5. FASE MEMBER: Lanjut membaca bab-bab berikutnya
+                        start_idx = read_count
+                        end_idx = min(start_idx + member_chapters_after, len(chapters))
+                        if start_idx < end_idx:
+                            self.log(f"[cyan]Melanjutkan membaca {end_idx - start_idx} bab berikutnya sebagai Member Terdaftar...[/]")
+                            for m_idx in range(start_idx, end_idx):
+                                m_ch = chapters[m_idx]
+                                m_ch_id = m_ch.get("hash_id") or m_ch.get("id")
+                                m_ch_num = m_ch.get("chapter_num", m_idx + 1)
+                                m_ch_title = m_ch.get("title", f"Bab {m_ch_num}")
+
+                                self.log(f"[yellow]Membuka Bab {m_ch_num}: '{m_ch_title[:25]}' sebagai Member[/]")
+                                m_detail = await self.client.get_chapter_detail(self.target_novel_id, m_ch_id)
+                                if not m_detail:
+                                    self.log(f"[red]Gagal memuat bab {m_ch_num}.[/]")
+                                    continue
+
+                                m_content = m_detail.get("content", "")
+                                m_dur, m_pace = self.timing.calculate_reading_duration(m_content)
+                                self.log(f"[green]Membaca Bab {m_ch_num} (WPM: {len(m_content.split())} kata, durasi: {int(m_dur)}s)...[/]")
+
+                                def on_m_progress(pct: int, el: float):
+                                    if pct < 100:
+                                        self.log(f"[dim]  Bab {m_ch_num} progres: {pct}% ({int(el)}s)[/]")
+                                        asyncio.create_task(
+                                            self.client.send_reading_telemetry(
+                                                self.target_novel_id, m_ch_id, m_ch_num, el, depth_percent=pct, completed=False
+                                            )
+                                        )
+
+                                await self.timing.simulate_human_reading(m_dur, on_progress=on_m_progress)
+
+                                await self.client.send_reading_telemetry(
+                                    self.target_novel_id, m_ch_id, m_ch_num, m_dur, depth_percent=100, completed=True
+                                )
+                                read_count += 1
+                                self.log(f"[bold green]✓ Selesai Bab {m_ch_num} sebagai Member Resmi Terdaftar![/]")
+
+                                if m_idx < end_idx - 1:
+                                    await asyncio.sleep(random.uniform(3.0, 7.0))
+                    else:
+                        self.log(f"[bold red]✗ Akun gagal diverifikasi, tidak disimpan ke file.[/]")
+                else:
+                    self.log(f"[red]Pendaftaran gagal: {signup_msg}[/]")
+            else:
+                self.log("[yellow]Gagal mendapatkan email wajar unik untuk konversi tamu.[/]")
+
+        self.log(f"[bold cyan]Selesai sesi! Total {read_count} bab terselesaikan secara alami.[/]")
         return read_count
