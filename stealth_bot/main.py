@@ -180,27 +180,12 @@ async def run_guest_reading_flow():
 
 
 async def run_spaced_signup_flow(scheduler: StealthScheduler):
-    console.print("\n[bold cyan]>>> Registrasi Akun Halus (Spaced / Throttled Signup)[/]\n")
-    console.print("[dim]Mencegah deteksi 'Registration Clustering' dengan jeda acak 60-180 detik per akun.[/]\n")
+    console.print("\n[bold cyan]>>> Registrasi Akun Halus (Full Auto Random Stealth)[/]\n")
+    console.print("[dim]Fitur Otomatis Penuh: Mengacak Negara (KR/US/JP/GB/ID), Provider Email (Gmail/Outlook/Hotmail/Edu), dan Verifikasi OTP via temp.tf.[/]\n")
 
     count = IntPrompt.ask("Berapa akun yang ingin didaftarkan?", default=5)
-    country = Prompt.ask("Kode Negara (contoh: ID, US, KR, JP, GB)", default="ID").upper()
-    
-    verify_email = Confirm.ask(
-        "Aktifkan Verifikasi Email Organik via temp.tf (Gmail / Outlook / Edu)?",
-        default=True,
-    )
-    email_provider = "gmail"
-    if verify_email:
-        email_provider = Prompt.ask(
-            "Pilih Provider Email ([bold green]gmail[/] / [cyan]outlook[/] / [yellow]hotmail[/] / [magenta]edu[/])",
-            default="gmail",
-            choices=["gmail", "outlook", "hotmail", "edu"],
-        )
 
-    confirm = Confirm.ask(f"Mulai pendaftaran {count} akun negara {country} sekarang?", default=True)
-    if not confirm:
-        return
+    console.print(f"\n[bold green]Memulai registrasi {count} akun (Random Country + Random Email + Auto-Verify OTP)...[/]\n")
 
     def log_cb(msg: str):
         console.print(msg)
@@ -208,9 +193,9 @@ async def run_spaced_signup_flow(scheduler: StealthScheduler):
     scheduler.status_cb = log_cb
     await scheduler.register_spaced_accounts(
         total_count=count,
-        country_code=country,
-        verify_email=verify_email,
-        email_provider=email_provider,
+        country_code="RANDOM",
+        verify_email=True,
+        email_provider="RANDOM",
     )
     Prompt.ask("\nTekan Enter untuk kembali")
 

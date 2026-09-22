@@ -62,19 +62,21 @@ class StealthScheduler:
     async def register_spaced_accounts(
         self,
         total_count: int,
-        country_code: str = "ID",
-        verify_email: bool = False,
-        email_provider: str = "gmail",
+        country_code: str = "RANDOM",
+        verify_email: bool = True,
+        email_provider: str = "RANDOM",
         cancel_event: Optional[asyncio.Event] = None,
     ) -> int:
         """
         Mendaftarkan `total_count` akun baru dengan jeda acak (jittered interval)
         untuk menghindari pola 'Registration Clustering'.
-        Mendukung verifikasi email otomatis via temp.tf (Gmail Dot Trick / Outlook).
+        Mendukung verifikasi email otomatis via temp.tf (Gmail / Outlook / Hotmail / Edu)
+        serta pemilihan negara dan provider secara acak proporsional.
         """
-        mode_str = f"dengan Verifikasi Email Organik ({email_provider})" if verify_email else "mode Standar (Bypass)"
+        mode_str = f"Verifikasi Email Organik (Random Provider)" if email_provider.upper() in ("RANDOM", "ALL", "AUTO") else f"Verifikasi Email ({email_provider})"
+        country_str = "Random Global (KR/US/JP/GB/ID)" if country_code.upper() in ("RANDOM", "ALL", "AUTO") else country_code
         self.log(
-            f"[bold cyan]Memulai pendaftaran {total_count} akun [{mode_str}] "
+            f"[bold cyan]Memulai pendaftaran {total_count} akun [{mode_str} | {country_str}] "
             f"dengan jeda anti-clustering ({int(MIN_SIGNUP_INTERVAL_SEC)}-{int(MAX_SIGNUP_INTERVAL_SEC)}s)...[/]"
         )
         success_count = 0
@@ -89,12 +91,26 @@ class StealthScheduler:
                 self.log("[yellow]Pendaftaran dihentikan oleh pengguna.[/]")
                 break
 
-            self.log(f"\n[cyan][{i}/{total_count}] Membuat profil & identitas perangkat baru ({country_code})...[/]")
+            # 1. Resolusi Negara per Akun (Otomatis Acak Bobot Tinggi atau Spesifik)
+            if country_code.upper() in ("RANDOM", "ALL", "AUTO", ""):
+                candidate_countries = ["KR", "US", "JP", "GB", "ID", "DE", "CA", "AU", "FR", "SG"]
+                weights = [25, 25, 15, 10, 5, 5, 5, 5, 3, 2]  # Pasar utama KR & US
+                current_country = random.choices(candidate_countries, weights=weights, k=1)[0]
+            else:
+                current_country = country_code.upper().strip()
+
+            self.log(f"\n[cyan][{i}/{total_count}] Membuat profil & identitas perangkat baru ([yellow]{current_country}[/])...[/]")
             
             temp_email = None
             if verifier:
-                provider_key = "high.edu.pl" if email_provider == "edu" else email_provider
-                self.log(f"[dim]Mengambil email unik dari temp.tf (provider: {provider_key})...[/]")
+                # 2. Resolusi Provider Email per Akun (Otomatis Acak atau Spesifik)
+                if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
+                    chosen_provider = random.choice(["gmail", "outlook", "hotmail", "edu"])
+                else:
+                    chosen_provider = email_provider.lower().strip()
+
+                provider_key = "high.edu.pl" if chosen_provider == "edu" else chosen_provider
+                self.log(f"[dim]Mengambil email unik dari temp.tf (provider: {chosen_provider})...[/]")
                 use_dot = (provider_key == "gmail")
                 use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
                 
@@ -109,16 +125,24 @@ class StealthScheduler:
                         else:
                             self.log(f"[dim yellow]Email {candidate} sudah ada di akun_stealth.txt, meminta variasi baru...[/]")
                             await asyncio.sleep(0.8)
+                    else:
+                        # Jika provider tertentu sedang kosong, ganti provider lain jika mode random
+                        if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
+                            chosen_provider = random.choice(["gmail", "outlook", "hotmail", "edu"])
+                            provider_key = "high.edu.pl" if chosen_provider == "edu" else chosen_provider
+                            use_dot = (provider_key == "gmail")
+                            use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
+                        await asyncio.sleep(0.5)
 
                 if temp_email:
-                    self.log(f"[bold cyan]Email Langsung dari temp.tf Didapat:[/] [green]{temp_email}[/]")
+                    self.log(f"[bold cyan]Email Langsung dari temp.tf Didapat:[/] [green]{temp_email}[/] ([dim]{chosen_provider}[/])")
                 else:
                     self.log("[yellow]Gagal mendapatkan email unik dari temp.tf, fallback ke email sintetis.[/]")
 
-            profile = ProfileGenerator.generate_profile(country_code=country_code, email=temp_email)
+            profile = ProfileGenerator.generate_profile(country_code=current_country, email=temp_email)
 
             # Ambil proxy unik untuk pendaftaran ini
-            proxy = self.proxy_manager.pop_proxy(country_code)
+            proxy = self.proxy_manager.pop_proxy(current_country)
             client = StealthApiClient(
                 profile=profile,
                 proxy_manager=self.proxy_manager,
