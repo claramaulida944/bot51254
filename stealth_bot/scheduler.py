@@ -89,12 +89,13 @@ class StealthScheduler:
             
             temp_email = None
             if verifier:
-                self.log(f"[dim]Mengambil email organik dari temp.tf (provider: {email_provider})...[/]")
-                use_dot = (email_provider == "gmail")
-                use_plus = (email_provider != "gmail")
-                temp_email = await verifier.get_email(provider=email_provider, use_dot=use_dot, use_plus=use_plus)
+                provider_key = "high.edu.pl" if email_provider == "edu" else email_provider
+                self.log(f"[dim]Mengambil email langsung dari temp.tf (provider: {provider_key})...[/]")
+                use_dot = (provider_key == "gmail")
+                use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
+                temp_email = await verifier.get_email(provider=provider_key, use_dot=use_dot, use_plus=use_plus)
                 if temp_email:
-                    self.log(f"[bold cyan]Email Organik Didapat:[/] [green]{temp_email}[/]")
+                    self.log(f"[bold cyan]Email Langsung dari temp.tf Didapat:[/] [green]{temp_email}[/]")
                 else:
                     self.log("[yellow]Gagal mendapatkan email dari temp.tf, fallback ke email sintetis.[/]")
 

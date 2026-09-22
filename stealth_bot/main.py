@@ -187,15 +187,15 @@ async def run_spaced_signup_flow(scheduler: StealthScheduler):
     country = Prompt.ask("Kode Negara (contoh: ID, US, KR, JP, GB)", default="ID").upper()
     
     verify_email = Confirm.ask(
-        "Aktifkan Verifikasi Email Organik via temp.tf (Gmail Dot Trick / Outlook)?",
+        "Aktifkan Verifikasi Email Organik via temp.tf (Gmail / Outlook / Edu)?",
         default=True,
     )
     email_provider = "gmail"
     if verify_email:
         email_provider = Prompt.ask(
-            "Pilih Provider Email ([bold green]gmail[/] / [cyan]outlook[/] / [yellow]hotmail[/])",
+            "Pilih Provider Email ([bold green]gmail[/] / [cyan]outlook[/] / [yellow]hotmail[/] / [magenta]edu[/])",
             default="gmail",
-            choices=["gmail", "outlook", "hotmail"],
+            choices=["gmail", "outlook", "hotmail", "edu"],
         )
 
     confirm = Confirm.ask(f"Mulai pendaftaran {count} akun negara {country} sekarang?", default=True)
