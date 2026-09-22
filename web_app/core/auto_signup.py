@@ -885,6 +885,7 @@ class RegistrationRunner:
                         "access_token": access_token,
                         "refresh_token": refresh_token,
                         "user_id": user_id,
+                        "login_id": user_info.get("login_id") or profile.email,
                         "device_id": device_id,
                         "user_agent": user_agent,
                         "country": profile.country,

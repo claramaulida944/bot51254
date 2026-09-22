@@ -444,6 +444,32 @@ def feature_account_manager() -> None:
                                     time.sleep(0.4)
                                     continue
 
+                            # Coba refresh token terlebih dahulu sebelum login password
+                            ref_tok = acc.get("refresh_token")
+                            if ref_tok and not is_jwt_expired(ref_tok, buffer_seconds=30):
+                                try:
+                                    h_ref = {
+                                        "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
+                                        "x-device-id": acc.get("device_id", ""),
+                                        "x-platform": "android",
+                                        "x-app-variant": "prod",
+                                        "x-app-version": "3.0.52",
+                                        "content-type": "application/json",
+                                        "accept": "application/json",
+                                    }
+                                    r_ref = client.post("/api/auth/token/refresh", json={"refresh_token": ref_tok}, headers=h_ref)
+                                    if r_ref.status_code == 200:
+                                        d_ref = r_ref.json()
+                                        acc["access_token"] = d_ref.get("access_token", acc.get("access_token"))
+                                        if "refresh_token" in d_ref:
+                                            acc["refresh_token"] = d_ref.get("refresh_token")
+                                        relogin_ok = True
+                                        is_active = True
+                                        default_proxy_manager.mark_used(acc_proxy)
+                                        break
+                                except Exception:
+                                    pass
+
                             if email and pw:
                                 h = {
                                     "user-agent": acc.get("user_agent", "okhttp/4.12.0"),
@@ -454,12 +480,15 @@ def feature_account_manager() -> None:
                                     "content-type": "application/json",
                                     "accept": "application/json",
                                 }
-                                r = client.post("/api/auth/login", json={"login_id": email, "password": pw}, headers=h)
+                                login_id = acc.get("login_id") or email
+                                r = client.post("/api/auth/login", json={"login_id": login_id, "password": pw}, headers=h)
                                 if r.status_code == 200:
                                     d = r.json()
                                     acc["access_token"] = d.get("access_token", acc.get("access_token"))
                                     if "refresh_token" in d:
                                         acc["refresh_token"] = d.get("refresh_token")
+                                    if "user" in d and "login_id" in d["user"]:
+                                        acc["login_id"] = d["user"]["login_id"]
                                     relogin_ok = True
                                     default_proxy_manager.mark_used(acc_proxy)
                                     break
@@ -531,10 +560,15 @@ def feature_account_manager() -> None:
                 email = acc.get("email", "-")
                 country = acc.get("country", "ID")
                 tok = acc.get("access_token", "")
+                ref_tok = acc.get("refresh_token", "")
 
                 # 1. Cek JWT lokal instan (0 ms) - jika token sudah expired, tidak perlu request sia-sia
                 if not tok or is_jwt_expired(tok, buffer_seconds=60):
-                    status_str = "[bold red]KADALUARSA (Expired)[/]"
+                    can_refresh = ref_tok and not is_jwt_expired(ref_tok, buffer_seconds=30)
+                    if can_refresh:
+                        status_str = "[bold yellow]KADALUARSA (Bisa di-refresh)[/]"
+                    else:
+                        status_str = "[bold red]KADALUARSA (Expired)[/]"
                     expired_accounts.append(acc)
                     console.print(f"  [{idx:02d}] {email} -> {status_str}")
                     continue
@@ -571,7 +605,11 @@ def feature_account_manager() -> None:
                                 default_proxy_manager.mark_used(chk_proxy)
                                 break
                             elif resp.status_code == 401:
-                                status_str = "[bold red]KADALUARSA (Expired)[/]"
+                                can_refresh = ref_tok and not is_jwt_expired(ref_tok, buffer_seconds=30)
+                                if can_refresh:
+                                    status_str = "[bold yellow]KADALUARSA (Bisa di-refresh)[/]"
+                                else:
+                                    status_str = "[bold red]KADALUARSA (Expired)[/]"
                                 break
                             elif resp.status_code in (403, 429, 500, 502, 503, 504):
                                 default_proxy_manager.mark_failed(chk_proxy, f"HTTP {resp.status_code}")
@@ -590,19 +628,23 @@ def feature_account_manager() -> None:
             if expired_accounts:
                 console.print(f"\n[yellow]Terdeteksi {len(expired_accounts)} akun dengan token kadaluarsa.[/]")
                 do_relogin = Confirm.ask(
-                    "[bold green]?[/] Lakukan Login Ulang otomatis (Re-Login) sekarang dengan email & password?",
+                    "[bold green]?[/] Lakukan Perpanjangan Sesi (Refresh Token) / Login Ulang otomatis sekarang?",
                     default=True,
                 )
                 if do_relogin:
-                    console.print("\n[cyan]Memulai proses Login Ulang akun via proxy (dengan Auto-Retry & Rotasi Proxy)...[/]\n")
+                    console.print("\n[cyan]Memulai proses perpanjangan sesi via Refresh Token & Login Ulang (dengan Auto-Retry & Rotasi Proxy)...[/]\n")
                     relogin_success = 0
                     max_retries = 3
 
                     for i, acc in enumerate(expired_accounts, start=1):
                         email = acc.get("email")
                         password = acc.get("password")
+                        refresh_token = acc.get("refresh_token")
                         country = acc.get("country", "ID")
-                        if not email or not password:
+                        login_id = acc.get("login_id") or email
+
+                        if not refresh_token and not (login_id and password):
+                            console.print(f"  [{i:02d}] {email} -> [red]Lewati (Tidak ada refresh_token maupun password)[/]")
                             continue
 
                         h = {
@@ -635,24 +677,67 @@ def feature_account_manager() -> None:
                                     base_url="https://api.quarterfull.io",
                                     timeout=httpx.Timeout(8.0, connect=3.5),
                                 ) as relogin_client:
-                                    r = relogin_client.post("/api/auth/login", json={"login_id": email, "password": password}, headers=h)
-                                    if r.status_code == 200:
-                                        d = r.json()
-                                        acc["access_token"] = d.get("access_token", acc.get("access_token"))
-                                        if "refresh_token" in d:
-                                            acc["refresh_token"] = d.get("refresh_token")
-                                        relogin_success += 1
-                                        relogin_ok = True
-                                        default_proxy_manager.mark_used(current_proxy)
-                                        retry_tag = f" (Percobaan ke-{attempt})" if attempt > 1 else ""
-                                        console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN ULANG (Token Baru){retry_tag}[/]")
-                                        break
-                                    elif r.status_code in (400, 401, 403, 404, 422):
-                                        last_err = f"HTTP {r.status_code}"
-                                        break
+                                    # 1. Coba perpanjang sesi via Refresh Token terlebih dahulu (Sesi Resmi 30 Hari)
+                                    if refresh_token and not is_jwt_expired(refresh_token, buffer_seconds=30):
+                                        try:
+                                            r_ref = relogin_client.post(
+                                                "/api/auth/token/refresh",
+                                                json={"refresh_token": refresh_token},
+                                                headers=h,
+                                            )
+                                            if r_ref.status_code == 200:
+                                                d_ref = r_ref.json()
+                                                acc["access_token"] = d_ref.get("access_token", acc.get("access_token"))
+                                                if "refresh_token" in d_ref:
+                                                    acc["refresh_token"] = d_ref.get("refresh_token")
+                                                relogin_success += 1
+                                                relogin_ok = True
+                                                default_proxy_manager.mark_used(current_proxy)
+                                                retry_tag = f" (Percobaan ke-{attempt})" if attempt > 1 else ""
+                                                console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL REFRESH TOKEN (Sesi Diperpanjang){retry_tag}[/]")
+                                                break
+                                            elif r_ref.status_code in (403, 429, 500, 502, 503, 504):
+                                                default_proxy_manager.mark_failed(current_proxy, f"HTTP {r_ref.status_code}")
+                                                continue
+                                            else:
+                                                last_err = f"Refresh HTTP {r_ref.status_code}"
+                                        except Exception as ref_err:
+                                            last_err = str(ref_err)
+                                            if is_dead_or_proxy_error(ref_err) or "timeout" in str(ref_err).lower():
+                                                default_proxy_manager.mark_failed(current_proxy, ref_err)
+                                                continue
+
+                                    # 2. Fallback: Coba Login Password jika refresh_token gagal / tidak ada
+                                    if password and login_id:
+                                        r = relogin_client.post(
+                                            "/api/auth/login",
+                                            json={"login_id": login_id, "password": password},
+                                            headers=h,
+                                        )
+                                        if r.status_code == 200:
+                                            d = r.json()
+                                            acc["access_token"] = d.get("access_token", acc.get("access_token"))
+                                            if "refresh_token" in d:
+                                                acc["refresh_token"] = d.get("refresh_token")
+                                            if "user" in d and "login_id" in d["user"]:
+                                                acc["login_id"] = d["user"]["login_id"]
+                                            relogin_success += 1
+                                            relogin_ok = True
+                                            default_proxy_manager.mark_used(current_proxy)
+                                            retry_tag = f" (Percobaan ke-{attempt})" if attempt > 1 else ""
+                                            console.print(f"  [{i:02d}] {email} -> [bold green]BERHASIL LOGIN PASSWORD (Token Baru){retry_tag}[/]")
+                                            break
+                                        elif r.status_code in (403, 429, 500, 502, 503, 504):
+                                            default_proxy_manager.mark_failed(current_proxy, f"HTTP {r.status_code}")
+                                            continue
+                                        elif r.status_code in (400, 401, 404, 422):
+                                            last_err = f"Login HTTP {r.status_code}"
+                                            break
+                                        else:
+                                            last_err = f"HTTP {r.status_code}"
+                                            continue
                                     else:
-                                        last_err = f"HTTP {r.status_code}"
-                                        continue
+                                        break
                             except Exception as err:
                                 last_err = str(err)
                                 if is_dead_or_proxy_error(err) or "10054" in str(err) or "timeout" in str(err).lower() or "reset" in str(err).lower():
