@@ -133,49 +133,65 @@ async def run_organic_reading_flow(scheduler: StealthScheduler):
 
 
 async def run_guest_reading_flow():
-    console.print("\n[bold cyan]>>> Sesi Pembaca Tamu Organik (Guest Mode)[/]\n")
+    console.print("\n[bold cyan]>>> Sesi Pembaca Tamu Organik (Multi-Worker Guest Mode)[/]\n")
     console.print("[dim]Keunggulan Mode Tamu: Tidak memerlukan akun (Bebas 100% dari 'Registration Clustering').[/]")
     console.print("[dim]Setiap tamu menggunakan profil, proxy terisolasi & cold-start resmi Android.[/]\n")
 
     target_novel = Prompt.ask("Masukkan Novel ID Target", default=DEFAULT_TARGET_NOVEL_ID)
-    guest_count = IntPrompt.ask("Berapa sesi tamu yang ingin dijalankan bergantian?", default=5)
+    guest_count = IntPrompt.ask("Total Sesi Tamu yang ingin dijalankan", default=10)
+    concurrency = IntPrompt.ask("Jumlah Worker Bersamaan / Paralel (5-10 disarankan)", default=5)
     chapters_per_guest = IntPrompt.ask("Maksimal Bab yang Dibaca per Tamu", default=3)
-    country = Prompt.ask("Kode Negara Tamu (contoh: ID, US, KR, JP)", default="ID").upper()
+    country_input = Prompt.ask("Negara Tamu (ID/US/KR/JP/GB/DE atau 'RANDOM')", default="RANDOM").upper().strip()
 
-    console.print(f"\n[bold green]Memulai {guest_count} sesi pembaca tamu untuk novel '{target_novel}'...[/]\n")
+    console.print(
+        f"\n[bold green]Memulai {guest_count} sesi tamu ({concurrency} worker paralel, negara: {country_input}) "
+        f"untuk novel '{target_novel}'...[/]\n"
+    )
 
-    import random
+    sem = asyncio.Semaphore(concurrency)
 
-    for i in range(1, guest_count + 1):
-        profile = ProfileGenerator.generate_profile(country_code=country)
-        proxy = default_proxy_manager.pop_proxy(country)
-        client = StealthApiClient(
-            profile=profile,
-            proxy_manager=default_proxy_manager,
-            current_proxy=proxy,
-        )
+    async def run_single_guest(idx: int):
+        # Stagger jeda awal agar tidak memicu panggilan di milidetik yang persis sama
+        if idx <= concurrency:
+            await asyncio.sleep(random.uniform(0.5, 2.5) * (idx - 1))
 
-        def log_cb(msg: str):
-            console.print(msg)
+        async with sem:
+            if country_input in ("RANDOM", "ALL", "AUTO", ""):
+                c_code = random.choices(["KR", "US", "JP", "GB", "ID", "DE"], weights=[25, 25, 15, 15, 10, 10], k=1)[0]
+            else:
+                c_code = country_input
 
-        worker = StealthGuestWorker(
-            guest_index=i,
-            client=client,
-            target_novel_id=target_novel,
-            status_cb=log_cb,
-        )
+            profile = ProfileGenerator.generate_profile(country_code=c_code)
+            proxy = default_proxy_manager.pop_proxy(c_code)
+            client = StealthApiClient(
+                profile=profile,
+                proxy_manager=default_proxy_manager,
+                current_proxy=proxy,
+            )
 
-        try:
-            await worker.run_guest_session(max_chapters=chapters_per_guest)
-        finally:
-            await client.close()
+            def log_cb(msg: str):
+                console.print(msg)
 
-        if i < guest_count:
-            delay = random.uniform(10.0, 25.0)
-            console.print(f"\n[dim]Menunggu jeda kedatangan tamu berikutnya ({int(delay)}s)...[/]\n")
-            await asyncio.sleep(delay)
+            worker = StealthGuestWorker(
+                guest_index=idx,
+                client=client,
+                target_novel_id=target_novel,
+                status_cb=log_cb,
+            )
 
-    console.print("\n[bold green]Semua sesi pembaca tamu telah selesai secara alami![/]")
+            try:
+                console.print(f"[cyan][Guest-{idx:02d}] Masuk sebagai tamu baru ([yellow]{c_code}[/])...[/]")
+                await worker.run_guest_session(max_chapters=chapters_per_guest)
+            finally:
+                await client.close()
+
+            # Jeda alami sebelum slot diisi tamu berikutnya
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+
+    tasks = [run_single_guest(i) for i in range(1, guest_count + 1)]
+    await asyncio.gather(*tasks)
+
+    console.print(f"\n[bold green]Semua {guest_count} sesi pembaca tamu telah selesai secara alami dan aman![/]")
     Prompt.ask("\nTekan Enter untuk kembali")
 
 
