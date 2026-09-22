@@ -51,14 +51,18 @@ def print_banner():
 
 def show_accounts_summary(scheduler: StealthScheduler):
     accounts = scheduler.load_accounts()
-    proxy_count = len(default_proxy_manager.proxies)
+    proxy_desc = (
+        f"[green]{len(default_proxy_manager.proxies)} Proxy (Aktif)[/]"
+        if (default_proxy_manager.enabled and default_proxy_manager.proxies)
+        else "[bold yellow]Direct (Tanpa Proxy)[/]"
+    )
 
     table = Table(title="[bold yellow]Ringkasan Sistem Stealth Bot[/]", show_header=True)
     table.add_column("Parameter", style="cyan")
     table.add_column("Nilai Saat Ini", style="green")
 
     table.add_row("Total Akun Tersimpan (akun_stealth.txt)", f"{len(accounts)} Akun")
-    table.add_row("Total Proxy Aktif (HypeProxy / Pool)", f"{proxy_count} Proxy")
+    table.add_row("Mode Proxy Jaringan", proxy_desc)
     table.add_row("Rasio Kamuflase (Novel Lain)", f"{int(CAMOUFLAGE_NOVEL_RATIO * 100)}% Kamuflase : {int((1-CAMOUFLAGE_NOVEL_RATIO)*100)}% Target")
     table.add_row("Rentang Kecepatan Manusia (WPM)", f"{MIN_WPM} - {MAX_WPM} Words/Minute")
     table.add_row("Versi Aplikasi Android", f"v{APP_VERSION} (Official)")
@@ -70,7 +74,7 @@ async def run_organic_reading_flow(scheduler: StealthScheduler):
     accounts = scheduler.load_accounts()
     if not accounts:
         console.print("[bold red]Belum ada akun di 'akun_stealth.txt'![/]")
-        console.print("[yellow]Silakan buat akun baru terlebih dahulu via Menu [2].[/]")
+        console.print("[yellow]Silakan buat akun baru terlebih dahulu via Menu [3].[/]")
         Prompt.ask("\nTekan Enter untuk kembali")
         return
 
@@ -166,7 +170,6 @@ async def run_guest_reading_flow():
         finally:
             await client.close()
 
-        # Jeda natural antar tamu berikutnya (10 - 25 detik)
         if i < guest_count:
             delay = random.uniform(10.0, 25.0)
             console.print(f"\n[dim]Menunggu jeda kedatangan tamu berikutnya ({int(delay)}s)...[/]\n")
@@ -257,10 +260,11 @@ async def async_main():
             " [bold green][2][/] Jalankan Guest Stealth Reader (Mode Tamu Organik - Tanpa Akun)\n"
             " [bold green][3][/] Registrasi Akun Halus (Spaced / Anti-Clustering Signup)\n"
             " [bold green][4][/] Inspeksi Akun di 'akun_stealth.txt'\n"
+            " [bold green][5][/] Toggle Mode Proxy (Aktif / Direct Koneksi)\n"
             " [bold red][0][/] Keluar ke Terminal\n"
         )
 
-        choice = Prompt.ask("Pilih Menu", choices=["0", "1", "2", "3", "4"], default="1")
+        choice = Prompt.ask("Pilih Menu", choices=["0", "1", "2", "3", "4", "5"], default="1")
 
         if choice == "1":
             await run_organic_reading_flow(scheduler)
@@ -270,6 +274,11 @@ async def async_main():
             await run_spaced_signup_flow(scheduler)
         elif choice == "4":
             run_inspect_accounts(scheduler)
+        elif choice == "5":
+            default_proxy_manager.enabled = not default_proxy_manager.enabled
+            status = "[bold green]DIAKTIFKAN[/]" if default_proxy_manager.enabled else "[bold yellow]DINONAKTIFKAN (Direct Connection)[/]"
+            console.print(f"\n[bold cyan]Status Proxy:[/] {status}")
+            Prompt.ask("\nTekan Enter untuk kembali")
         elif choice == "0":
             console.print("[yellow]Keluar dari Stealth Bot. Sampai jumpa![/]")
             break
@@ -278,8 +287,8 @@ async def async_main():
 def main():
     try:
         asyncio.run(async_main())
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Operasi dibatalkan pengguna.[/]")
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Operasi dihentikan. Keluar.[/]")
 
 
 if __name__ == "__main__":

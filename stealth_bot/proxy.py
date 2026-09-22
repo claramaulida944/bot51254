@@ -68,11 +68,13 @@ class ProxyItem:
 class StealthProxyManager:
     """Manajer Proxy yang mengedepankan isolasi IP & mencegah clustering request."""
 
-    def __init__(self, proxies_file: Optional[Path] = None):
+    def __init__(self, proxies_file: Optional[Path] = None, enabled: bool = True):
         self.proxies_file = proxies_file or (PROXIES_FILE if PROXIES_FILE.exists() else FALLBACK_PROXIES_FILE)
+        self.enabled = enabled
         self.lock = threading.Lock()
         self.proxies: List[ProxyItem] = []
-        self._load_proxies()
+        if self.enabled:
+            self._load_proxies()
 
     def _load_proxies(self):
         if not self.proxies_file.exists():
@@ -88,10 +90,12 @@ class StealthProxyManager:
 
     @property
     def has_proxies(self) -> bool:
-        return len(self.proxies) > 0
+        return self.enabled and len(self.proxies) > 0
 
     def pop_proxy(self, country_code: Optional[str] = None) -> Optional[str]:
         """Mengambil proxy yang siap pakai secara round-robin atau acak tertimbang."""
+        if not self.enabled:
+            return None
         with self.lock:
             if not self.proxies:
                 self._load_proxies()

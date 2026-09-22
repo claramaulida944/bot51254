@@ -199,8 +199,13 @@ class StealthApiClient:
             else:
                 return False, f"Server menolak: HTTP {resp.status_code} ({resp.text[:80]})"
         except Exception as exc:
-            await self.rotate_proxy_if_needed(str(exc))
-            return False, f"Koneksi gagal: {exc}"
+            err_msg = str(exc) or repr(exc)
+            if "Proxy" in type(exc).__name__ or "407" in err_msg:
+                err_desc = f"Proxy Error (407 Auth / Mati): {err_msg}"
+            else:
+                err_desc = f"{type(exc).__name__}: {err_msg}"
+            await self.rotate_proxy_if_needed(err_desc)
+            return False, f"Koneksi gagal: {err_desc}"
 
     async def _sync_signup_attribution(self):
         """Mengirimkan konfirmasi atribusi instalasi AppsFlyer ke server."""
