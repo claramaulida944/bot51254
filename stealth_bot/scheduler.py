@@ -10,7 +10,16 @@ import asyncio
 import json
 import logging
 import random
+import re
 from typing import Any, Callable, Dict, List, Optional
+
+
+def extract_base_username(email_addr: str) -> str:
+    """Mengekstrak username dasar tanpa dot trick atau suffix plus tag."""
+    user = email_addr.split("@")[0].lower()
+    user = re.sub(r"\+.*", "", user)
+    user = user.replace(".", "")
+    return user
 
 from .config import (
     ACCOUNTS_FILE,
@@ -82,9 +91,10 @@ class StealthScheduler:
         success_count = 0
         verifier = TempTfVerifier() if verify_email else None
 
-        # Muat daftar email yang sudah pernah terdaftar untuk mencegah duplikasi
+        # Muat daftar email dan base username yang sudah pernah terdaftar untuk mencegah duplikasi & daur ulang nama
         saved_accs = self.load_accounts()
         existing_emails = {str(a.get("email", "")).strip().lower() for a in saved_accs if a.get("email")}
+        existing_base_users = {extract_base_username(e) for e in existing_emails if e}
 
         for i in range(1, total_count + 1):
             if cancel_event and cancel_event.is_set():
@@ -103,41 +113,71 @@ class StealthScheduler:
             
             temp_email = None
             if verifier:
-                # 2. Resolusi Provider Email per Akun (Otomatis Acak atau Spesifik)
+                # 2. Resolusi Provider Email Wajar (Outlook / Hotmail - Bebas Edu & Bebas Daur Ulang Nama)
                 if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                    chosen_provider = random.choice(["gmail", "outlook", "hotmail", "edu"])
+                    chosen_provider = random.choice(["outlook", "hotmail"])
                 else:
                     chosen_provider = email_provider.lower().strip()
 
-                provider_key = "high.edu.pl" if chosen_provider == "edu" else chosen_provider
-                self.log(f"[dim]Mengambil email unik dari temp.tf (provider: {chosen_provider})...[/]")
+                # Larang keras penggunaan edu
+                if chosen_provider in ("edu", "high.edu.pl"):
+                    chosen_provider = "outlook"
+
+                provider_key = chosen_provider
+                self.log(f"[dim]Mengambil email wajar dari temp.tf (provider: {chosen_provider})...[/]")
                 use_dot = (provider_key == "gmail")
-                use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
+                use_plus = (provider_key != "gmail")
                 
-                # Coba ambil email yang belum pernah tersimpan di akun_stealth.txt
-                for attempt_email in range(1, 10):
+                # Coba ambil email dengan nama dasar yang benar-benar belum pernah terdaftar sama sekali
+                for attempt_email in range(1, 15):
                     candidate = await verifier.get_email(provider=provider_key, use_dot=use_dot, use_plus=use_plus)
                     if candidate:
-                        if candidate.lower() not in existing_emails:
-                            temp_email = candidate.lower()
-                            existing_emails.add(temp_email)
-                            break
-                        else:
-                            self.log(f"[dim yellow]Email {candidate} sudah ada di akun_stealth.txt, meminta variasi baru...[/]")
-                            await asyncio.sleep(0.8)
+                        # Tolak jika domain edu
+                        if "@high.edu.pl" in candidate or candidate.endswith(".edu"):
+                            provider_key = random.choice(["outlook", "hotmail"])
+                            use_dot = False
+                            use_plus = True
+                            await asyncio.sleep(0.4)
+                            continue
+
+                        base_u = extract_base_username(candidate)
+
+                        # Tolak jika base user sudah pernah terdaftar (mencegah dot trick berulang dari nama yang sama)
+                        if base_u in existing_base_users or candidate.lower() in existing_emails:
+                            self.log(f"[dim yellow]Nama akun dasar '{base_u}' sudah pernah dipakai, meminta nama baru...[/]")
+                            if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
+                                chosen_provider = random.choice(["outlook", "hotmail"])
+                                provider_key = chosen_provider
+                                use_dot = False
+                                use_plus = True
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        # Jika Gmail, normalkan titik agar wajar (maksimal 1 titik, bukan rentetan titik)
+                        if "@gmail.com" in candidate and candidate.count(".") > 2:
+                            u_part = candidate.split("@")[0].replace(".", "")
+                            if len(u_part) > 5:
+                                mid = len(u_part) // 2
+                                candidate = f"{u_part[:mid]}.{u_part[mid:]}@gmail.com"
+                            else:
+                                candidate = f"{u_part}@gmail.com"
+
+                        temp_email = candidate.lower()
+                        existing_emails.add(temp_email)
+                        existing_base_users.add(base_u)
+                        break
                     else:
-                        # Jika provider tertentu sedang kosong, ganti provider lain jika mode random
                         if email_provider.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                            chosen_provider = random.choice(["gmail", "outlook", "hotmail", "edu"])
-                            provider_key = "high.edu.pl" if chosen_provider == "edu" else chosen_provider
-                            use_dot = (provider_key == "gmail")
-                            use_plus = (provider_key != "gmail" and provider_key != "high.edu.pl")
+                            chosen_provider = random.choice(["outlook", "hotmail"])
+                            provider_key = chosen_provider
+                            use_dot = False
+                            use_plus = True
                         await asyncio.sleep(0.5)
 
                 if temp_email:
-                    self.log(f"[bold cyan]Email Langsung dari temp.tf Didapat:[/] [green]{temp_email}[/] ([dim]{chosen_provider}[/])")
+                    self.log(f"[bold cyan]Email Wajar Didapat:[/] [green]{temp_email}[/] ([dim]{chosen_provider}[/])")
                 else:
-                    self.log("[yellow]Gagal mendapatkan email unik dari temp.tf, fallback ke email sintetis.[/]")
+                    self.log("[yellow]Gagal mendapatkan email wajar dari temp.tf, fallback ke email sintetis.[/]")
 
             profile = ProfileGenerator.generate_profile(country_code=current_country, email=temp_email)
 

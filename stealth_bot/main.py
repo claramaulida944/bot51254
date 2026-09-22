@@ -181,7 +181,7 @@ async def run_guest_reading_flow():
 
 async def run_spaced_signup_flow(scheduler: StealthScheduler):
     console.print("\n[bold cyan]>>> Registrasi Akun Halus (Full Auto Random Stealth)[/]\n")
-    console.print("[dim]Fitur Otomatis Penuh: Mengacak Negara (KR/US/JP/GB/ID), Provider Email (Gmail/Outlook/Hotmail/Edu), dan Verifikasi OTP via temp.tf.[/]\n")
+    console.print("[dim]Fitur Otomatis Penuh: Mengacak Negara (KR/US/JP/GB/ID), Provider Email Wajar (Outlook/Hotmail/Gmail Unik), dan Verifikasi OTP 120s.[/]\n")
 
     count = IntPrompt.ask("Berapa akun yang ingin didaftarkan?", default=5)
 
