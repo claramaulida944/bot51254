@@ -206,54 +206,75 @@ class BotBridge:
         if not novel_id:
             return {"ok": False, "error": "URL atau ID Novel tidak valid (harus 16 karakter)"}
 
-        # Pinjam 1 proxy sementara jika ada
-        proxy = ProxyPoolManager.acquire_proxy("info_fetch", "worker_info")
+        headers = {
+            "user-agent": "okhttp/4.12.0",
+            "accept": "application/json",
+            "platform": "android",
+        }
+
+        # Strategi cerdas: Coba direct connection terlebih dahulu (cepat & reliabel)
+        # Jika ada kendala, fallback gunakan proxy pool
+        client_configs = [{"timeout": 7.0}]
+        
+        fallback_proxy = ProxyPoolManager.acquire_proxy("info_fetch", "worker_info")
+        if fallback_proxy:
+            client_configs.append({"proxy": fallback_proxy, "timeout": 12.0})
+
+        last_error = "Tidak dapat terhubung ke server Quarterfull."
+
         try:
             import httpx
-            kwargs = {
-                "base_url": "https://api.quarterfull.io",
-                "timeout": 15.0,
-                "headers": {
-                    "user-agent": "okhttp/4.12.0",
-                    "accept": "application/json",
-                    "platform": "android",
-                }
-            }
-            if proxy:
-                kwargs["proxy"] = proxy
-
-            async with httpx.AsyncClient(**kwargs) as client:
-                resp = await client.get(f"/api/v1/novels/{novel_id}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    author_data = data.get("author", {}) or {}
-                    author_id = author_data.get("id") or author_data.get("hash_id") or data.get("author_id", "")
-                    
-                    # Ambil bab
-                    c_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
-                    ch_count = 0
-                    if c_resp.status_code == 200:
-                        c_data = c_resp.json()
-                        ch_list = c_data.get("chapters", []) or c_data.get("items", []) or []
-                        ch_count = len(ch_list)
-
-                    return {
-                        "ok": True,
-                        "novel_id": novel_id,
-                        "title": data.get("title", f"Novel #{novel_id}"),
-                        "author": author_data.get("name") or author_data.get("nickname") or "Penulis",
-                        "author_id": str(author_id),
-                        "cover_url": data.get("cover_url") or data.get("cover_image_url") or "",
-                        "synopsis": (data.get("synopsis") or "")[:200],
-                        "total_chapters": ch_count,
+            for cfg in client_configs:
+                try:
+                    kwargs = {
+                        "base_url": "https://api.quarterfull.io",
+                        "headers": headers,
+                        **cfg
                     }
-                else:
-                    return {"ok": False, "error": f"Server menolak: HTTP {resp.status_code}"}
-        except Exception as e:
-            return {"ok": False, "error": f"Gagal mengambil info novel: {str(e)}"}
+                    async with httpx.AsyncClient(**kwargs) as client:
+                        resp = await client.get(f"/api/v1/novels/{novel_id}")
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            author_data = data.get("author", {}) or {}
+                            author_id = author_data.get("hash_id") or author_data.get("id") or data.get("author_id", "")
+                            author_name = author_data.get("pen_name") or author_data.get("name") or author_data.get("nickname") or "Penulis"
+
+                            # Ambil data bab
+                            ch_count = 0
+                            try:
+                                c_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
+                                if c_resp.status_code == 200:
+                                    c_data = c_resp.json()
+                                    if isinstance(c_data, dict):
+                                        ch_count = c_data.get("total_count") or len(c_data.get("items", [])) or len(c_data.get("chapters", []))
+                                    elif isinstance(c_data, list):
+                                        ch_count = len(c_data)
+                            except Exception:
+                                pass
+
+                            return {
+                                "ok": True,
+                                "novel_id": novel_id,
+                                "title": data.get("title", f"Novel #{novel_id}"),
+                                "author": author_name,
+                                "author_id": str(author_id),
+                                "cover_url": data.get("cover_image_url") or data.get("cover_url") or "",
+                                "synopsis": (data.get("description") or data.get("synopsis") or "")[:250],
+                                "total_chapters": ch_count,
+                            }
+                        elif resp.status_code == 404:
+                            return {"ok": False, "error": f"Novel dengan ID '{novel_id}' tidak ditemukan di Quarterfull."}
+                        else:
+                            last_error = f"Server Quarterfull mengembalikan HTTP {resp.status_code}"
+                except Exception as exc:
+                    err_msg = str(exc).strip() or exc.__class__.__name__
+                    last_error = f"Koneksi gagal ({err_msg})"
+                    continue
+
+            return {"ok": False, "error": f"Gagal mengambil info novel: {last_error}"}
         finally:
-            if proxy:
-                ProxyPoolManager.release_proxy(proxy)
+            if fallback_proxy:
+                ProxyPoolManager.release_proxy(fallback_proxy)
 
     @classmethod
     async def run_task_lifecycle(cls, task: WebTask) -> None:
