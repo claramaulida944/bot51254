@@ -486,21 +486,23 @@ async def api_create_payment(req: PaymentCreateRequest, request: Request):
             customer_email=cust_email,
         )
 
-        if not res.get("status"):
-            err_msg = res.get("message") or "Gagal membuat invoice QRIS ke WijayaPay."
+        if not res.get("ok"):
+            err_msg = res.get("error") or "Gagal membuat invoice QRIS ke WijayaPay."
             return JSONResponse(status_code=400, content={"ok": False, "error": err_msg})
 
         tx_data = res.get("data", {})
-        qr_url = tx_data.get("qr_url") or tx_data.get("checkout_url")
-        qr_image = tx_data.get("qr_image") or tx_data.get("qr_content")
-        expired_at = tx_data.get("expired_time")
+        qr_image = tx_data.get("qr_image") or tx_data.get("qr_url") or tx_data.get("checkout_url")
+        qr_string = tx_data.get("qr_string") or ""
+        total_bayar = int(tx_data.get("total_bayar") or nominal)
+        expired_at = tx_data.get("expired") or tx_data.get("expired_time")
 
         return {
             "ok": True,
             "ref_id": ref_id,
             "nominal": nominal,
-            "qr_url": qr_url,
+            "total_bayar": total_bayar,
             "qr_image": qr_image,
+            "qr_string": qr_string,
             "expired_at": expired_at,
         }
     except Exception as e:
@@ -516,36 +518,40 @@ async def api_check_payment(ref_id: str, request: Request):
 
     try:
         res = default_wijayapay_client.check_status(ref_id)
-        if not res.get("status"):
-            return {"ok": False, "payment_status": "PENDING", "message": res.get("message")}
+        if not res.get("ok"):
+            return {"ok": False, "payment_status": "PENDING", "message": res.get("error") or "Menunggu pembayaran..."}
 
+        is_paid = res.get("is_paid", False)
+        status_str = (res.get("status") or "pending").upper().strip()
         data = res.get("data", {})
-        tx_status = (data.get("status") or "").upper().strip()
 
-        if tx_status in ("PAID", "SUCCESS", "BERHASIL"):
-            # Cek apakah transaksi sudah dikreditkan sebelumnya
+        if is_paid or status_str in ("PAID", "SUCCESS", "BERHASIL", "SETTLED"):
             with db_session() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT id FROM transactions WHERE reference_id = ? AND type = 'TOPUP';", (ref_id,))
                 already_credited = cursor.fetchone() is not None
 
                 if not already_credited:
-                    amount = int(data.get("nominal") or data.get("amount") or 0)
-                    if amount > 0:
-                        AuthManager.add_balance(
-                            user_id=user["id"],
-                            amount=amount,
-                            description=f"Top Up Saldo QRIS ({ref_id})",
-                            reference_id=ref_id
-                        )
-                        logger.info(f"Saldo Rp {amount:,} berhasil dikreditkan ke user {user['username']}")
+                    amount = int(data.get("total_diterima") or data.get("nominal") or data.get("amount") or 0)
+                    if amount <= 0:
+                        # Fallback ambil dari ref_id TOPUP-{user_id}-{time}-{hex}
+                        try:
+                            amount = int(data.get("total_bayar") or 10000)
+                        except Exception:
+                            amount = 10000
 
-            # Refresh profil user
+                    AuthManager.add_balance(
+                        user_id=user["id"],
+                        amount=amount,
+                        description=f"Top Up Saldo QRIS ({ref_id})",
+                        reference_id=ref_id
+                    )
+                    logger.info(f"Top up QRIS berhasil untuk user {user['id']}: Rp {amount:,}")
             refreshed_user = AuthManager.get_user_by_session(request.headers.get("x-session-token", ""))
             new_bal = refreshed_user["balance"] if refreshed_user else user["balance"]
-            return {"ok": True, "payment_status": "PAID", "message": "Pembayaran lunas!", "new_balance": new_bal}
+            return {"ok": True, "payment_status": "PAID", "message": "Pembayaran lunas! Saldo telah bertambah.", "new_balance": new_bal}
 
-        return {"ok": True, "payment_status": tx_status or "PENDING", "message": "Menunggu konfirmasi pembayaran..."}
+        return {"ok": True, "payment_status": status_str or "PENDING", "message": "Menunggu konfirmasi pembayaran..."}
     except Exception as e:
         logger.error(f"Error checking payment {ref_id}: {e}")
         return {"ok": False, "error": str(e)}

@@ -1698,8 +1698,9 @@ function showQrisModal(data) {
   const amtDisplay = document.getElementById("qrisAmountDisplay");
   const refDisplay = document.getElementById("qrisRefDisplay");
 
-  if (img) img.src = data.qr_image_url || `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(data.qr_string || "QRIS")}`;
-  if (amtDisplay) amtDisplay.textContent = formatRupiah(data.nominal);
+  const qrSrc = data.qr_image || data.qr_image_url || `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.qr_string || "QRIS")}`;
+  if (img) img.src = qrSrc;
+  if (amtDisplay) amtDisplay.textContent = formatRupiah(data.total_bayar || data.nominal);
   if (refDisplay) refDisplay.textContent = data.ref_id;
 
   if (modal) modal.style.display = "flex";
