@@ -631,6 +631,15 @@ class AdminHypeProxyExtendRequest(BaseModel):
     days: int = 7
 
 
+class AdminResetUserPasswordRequest(BaseModel):
+    user_id: int
+    new_password: str = "Rinara123!"
+
+
+class AdminDeleteUserRequest(BaseModel):
+    user_id: int
+
+
 class AdminBotRegisterRequest(BaseModel):
     count: int = 5
     country: str = "RANDOM"
@@ -714,6 +723,35 @@ async def api_admin_topup_user(req: AdminTopupRequest, request: Request):
     if ok:
         return {"ok": True, "message": f"Berhasil memproses saldo Rp {abs(req.amount):,} untuk User #{req.user_id}."}
     return JSONResponse(status_code=400, content={"ok": False, "error": "Gagal memproses saldo. Pastikan User ID terdaftar dan saldo cukup."})
+
+
+@app.post("/api/admin/reset-user-password")
+async def api_admin_reset_user_password(req: AdminResetUserPasswordRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+    if len(req.new_password) < 6:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Kata sandi baru minimal 6 karakter."})
+    from database import hash_password
+    pwd_hash, pwd_salt = hash_password(req.new_password)
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?;", (pwd_hash, pwd_salt, req.user_id))
+        if cursor.rowcount > 0:
+            return {"ok": True, "message": f"Kata sandi User #{req.user_id} berhasil diubah ke '{req.new_password}'!"}
+        return JSONResponse(status_code=404, content={"ok": False, "error": f"User #{req.user_id} tidak ditemukan."})
+
+
+@app.post("/api/admin/delete-user")
+async def api_admin_delete_user(req: AdminDeleteUserRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM users WHERE id = ?;", (req.user_id,))
+        if cursor.rowcount > 0:
+            return {"ok": True, "message": f"User #{req.user_id} berhasil dihapus."}
+        return JSONResponse(status_code=404, content={"ok": False, "error": "User tidak ditemukan."})
+
 
 
 @app.get("/api/admin/proxies")

@@ -467,7 +467,8 @@ async function submitLogin() {
       if (passEl) passEl.value = "";
     } else {
       triggerAuthShake();
-      if (errText) errText.textContent = data.error || "Gagal masuk ke akun.";
+      const msg = data.error || (typeof data.detail === "string" ? data.detail : null) || (resp.status === 404 ? "Layanan autentikasi server sedang dimuat ulang. Coba sesaat lagi." : "Gagal masuk ke akun.");
+      if (errText) errText.textContent = msg;
       if (errBox) errBox.style.display = "flex";
     }
   } catch (e) {
@@ -564,7 +565,8 @@ async function submitRegister() {
       if (cEl) cEl.value = "";
     } else {
       triggerAuthShake();
-      if (errText) errText.textContent = data.error || "Gagal mendaftarkan akun baru.";
+      const msg = data.error || (typeof data.detail === "string" ? data.detail : null) || (resp.status === 404 ? "Layanan pendaftaran server sedang dimuat ulang. Coba sesaat lagi." : "Gagal mendaftarkan akun baru.");
+      if (errText) errText.textContent = msg;
       if (errBox) errBox.style.display = "flex";
     }
   } catch (e) {
