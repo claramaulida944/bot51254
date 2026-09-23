@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=12.0">
+  <link rel="stylesheet" href="/static/style.css?v=13.0">
 </head>
 <body>
 
@@ -175,17 +175,71 @@
                 </div>
                 <span class="form-hint">Sistem memverifikasi judul, penulis, dan bab secara langsung dari server.</span>
 
-                <!-- Preview Novel Box -->
+                <!-- Enhanced Rich Preview Novel Box -->
                 <div id="novelPreviewBox" class="novel-preview-card" style="display:none;">
-                  <img id="novelCoverImg" class="novel-cover-img" src="" alt="Cover Novel">
-                  <div class="novel-meta-content">
-                    <div id="novelTitle" class="novel-title">Judul Novel</div>
-                    <div id="novelAuthor" class="novel-author">Penulis</div>
-                    <div class="novel-tags">
-                      <span class="novel-tag font-mono" id="tagChapters">0 Bab</span>
-                      <span class="novel-tag" style="color:var(--accent-emerald);">Metadata Terverifikasi</span>
+                  <div class="novel-preview-header">
+                    <div class="novel-cover-wrap">
+                      <img id="novelCoverImg" class="novel-cover-img" src="" alt="Cover Novel">
+                      <div id="novelBadgeAdult" class="novel-adult-overlay" style="display:none;">18+</div>
+                    </div>
+                    <div class="novel-meta-content">
+                      <div class="novel-meta-top">
+                        <span id="novelCategoryTag" class="novel-badge-cat">Romansa</span>
+                        <span id="novelAgeRatingTag" class="novel-badge-rating">Umum</span>
+                      </div>
+                      <h4 id="novelTitle" class="novel-title" style="margin:0 0 4px; font-size:14px; color:#ffffff;">Judul Novel</h4>
+                      <div id="novelAuthor" class="novel-author" style="margin-bottom:8px;">✍️ Penulis: -</div>
+                      
+                      <div class="novel-tags">
+                        <span class="novel-tag font-mono" id="tagChapters">0 Bab</span>
+                        <span class="novel-tag font-mono" id="tagFreeChapters" style="color:#10b981; border-color:rgba(16, 185, 129, 0.35);">0 Gratis</span>
+                        <span class="novel-tag font-mono" id="tagVipChapters" style="display:none; color:#f59e0b; border-color:rgba(245, 158, 11, 0.35);">0 VIP/Kunci</span>
+                        <span class="novel-tag" style="color:var(--accent-emerald);">✓ Terverifikasi</span>
+                      </div>
                     </div>
                   </div>
+
+                  <!-- 18+ Warning Alert -->
+                  <div id="novelAdultNotice" class="novel-adult-alert" style="display:none;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="flex-shrink:0; margin-top:2px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    <div>
+                      <strong>Perhatian: Konten Khusus Dewasa (18+)</strong>
+                      <p>Quarterfull mewajibkan verifikasi akun dewasa untuk membaca novel 18+. <strong>Mode Tamu (Guest) otomatis dinonaktifkan</strong> untuk novel ini. Sistem mengunci eksekusi ke <strong>Mode Akun Valid (25 Bab)</strong>.</p>
+                    </div>
+                  </div>
+
+                  <!-- Sinopsis Lengkap -->
+                  <div class="novel-synopsis-section">
+                    <div class="novel-synopsis-header">
+                      <span>📖 Sinopsis Novel</span>
+                      <button type="button" class="btn-synopsis-toggle" id="btnToggleSynopsis" onclick="toggleNovelSynopsis()">Lihat Selengkapnya</button>
+                    </div>
+                    <div id="novelSynopsisText" class="novel-synopsis-content collapsed">
+                      -
+                    </div>
+                  </div>
+
+                  <!-- Chapter Explorer / Accordion -->
+                  <div class="novel-chapters-section">
+                    <div class="novel-chapters-header" onclick="toggleChapterList()">
+                      <div style="display:flex; align-items:center; gap:8px;">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                        <span style="font-weight:600; font-size:12.5px; color:#ffffff;">Daftar Bab Novel</span>
+                        <span id="badgeChapterCount" class="novel-tag font-mono" style="font-size:10px;">0 Bab</span>
+                      </div>
+                      <span id="iconChapterAccordion" style="font-size:11.5px; color:var(--text-muted); font-weight:600;">▼ Buka Daftar Bab</span>
+                    </div>
+
+                    <div id="novelChapterDrawer" class="novel-chapters-drawer" style="display:none;">
+                      <div class="chapter-search-box">
+                        <input type="text" id="inputFilterChapters" class="form-input" placeholder="Cari nomor atau judul bab..." oninput="filterChapterList(this.value)" style="font-size:12px; padding:6px 10px;">
+                      </div>
+                      <div id="novelChapterList" class="chapter-list-grid">
+                        <!-- Chapter items injected by JS -->
+                      </div>
+                    </div>
+                  </div>
+
                 </div>
               </div>
 
@@ -1043,6 +1097,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toastContainer" class="toast-container"></div>
 
-<script src="/static/app.js?v=12.0"></script>
+<script src="/static/app.js?v=13.0"></script>
 </body>
 </html>

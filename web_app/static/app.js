@@ -631,19 +631,102 @@ async function fetchNovelInfo() {
     const data = await resp.json();
 
     if (data.ok) {
+      currentNovelData = data;
+      currentNovelChapters = data.chapters || [];
+
       const preview = document.getElementById("novelPreviewBox");
       const cover = document.getElementById("novelCoverImg");
       const title = document.getElementById("novelTitle");
       const author = document.getElementById("novelAuthor");
       const tagChapters = document.getElementById("tagChapters");
+      const tagFreeChapters = document.getElementById("tagFreeChapters");
+      const tagVipChapters = document.getElementById("tagVipChapters");
+      const badgeCount = document.getElementById("badgeChapterCount");
+      const catTag = document.getElementById("novelCategoryTag");
+      const ratingTag = document.getElementById("novelAgeRatingTag");
+      const adultBadge = document.getElementById("novelBadgeAdult");
+      const adultNotice = document.getElementById("novelAdultNotice");
+      const synopsis = document.getElementById("novelSynopsisText");
+      const btnToggleSyn = document.getElementById("btnToggleSynopsis");
 
       if (preview) preview.style.display = "flex";
       if (cover) cover.src = data.cover_url || "https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=120";
       if (title) title.textContent = data.title;
-      if (author) author.textContent = "Oleh: " + data.author;
-      if (tagChapters) tagChapters.textContent = `${data.total_chapters || 0} Bab Tersedia`;
+      if (author) author.textContent = `✍️ Penulis: ${data.author || "Anonim"} ${data.author_id ? `(${data.author_id})` : ""}`;
+      if (tagChapters) tagChapters.textContent = `${data.total_chapters || 0} Bab Total`;
+      if (badgeCount) badgeCount.textContent = `${data.total_chapters || 0} Bab`;
 
-      showToast("success", `Novel '${data.title}' berhasil diverifikasi.`, "Pemeriksaan Selesai");
+      if (tagFreeChapters) {
+        tagFreeChapters.textContent = `${data.free_chapters ?? (data.total_chapters || 0)} Bab Gratis`;
+      }
+
+      if (tagVipChapters) {
+        if (data.premium_chapters > 0) {
+          tagVipChapters.style.display = "inline-block";
+          tagVipChapters.textContent = `${data.premium_chapters} VIP/Kunci`;
+        } else {
+          tagVipChapters.style.display = "none";
+        }
+      }
+
+      // Kategori
+      if (catTag) {
+        catTag.textContent = data.category || "Novel Digital";
+      }
+
+      // 18+ Handling (Khusus Dewasa)
+      const isAdult = Boolean(data.is_adult_only);
+      const guestCard = document.querySelector('.reader-mode-card[data-mode="guest"]');
+
+      if (isAdult) {
+        if (adultBadge) adultBadge.style.display = "block";
+        if (adultNotice) adultNotice.style.display = "flex";
+        if (ratingTag) {
+          ratingTag.textContent = "🔞 Khusus Dewasa (18+)";
+          ratingTag.classList.add("adult");
+        }
+
+        // Kunci ke Mode Valid (Tamu tidak bisa baca novel 18+)
+        selectReaderMode("valid");
+        if (guestCard) {
+          guestCard.style.opacity = "0.45";
+          guestCard.style.pointerEvents = "none";
+          guestCard.style.filter = "grayscale(0.6)";
+          const desc = guestCard.querySelector(".reader-mode-desc");
+          if (desc) desc.textContent = "⛔ Tidak didukung untuk novel 18+ (Quarterfull mewajibkan akun terverifikasi).";
+        }
+
+        showToast("warning", "Novel ini berkategori 18+ (Dewasa). Mode Tamu dinonaktifkan & dialihkan otomatis ke Mode Akun Valid.", "Novel 18+ Terdeteksi");
+      } else {
+        if (adultBadge) adultBadge.style.display = "none";
+        if (adultNotice) adultNotice.style.display = "none";
+        if (ratingTag) {
+          ratingTag.textContent = "🟢 Semua Umur (Umum)";
+          ratingTag.classList.remove("adult");
+        }
+
+        if (guestCard) {
+          guestCard.style.opacity = "1";
+          guestCard.style.pointerEvents = "auto";
+          guestCard.style.filter = "none";
+          const desc = guestCard.querySelector(".reader-mode-desc");
+          if (desc) desc.textContent = "Sesi anonim super cepat via rotasi proxy tanpa akun.";
+        }
+
+        showToast("success", `Novel '${data.title}' berhasil diverifikasi.`, "Pemeriksaan Selesai");
+      }
+
+      // Sinopsis
+      if (synopsis) {
+        synopsis.textContent = data.synopsis || data.short_description || "Tidak ada deskripsi sinopsis untuk novel ini.";
+        synopsis.classList.add("collapsed");
+      }
+      if (btnToggleSyn) {
+        btnToggleSyn.textContent = "Lihat Selengkapnya";
+      }
+
+      // Render Chapters
+      renderChapterList(currentNovelChapters);
     } else {
       showToast("error", data.error || "Gagal memverifikasi informasi novel.");
     }
@@ -657,8 +740,76 @@ async function fetchNovelInfo() {
   }
 }
 
+let currentNovelData = null;
+let currentNovelChapters = [];
+
+function toggleNovelSynopsis() {
+  const el = document.getElementById("novelSynopsisText");
+  const btn = document.getElementById("btnToggleSynopsis");
+  if (!el || !btn) return;
+  const isCollapsed = el.classList.contains("collapsed");
+  if (isCollapsed) {
+    el.classList.remove("collapsed");
+    btn.textContent = "Sembunyikan";
+  } else {
+    el.classList.add("collapsed");
+    btn.textContent = "Lihat Selengkapnya";
+  }
+}
+
+function toggleChapterList() {
+  const drawer = document.getElementById("novelChapterDrawer");
+  const icon = document.getElementById("iconChapterAccordion");
+  if (!drawer) return;
+  const isClosed = drawer.style.display === "none" || !drawer.style.display;
+  drawer.style.display = isClosed ? "block" : "none";
+  if (icon) {
+    icon.textContent = isClosed ? "▲ Tutup Daftar Bab" : "▼ Buka Daftar Bab";
+    icon.style.color = isClosed ? "#10b981" : "var(--text-muted)";
+  }
+}
+
+function filterChapterList(query = "") {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) {
+    renderChapterList(currentNovelChapters);
+    return;
+  }
+  const filtered = currentNovelChapters.filter(c => {
+    const numMatch = String(c.num || "").includes(q);
+    const titleMatch = (c.title || "").toLowerCase().includes(q);
+    return numMatch || titleMatch;
+  });
+  renderChapterList(filtered);
+}
+
+function renderChapterList(chapters = []) {
+  const container = document.getElementById("novelChapterList");
+  if (!container) return;
+  if (!chapters || chapters.length === 0) {
+    container.innerHTML = `<div style="text-align:center; padding:16px; color:var(--text-dim); font-size:11.5px;">Tidak ada bab yang sesuai pencarian.</div>`;
+    return;
+  }
+  container.innerHTML = chapters.map(c => `
+    <div class="chapter-list-item">
+      <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
+        <span class="font-mono" style="font-weight:700; color:#38bdf8; min-width:32px;">#${c.num}</span>
+        <span style="color:#ffffff; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(c.title)}</span>
+      </div>
+      <span class="${c.is_premium ? 'chapter-badge-vip' : 'chapter-badge-free'}">
+        ${c.is_premium ? '🔒 VIP / Kunci' : '✓ Gratis'}
+      </span>
+    </div>
+  `).join("");
+}
+
 // Mode Selection: Valid vs Guest
 function selectReaderMode(mode) {
+  if (currentNovelData && currentNovelData.is_adult_only && mode === "guest") {
+    showToast("warning", "Novel ini berkategori 18+. Mode Tamu tidak didukung oleh Quarterfull untuk konten dewasa. Gunakan Mode Akun Valid.", "Mode Tamu Dikunci");
+    return;
+  }
+
   selectedMode = mode;
   document.querySelectorAll(".reader-mode-card").forEach((c) => {
     if (c.getAttribute("data-mode") === mode) {

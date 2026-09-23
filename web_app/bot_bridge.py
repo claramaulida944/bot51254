@@ -239,18 +239,41 @@ class BotBridge:
                             author_id = author_data.get("hash_id") or author_data.get("id") or data.get("author_id", "")
                             author_name = author_data.get("pen_name") or author_data.get("name") or author_data.get("nickname") or "Penulis"
 
-                            # Ambil data bab
+                            # Ambil data bab lengkap (hingga 100 bab)
                             ch_count = 0
+                            ch_items = []
                             try:
-                                c_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
+                                c_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc&limit=100")
                                 if c_resp.status_code == 200:
                                     c_data = c_resp.json()
+                                    raw_items = []
                                     if isinstance(c_data, dict):
                                         ch_count = c_data.get("total_count") or len(c_data.get("items", [])) or len(c_data.get("chapters", []))
+                                        raw_items = c_data.get("items", []) or c_data.get("chapters", [])
                                     elif isinstance(c_data, list):
                                         ch_count = len(c_data)
+                                        raw_items = c_data
+
+                                    for idx, it in enumerate(raw_items):
+                                        ch_items.append({
+                                            "num": it.get("chapter_num", idx + 1),
+                                            "title": it.get("title", f"Bab {idx + 1}"),
+                                            "hash_id": it.get("hash_id", ""),
+                                            "is_premium": bool(it.get("is_premium", False)),
+                                        })
                             except Exception:
                                 pass
+
+                            free_count = sum(1 for c in ch_items if not c["is_premium"])
+                            prem_count = sum(1 for c in ch_items if c["is_premium"])
+
+                            # Kategori
+                            cat_raw = data.get("category")
+                            cat_name = ""
+                            if isinstance(cat_raw, dict):
+                                cat_name = cat_raw.get("name") or ""
+                            elif isinstance(cat_raw, str):
+                                cat_name = cat_raw
 
                             return {
                                 "ok": True,
@@ -259,8 +282,15 @@ class BotBridge:
                                 "author": author_name,
                                 "author_id": str(author_id),
                                 "cover_url": data.get("cover_image_url") or data.get("cover_url") or "",
-                                "synopsis": (data.get("description") or data.get("synopsis") or "")[:250],
-                                "total_chapters": ch_count,
+                                "synopsis": data.get("description") or data.get("synopsis") or "",
+                                "short_description": data.get("short_description") or "",
+                                "category": cat_name,
+                                "total_chapters": ch_count or len(ch_items),
+                                "free_chapters": free_count,
+                                "premium_chapters": prem_count,
+                                "is_adult_only": bool(data.get("is_adult_only", False)),
+                                "chapters": ch_items,
+                                "stats": data.get("stats") or {},
                             }
                         elif resp.status_code == 404:
                             return {"ok": False, "error": f"Novel dengan ID '{novel_id}' tidak ditemukan di Quarterfull."}

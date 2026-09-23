@@ -278,6 +278,19 @@ async def api_start_task(req: TaskStartRequest, request: Request):
         return JSONResponse(status_code=400, content={"ok": False, "error": "URL atau ID Novel tidak valid (16 karakter)."})
 
     novel_info = await BotBridge.get_novel_info(novel_id)
+    if not novel_info.get("ok"):
+        return JSONResponse(status_code=400, content={"ok": False, "error": novel_info.get("error") or "Gagal memverifikasi informasi novel."})
+
+    is_adult = bool(novel_info.get("is_adult_only", False))
+    if is_adult and mode == "guest":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "Novel ini memiliki batasan 18+ (Dewasa). Quarterfull mewajibkan akun terverifikasi untuk membaca novel 18+, sehingga Mode Tamu (Guest) tidak dapat digunakan. Silakan gunakan Mode Akun Valid (25 Bab)."
+            }
+        )
+
     novel_title = novel_info.get("title", f"Novel #{novel_id}")
     author_id = novel_info.get("author_id", "")
 
