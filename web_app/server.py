@@ -72,7 +72,7 @@ async def on_startup():
         from proxy_pool import ProxyPoolManager
         ProxyPoolManager.sync_from_files()
         with db_session() as conn:
-            conn.cursor().execute("UPDATE proxies SET status = 'IDLE', active_task_id = NULL, active_worker_id = NULL WHERE status = 'BUSY';")
+            conn.cursor().execute("UPDATE proxies SET status = 'IDLE', current_task_id = NULL, current_worker_id = NULL, current_user_id = NULL WHERE status = 'BUSY';")
         logger.info("Server RinaraDev siap! Database dan aset bot telah disinkronkan.")
     except Exception as e:
         logger.error(f"Error sinkronisasi database: {e}")
