@@ -15,6 +15,7 @@ let selectedPayCategory = "qris"; // "qris", "va", "retail"
 let selectedPayChannel = "QRIS";
 let qrisPollingInterval = null;
 let currentQrisRefId = null;
+let isCurrentTaskPaused = false;
 
 // Dynamic System Settings (dimuat dari backend /api/settings)
 let appSettings = {
@@ -1549,35 +1550,112 @@ function updateStatsWidget(stats) {
   const fEl = document.getElementById("activeTaskFollows");
   const cEl = document.getElementById("activeTaskConverted");
   const consoleEta = document.getElementById("liveConsoleEta");
+  const wsProgress = document.getElementById("workstationTaskProgressLabel");
 
   if (pEl) pEl.textContent = `${stats.completed_readers || 0} / ${stats.target_readers || 0}`;
+  if (wsProgress) wsProgress.textContent = `${stats.completed_readers || 0} / ${stats.target_readers || 0} Pembaca`;
   if (lEl) lEl.textContent = stats.likes || 0;
   if (bEl) bEl.textContent = stats.bookmarks || 0;
   if (fEl) fEl.textContent = stats.follows || 0;
   if (cEl) cEl.textContent = stats.converted_accounts || 0;
 
+  if (stats.is_paused !== undefined) {
+    updatePauseButtons(stats.is_paused);
+  }
+
   if (stats.estimated_seconds_left !== undefined) {
     const sec = stats.estimated_seconds_left;
     const mins = Math.ceil(sec / 60);
     const textEta = sec > 0 ? `~${mins} Menit (${stats.estimated_finish_time || ''})` : "Hampir Selesai";
-    if (etaEl) etaEl.textContent = textEta;
-    if (consoleEta) consoleEta.textContent = `ETA: ${textEta}`;
+    if (etaEl) etaEl.textContent = isCurrentTaskPaused ? "⏸️ Dijeda" : textEta;
+    if (consoleEta) consoleEta.textContent = isCurrentTaskPaused ? "ETA: Tugas Dijeda" : `ETA: ${textEta}`;
+  }
+}
+
+function updatePauseButtons(isPaused) {
+  isCurrentTaskPaused = !!isPaused;
+
+  // 1. Top bar button
+  const topBtn = document.getElementById("btnTopBarPause");
+  if (topBtn) {
+    topBtn.textContent = isPaused ? "▶️ Lanjutkan" : "⏸️ Jeda";
+    topBtn.className = isPaused ? "btn btn-primary btn-xs" : "btn btn-secondary btn-xs";
+  }
+
+  // 2. Workstation button & status label
+  const wsBtn = document.getElementById("btnWorkstationPause");
+  const wsLabel = document.getElementById("workstationTaskStatusLabel");
+  if (wsBtn) {
+    wsBtn.textContent = isPaused ? "▶️ Lanjutkan Sesi Bot" : "⏸️ Jeda Sesi Bot";
+    wsBtn.className = isPaused ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm";
+  }
+  if (wsLabel) {
+    wsLabel.textContent = isPaused ? "Tugas Bot Dijeda (Paused)" : "Tugas Bot Sedang Berjalan";
+    wsLabel.style.color = isPaused ? "var(--accent-amber)" : "#38bdf8";
+  }
+
+  // 3. Dashboard card button
+  const dashBtn = document.getElementById("btnDashPause");
+  if (dashBtn) {
+    dashBtn.textContent = isPaused ? "▶️ Lanjutkan" : "⏸️ Jeda";
+    dashBtn.className = isPaused ? "btn btn-primary btn-xs font-mono" : "btn btn-secondary btn-xs font-mono";
+  }
+}
+
+async function togglePauseTask() {
+  if (!currentTaskId) {
+    showToast("warning", "Tidak ada tugas bot yang sedang aktif.");
+    return;
+  }
+
+  const endpoint = isCurrentTaskPaused ? `/api/tasks/resume/${currentTaskId}` : `/api/tasks/pause/${currentTaskId}`;
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: getAuthHeaders(),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      updatePauseButtons(data.is_paused);
+      showToast("info", data.message || (data.is_paused ? "Tugas bot dijeda sementara." : "Tugas bot dilanjutkan kembali."));
+    } else {
+      showToast("error", data.error || "Gagal mengubah status jeda tugas.");
+    }
+  } catch (e) {
+    showToast("error", "Kesalahan koneksi saat mengubah status tugas: " + e);
   }
 }
 
 function updateTaskControlBar(isRunning, title = "") {
   const bar = document.getElementById("activeTaskBar");
   const titleDisplay = document.getElementById("activeTaskTitle");
+  const btnStart = document.getElementById("btnStartBot");
+  const wsPanel = document.getElementById("workstationActiveTaskPanel");
+
   if (bar) bar.style.display = isRunning ? "flex" : "none";
   if (titleDisplay && title) titleDisplay.textContent = title;
+
+  if (btnStart) {
+    btnStart.style.display = isRunning ? "none" : "block";
+    btnStart.disabled = isRunning;
+  }
+  if (wsPanel) {
+    wsPanel.style.display = isRunning ? "block" : "none";
+  }
+
   if (!isRunning) {
     const consoleEta = document.getElementById("liveConsoleEta");
     if (consoleEta) consoleEta.textContent = "ETA: Selesai";
+    updatePauseButtons(false);
   }
 }
 
 async function stopCurrentTask() {
   if (!currentTaskId) return;
+  if (!confirm("Apakah Anda yakin ingin menghentikan tugas bot ini? Seluruh armada terminal dan proxy akan segera dilepaskan.")) {
+    return;
+  }
+
   try {
     const resp = await fetch(`/api/tasks/stop/${currentTaskId}`, {
       method: "POST",
@@ -1587,11 +1665,14 @@ async function stopCurrentTask() {
     showToast("info", data.message || "Tugas dihentikan.");
     updateTaskControlBar(false);
     setDashboardTaskActive(false);
+    updatePauseButtons(false);
     if (activeEventSource) {
       activeEventSource.close();
       activeEventSource = null;
     }
+    currentTaskId = null;
     loadRecentDashboardTasks();
+    await checkAuthMe();
   } catch (e) {
     showToast("error", "Gagal menghentikan tugas: " + e);
   }
@@ -1607,6 +1688,9 @@ async function checkActiveTask() {
         currentTaskMetadata = data;
         updateTaskControlBar(true, data.novel_title);
         renderDashboardActiveTask(data);
+        if (data.is_paused !== undefined) {
+          updatePauseButtons(data.is_paused);
+        }
         if (data.stats) {
           updateStatsWidget(data.stats);
           updateDashboardTaskStats(data.stats);
@@ -1615,6 +1699,7 @@ async function checkActiveTask() {
           listenTaskSSE(currentTaskId);
         }
       } else {
+        updateTaskControlBar(false);
         setDashboardTaskActive(false);
       }
     }

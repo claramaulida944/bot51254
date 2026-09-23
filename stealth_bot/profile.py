@@ -291,12 +291,13 @@ class ProfileGenerator:
         return "".join(pwd_chars)
 
     @classmethod
-    def generate_profile(cls, country_code: str = "ID", email: Optional[str] = None) -> AccountProfile:
-        country = country_code if country_code in COUNTRY_METADATA else "ID"
-        meta = COUNTRY_METADATA[country]
+    def generate_profile(cls, country_code: str = "ID", email: Optional[str] = None, country: Optional[str] = None) -> AccountProfile:
+        selected_code = country or country_code or "ID"
+        resolved_country = selected_code if selected_code in COUNTRY_METADATA else "ID"
+        meta = COUNTRY_METADATA[resolved_country]
 
-        fn, ln = cls._get_name_pair(country)
-        nick = cls.generate_nickname(country)
+        fn, ln = cls._get_name_pair(resolved_country)
+        nick = cls.generate_nickname(resolved_country)
 
         # Email realistis dengan variasi numerik/separator jika tidak disuplai
         if not email:

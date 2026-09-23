@@ -387,8 +387,42 @@ async def api_stop_task(task_id: str, request: Request):
     if user and task.user_id != user["id"] and user["role"] != "admin":
         return JSONResponse(status_code=403, content={"ok": False, "error": "Bukan pemilik tugas ini."})
 
+    await task.emit_log("🛑 Tugas dihentikan oleh user. Melepaskan seluruh sesi dan proxy...", "warn")
     task.cancel()
-    return {"ok": True, "message": "Tugas dihentikan dan semua proxy telah di-release."}
+    await task.emit_done()
+    return {"ok": True, "message": "Tugas berhasil dihentikan dan semua proxy telah di-release."}
+
+
+@app.post("/api/tasks/pause/{task_id}")
+async def api_pause_task(task_id: str, request: Request):
+    user = resolve_current_user(request)
+    entry = ACTIVE_TASKS.get(task_id)
+    if not entry:
+        return {"ok": False, "error": "Tugas tidak ditemukan atau sudah berhenti."}
+
+    task: WebTask = entry["task"]
+    if user and task.user_id != user["id"] and user["role"] != "admin":
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Bukan pemilik tugas ini."})
+
+    task.pause()
+    await task.emit_stats()
+    return {"ok": True, "message": "Tugas berhasil dijeda (paused).", "is_paused": True}
+
+
+@app.post("/api/tasks/resume/{task_id}")
+async def api_resume_task(task_id: str, request: Request):
+    user = resolve_current_user(request)
+    entry = ACTIVE_TASKS.get(task_id)
+    if not entry:
+        return {"ok": False, "error": "Tugas tidak ditemukan atau sudah berhenti."}
+
+    task: WebTask = entry["task"]
+    if user and task.user_id != user["id"] and user["role"] != "admin":
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Bukan pemilik tugas ini."})
+
+    task.resume()
+    await task.emit_stats()
+    return {"ok": True, "message": "Tugas berhasil dilanjutkan kembali (resumed).", "is_paused": False}
 
 
 @app.get("/api/tasks/active")
@@ -412,6 +446,7 @@ async def api_get_active_task(request: Request):
                 "target_readers": task.target_readers,
                 "rate_per_reader": task.rate_per_reader,
                 "addon_guest_conversion": task.addon_guest_conversion,
+                "is_paused": task.is_paused,
                 "stats": task.stats,
             }
     return {"ok": True, "active": False}

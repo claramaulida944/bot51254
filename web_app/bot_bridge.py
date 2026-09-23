@@ -82,6 +82,9 @@ class WebTask:
         self.logs_history: List[Dict[str, Any]] = []
         self.is_running = True
         self.is_cancelled = False
+        self.is_paused = False
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
         self.created_at = datetime.now(timezone.utc).isoformat()
         
         self.stats = {
@@ -96,6 +99,7 @@ class WebTask:
             "current_balance": 0,
             "active_terminals": self.concurrent_terminals,
             "addon_guest_conversion": self.addon_guest_conversion,
+            "is_paused": False,
         }
         
         # Tracking proxy yang sedang dipinjam oleh task ini agar aman di-release saat cancel
@@ -111,6 +115,45 @@ class WebTask:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         """Menghapus listener SSE saat user menutup tab / refresh."""
         self.subscribers.discard(q)
+
+    def pause(self) -> None:
+        """Menjeda tugas bot sementara."""
+        if not self.is_paused and self.is_running and not self.is_cancelled:
+            self.is_paused = True
+            self._pause_event.clear()
+            self.stats["is_paused"] = True
+            logger.info(f"Task {self.task_id} dijeda (paused).")
+
+    def resume(self) -> None:
+        """Melanjutkan tugas bot yang dijeda."""
+        if self.is_paused and self.is_running and not self.is_cancelled:
+            self.is_paused = False
+            self._pause_event.set()
+            self.stats["is_paused"] = False
+            logger.info(f"Task {self.task_id} dilanjutkan (resumed).")
+
+    async def wait_if_paused(self, term_id: Optional[int] = None) -> None:
+        """Menunggu sampai user menekan tombol lanjutkan jika sedang dalam status pause."""
+        if self.is_paused and not self.is_cancelled:
+            await self.emit_log("⏸️ Sesi dijeda. Menunggu user melanjutkan tugas...", "warn", term_id)
+            while self.is_paused and not self.is_cancelled and self.is_running:
+                try:
+                    await asyncio.wait_for(self._pause_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+            if not self.is_cancelled and self.is_running:
+                await self.emit_log("▶️ Sesi dilanjutkan kembali.", "info", term_id)
+
+    async def sleep_interruptible(self, seconds: float, term_id: Optional[int] = None) -> bool:
+        """Tidur selama 'seconds' yang aman dan responsif terhadap cancel dan pause."""
+        end_time = time.time() + seconds
+        while time.time() < end_time:
+            if not self.is_running or self.is_cancelled:
+                return False
+            if self.is_paused:
+                await self.wait_if_paused(term_id)
+            await asyncio.sleep(min(0.5, max(0.1, end_time - time.time())))
+        return self.is_running and not self.is_cancelled
 
     async def emit_log(self, message: str, level: str = "info", terminal_id: Optional[int] = None) -> None:
         """Mengirim pesan log ke semua subscriber SSE."""
@@ -139,17 +182,17 @@ class WebTask:
 
         remaining_readers = max(0, self.stats["target_readers"] - self.stats["completed_readers"])
         if self.mode == "guest":
-            # Jika ada addon konversi, butuh waktu tambahan signup + polling OTP (~135s)
             time_per_reader = 135.0 if self.addon_guest_conversion else 75.0
         else:
             time_per_reader = self.max_chapters * self.reading_delay
 
         rounds = math.ceil(remaining_readers / max(1, self.concurrent_terminals))
-        est_seconds_left = int(rounds * time_per_reader) if self.is_running else 0
+        est_seconds_left = int(rounds * time_per_reader) if (self.is_running and not self.is_paused) else 0
         finish_time = (datetime.now() + timedelta(seconds=est_seconds_left)).strftime("%H:%M WIB")
 
         self.stats["estimated_seconds_left"] = est_seconds_left
         self.stats["estimated_finish_time"] = finish_time
+        self.stats["is_paused"] = self.is_paused
 
         payload = {
             "type": "stats",
@@ -177,6 +220,9 @@ class WebTask:
         """Membatalkan tugas dan membebaskan semua proxy yang dipegang."""
         self.is_cancelled = True
         self.is_running = False
+        self.is_paused = False
+        self.stats["is_paused"] = False
+        self._pause_event.set()
         # Release semua proxy yang sedang aktif
         for proxy_url in list(self.active_proxies):
             ProxyPoolManager.release_proxy(proxy_url)
@@ -349,6 +395,9 @@ class BotBridge:
                 await asyncio.sleep(stagger_delay)
 
             while task.is_running and not task.is_cancelled:
+                if task.is_paused:
+                    await task.wait_if_paused(term_id)
+
                 # Cek apakah target sudah tercapai
                 async with remaining_lock:
                     if completed_count >= task.target_readers:
@@ -484,7 +533,7 @@ class BotBridge:
                 if task.is_running and not task.is_cancelled:
                     cooldown = random.uniform(4.0, 10.0)
                     await task.emit_log(f"Jeda antarpembaca {int(cooldown)}s...", "debug", term_id)
-                    await asyncio.sleep(cooldown)
+                    await task.sleep_interruptible(cooldown, term_id)
 
         # Luncurkan worker terminal sebanyak concurrent_terminals
         workers = [
@@ -523,7 +572,7 @@ class BotBridge:
         await task.emit_log(f"👤 Memulai sesi: {nickname} ({email}) | Asal: {country} | Proxy: {proxy_url.split('@')[-1]}", "info", term_id)
 
         # Inisialisasi StealthApiClient resmi Android
-        profile = ProfileGenerator.generate_profile(country=country)
+        profile = ProfileGenerator.generate_profile(country_code=country)
         bot = StealthApiClient(
             profile=profile,
             access_token=account_data.get("access_token"),
@@ -582,7 +631,9 @@ class BotBridge:
                 while spent_camo < c_delay:
                     if not task.is_running or task.is_cancelled:
                         return False
-                    step = min(4.0, c_delay - spent_camo)
+                    if task.is_paused:
+                        await task.wait_if_paused(term_id)
+                    step = min(2.0, c_delay - spent_camo)
                     await asyncio.sleep(step)
                     spent_camo += step
 
@@ -645,7 +696,9 @@ class BotBridge:
                 while spent < delay_sec:
                     if not task.is_running or task.is_cancelled:
                         return False
-                    step = min(5.0, delay_sec - spent)
+                    if task.is_paused:
+                        await task.wait_if_paused(term_id)
+                    step = min(2.0, delay_sec - spent)
                     await asyncio.sleep(step)
                     spent += step
                     pct = int((spent / delay_sec) * 100)
@@ -668,7 +721,7 @@ class BotBridge:
 
                 # Jeda manusiawi antar bab (5 - 12 detik)
                 if idx < read_target - 1:
-                    await asyncio.sleep(random.uniform(5.0, 12.0))
+                    await task.sleep_interruptible(random.uniform(5.0, 12.0), term_id)
 
             # Catat durasi baca ke profil akun
             AccountPoolManager.update_reading_progress(email, total_read_seconds)
@@ -724,7 +777,9 @@ class BotBridge:
             while spent < syn_time:
                 if not task.is_running or task.is_cancelled:
                     return False
-                step = min(4.0, syn_time - spent)
+                if task.is_paused:
+                    await task.wait_if_paused(term_id)
+                step = min(2.0, syn_time - spent)
                 await asyncio.sleep(step)
                 spent += step
 
@@ -765,7 +820,9 @@ class BotBridge:
                 while spent < read_duration:
                     if not task.is_running or task.is_cancelled:
                         return False
-                    step = min(4.0, read_duration - spent)
+                    if task.is_paused:
+                        await task.wait_if_paused(term_id)
+                    step = min(2.0, read_duration - spent)
                     await asyncio.sleep(step)
                     spent += step
                     pct = int((spent / read_duration) * 100)
@@ -786,7 +843,7 @@ class BotBridge:
 
                 # Jeda sejenak antar bab tamu jika membaca bab ke-2
                 if idx < num_guest_chapters - 1:
-                    await asyncio.sleep(random.uniform(4.0, 8.0))
+                    await task.sleep_interruptible(random.uniform(4.0, 8.0), term_id)
 
             # 4. FASE ADDON KONVERSI KE MEMBER RESMI (JIKA DIAKTIFKAN USER)
             if task.addon_guest_conversion and task.is_running and not task.is_cancelled:

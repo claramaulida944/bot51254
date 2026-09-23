@@ -141,8 +141,10 @@
         <span class="task-stat-chip">
           ❤️ <span id="activeTaskLikes">0</span> &nbsp;|&nbsp; 🔖 <span id="activeTaskBookmarks">0</span> &nbsp;|&nbsp; 👤 <span id="activeTaskFollows">0</span> &nbsp;|&nbsp; 🔄 <span id="activeTaskConverted">0</span>
         </span>
+      <div style="display:flex; gap:6px; margin-left:auto;">
+        <button id="btnTopBarPause" class="btn btn-secondary btn-xs" onclick="togglePauseTask()">⏸️ Jeda</button>
+        <button class="btn btn-danger btn-xs" onclick="stopCurrentTask()">🛑 Hentikan</button>
       </div>
-      <button class="btn btn-danger btn-xs" onclick="stopCurrentTask()">Hentikan Tugas</button>
     </div>
 
     <!-- VIEWS BODY -->
@@ -410,6 +412,26 @@
                   <button class="btn btn-primary w-full btn-lg" id="btnStartBot" onclick="startBotTask()">
                     Luncurkan Bot Sekarang
                   </button>
+
+                  <!-- Active Task In-Flight Control Panel for Workstation -->
+                  <div id="workstationActiveTaskPanel" style="display:none; margin-top:12px; padding:12px 14px; background:rgba(56, 189, 248, 0.08); border:1px solid rgba(56, 189, 248, 0.25); border-radius:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                      <div style="font-size:12px; font-weight:700; color:#38bdf8; display:flex; align-items:center; gap:6px;">
+                        <span class="pulse-dot"></span>
+                        <span id="workstationTaskStatusLabel">Tugas Bot Sedang Berjalan</span>
+                      </div>
+                      <span id="workstationTaskProgressLabel" class="font-mono" style="font-size:11.5px; color:#ffffff; font-weight:700;">0 / 0 Pembaca</span>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                      <button type="button" class="btn btn-secondary btn-sm" id="btnWorkstationPause" onclick="togglePauseTask()" style="font-size:12px;">
+                        ⏸️ Jeda Sesi Bot
+                      </button>
+                      <button type="button" class="btn btn-danger btn-sm" id="btnWorkstationStop" onclick="stopCurrentTask()" style="font-size:12px;">
+                        🛑 Hentikan Bot
+                      </button>
+                    </div>
+                  </div>
+
                   <div style="font-size:11px; color:var(--text-dim); text-align:center; margin-top:8px;">
                     Biaya hanya dipotong saat pembaca sukses menyelesaikan tugas.
                   </div>
@@ -541,11 +563,14 @@
                 <span class="task-stat-chip" id="dashEtaCountdown" style="color:#10b981; font-weight:700;">
                   ⏳ Menghitung ETA...
                 </span>
+                <button class="btn btn-secondary btn-xs font-mono" id="btnDashPause" onclick="togglePauseTask()">
+                  ⏸️ Jeda
+                </button>
                 <button class="btn btn-secondary btn-xs font-mono" onclick="switchPage('run')">
                   Buka Peluncur
                 </button>
                 <button class="btn btn-danger btn-xs font-mono" onclick="stopCurrentTask()">
-                  Hentikan Tugas
+                  🛑 Hentikan
                 </button>
               </div>
             </div>
@@ -1207,6 +1232,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toastContainer" class="toast-container"></div>
 
-<script src="/static/app.js?v=14.0"></script>
+<script src="/static/app.js?v=15.0"></script>
 </body>
 </html>
