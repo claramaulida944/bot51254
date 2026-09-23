@@ -607,20 +607,58 @@
     <div id="adminTabProxies" class="card" style="display:none;">
       <div class="card-header">
         <div>
-          <span class="card-title">🌐 Proxy Pool Fleet</span>
-          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">Pool proxy eksklusif yang dipinjam sesi terminal aktif</div>
+          <span class="card-title">🌐 Armada Proxy &amp; Integrasi HypeProxy Cloud</span>
+          <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">Pool proxy resmi HypeProxy API yang dipinjam sesi terminal aktif</div>
         </div>
         <div style="display:flex; gap:8px;">
-          <button class="btn btn-secondary btn-sm" onclick="syncProxiesFromFile()">⚡ Sinkronkan proxies.txt</button>
-          <button class="btn btn-secondary btn-sm" onclick="toggleProxyImportBox()">📥 Import Massal</button>
+          <button class="btn btn-primary btn-sm" onclick="syncHypeProxy()">🔄 Sinkronkan HypeProxy</button>
+          <button class="btn btn-secondary btn-sm" onclick="rotateAllHypeProxies()">⚡ Rotasi Semua IP</button>
+          <button class="btn btn-secondary btn-sm" onclick="toggleProxyImportBox()">📥 Import Manual</button>
           <button class="btn btn-secondary btn-sm" onclick="loadAdminProxies()">🔄 Refresh</button>
         </div>
       </div>
       <div class="card-body">
 
+        <!-- HYPEPROXY OFFICIAL CLOUD INTEGRATION CARD -->
+        <div style="background:linear-gradient(135deg, rgba(14, 165, 233, 0.12), rgba(16, 185, 129, 0.08)); border:1px solid rgba(56, 189, 248, 0.3); border-radius:var(--radius-sm); padding:16px 20px; margin-bottom:22px; position:relative; overflow:hidden;">
+          <div style="position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg, #38bdf8, #10b981);"></div>
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;">
+            <div style="display:flex; align-items:center; gap:14px;">
+              <div style="width:42px; height:42px; border-radius:10px; background:rgba(56, 189, 248, 0.15); border:1px solid rgba(56, 189, 248, 0.35); display:flex; align-items:center; justify-content:center; font-size:22px;">
+                ⚡
+              </div>
+              <div>
+                <div style="font-size:14px; font-weight:700; color:#ffffff; display:flex; align-items:center; gap:8px;">
+                  <span>HypeProxy.site Cloud Fleet</span>
+                  <span class="tag emerald" id="hypeBadgeStatus">CONNECTED</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+                  Akun: <b id="hypeUsername" style="color:#38bdf8;">claramaulida94</b> &bull; Host: <span style="font-family:var(--font-mono); color:#94a3b8;">proxy.hypeproxy.site</span> &bull; Pool: <span style="color:#10b981;">10 Slot Resmi</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- METRICS BADGES -->
+            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+              <div style="background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.08); padding:8px 14px; border-radius:8px; text-align:center;">
+                <div style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px;">Sisa Saldo</div>
+                <div style="font-size:16px; font-weight:700; color:#f59e0b; font-family:var(--font-mono);"><span id="hypeBalanceVal">12</span> Q</div>
+              </div>
+              <div style="background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.08); padding:8px 14px; border-radius:8px; text-align:center;">
+                <div style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px;">Slot Dimiliki</div>
+                <div style="font-size:16px; font-weight:700; color:#38bdf8; font-family:var(--font-mono);"><span id="hypeTotalCount">10</span> Slot</div>
+              </div>
+              <div style="background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.08); padding:8px 14px; border-radius:8px; text-align:center;">
+                <div style="font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px;">Pool Siap (IDLE)</div>
+                <div style="font-size:16px; font-weight:700; color:#10b981; font-family:var(--font-mono);"><span id="hypeIdleCount">10</span> Siap</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- IMPORT PROXY BOX (COLLAPSIBLE) -->
         <div id="admProxyImportBox" style="display:none; background:#0e0e12; border:1px solid rgba(56, 189, 248, 0.25); border-radius:var(--radius-sm); padding:16px; margin-bottom:20px;">
-          <div style="font-size:13px; font-weight:700; color:#38bdf8; margin-bottom:6px;">📥 Import Proxy Massal (1 baris per proxy)</div>
+          <div style="font-size:13px; font-weight:700; color:#38bdf8; margin-bottom:6px;">📥 Import Proxy Manual (1 baris per proxy)</div>
           <div style="font-size:11px; color:var(--text-dim); margin-bottom:10px;">Format: <code>http://user:pass@host:port</code>, <code>socks5://host:port</code>, atau <code>host:port:user:pass</code></div>
           <textarea id="admProxyImportText" class="form-input" style="height:110px; font-family:var(--font-mono); font-size:12px; line-height:1.5; resize:vertical;" placeholder="http://prx1:8080&#10;http://user:pass@prx2:8080&#10;192.168.1.1:8080:usr:pwd"></textarea>
           <div style="margin-top:10px; display:flex; gap:8px; justify-content:flex-end;">
@@ -631,7 +669,7 @@
         
         <!-- ADD PROXY FORM -->
         <div style="background:#0e0e12; border:1px solid rgba(255,255,255,0.1); border-radius:var(--radius-sm); padding:16px; margin-bottom:20px;">
-          <div style="font-size:13px; font-weight:700; color:#ffffff; margin-bottom:10px;">Tambah Proxy Baru ke Pool</div>
+          <div style="font-size:13px; font-weight:700; color:#ffffff; margin-bottom:10px;">Tambah Proxy Manual ke Pool</div>
           <div style="display:flex; gap:10px;">
             <input type="text" id="admNewProxyUrl" class="form-input" placeholder="http://user:pass@host:port atau http://host:port">
             <button class="btn btn-primary" style="white-space:nowrap;" onclick="submitAddProxy()">+ Tambah Proxy</button>
@@ -643,11 +681,11 @@
             <thead>
               <tr>
                 <th>ID</th>
-                <th>Proxy URL</th>
+                <th>Proxy URL &amp; Node</th>
                 <th>Status</th>
                 <th>Worker / Task</th>
                 <th>Gagal</th>
-                <th>Aksi</th>
+                <th>Aksi Cepat</th>
               </tr>
             </thead>
             <tbody id="admProxiesTbody">
@@ -1022,25 +1060,114 @@ async function submitUserTopup() {
   }
 }
 
+async function loadHypeProxyStatus() {
+  try {
+    const resp = await fetch("/api/admin/hypeproxy/status", { headers: getAdminHeaders() });
+    const data = await resp.json();
+    if (data.ok) {
+      const u = data.profile || {};
+      const balanceEl = document.getElementById("hypeBalanceVal");
+      const totalEl = document.getElementById("hypeTotalCount");
+      const idleEl = document.getElementById("hypeIdleCount");
+      const userEl = document.getElementById("hypeUsername");
+      if (balanceEl) balanceEl.innerText = (u.balance !== undefined ? u.balance : 12).toLocaleString();
+      if (totalEl) totalEl.innerText = data.total_owned || (data.proxies ? data.proxies.length : 10);
+      if (idleEl && data.pool_summary) idleEl.innerText = data.pool_summary.idle || 0;
+      if (userEl && u.username) userEl.innerText = u.username;
+    }
+  } catch (e) {}
+}
+
+async function syncHypeProxy() {
+  showToast("info", "Menghubungi HypeProxy API & membersihkan proxy lama...", "Sinkronisasi");
+  try {
+    const resp = await fetch("/api/admin/hypeproxy/sync", {
+      method: "POST",
+      headers: getAdminHeaders()
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message || "10 Proxy resmi HypeProxy berhasil disinkronkan!", "HypeProxy Cloud");
+      loadAdminProxies();
+      loadAdminOverview();
+    } else {
+      showToast("error", data.error || "Gagal sinkronisasi HypeProxy API");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+async function rotateAllHypeProxies() {
+  showToast("info", "Memutar IP seluruh slot proxy HypeProxy...", "Rotasi IP");
+  try {
+    const resp = await fetch("/api/admin/hypeproxy/rotate", {
+      method: "POST",
+      headers: getAdminHeaders(),
+      body: JSON.stringify({})
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message || "Seluruh IP proxy berhasil dirotasi!", "Rotasi Selesai");
+      loadAdminProxies();
+    } else {
+      showToast("warning", data.message || "Gagal melakukan rotasi IP");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+async function rotateSingleHypeProxy(slotId) {
+  showToast("info", `Memutar IP untuk slot proxy #${slotId}...`, "Rotasi Slot");
+  try {
+    const resp = await fetch("/api/admin/hypeproxy/rotate", {
+      method: "POST",
+      headers: getAdminHeaders(),
+      body: JSON.stringify({ proxy_id: slotId })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message || `IP Slot #${slotId} berhasil dirotasi!`, "Rotasi Sukses");
+      loadAdminProxies();
+    } else {
+      showToast("warning", data.message || data.error || `Gagal rotasi slot #${slotId}`);
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
 async function loadAdminProxies() {
   const tbody = document.getElementById("admProxiesTbody");
+  loadHypeProxyStatus();
   try {
     const resp = await fetch("/api/admin/proxies", { headers: getAdminHeaders() });
     const data = await resp.json();
     if (data.ok && data.proxies) {
-      tbody.innerHTML = data.proxies.map(p => `
+      tbody.innerHTML = data.proxies.map(p => {
+        const m = p.proxy_url.match(/user(\d+)/i);
+        const slotId = m ? m[1] : null;
+        return `
         <tr>
-          <td><span style="font-family:var(--font-mono); color:var(--text-muted);">#${p.id}</span></td>
-          <td><span style="color:#ffffff; font-family:var(--font-mono);">${p.proxy_url}</span></td>
+          <td><span style="font-family:var(--font-mono); color:var(--text-muted); font-weight:700;">#${p.id}</span></td>
+          <td>
+            <div style="display:flex; align-items:center; gap:8px;">
+              ${slotId ? `<span class="tag cyan font-mono">Slot #${slotId}</span>` : ''}
+              <span style="color:#ffffff; font-family:var(--font-mono); font-size:12px;">${p.proxy_url}</span>
+            </div>
+          </td>
           <td><span class="tag ${p.status === 'IDLE' ? 'emerald' : p.status === 'BUSY' ? 'blue' : 'rose'}">${p.status}</span></td>
           <td style="color:var(--text-dim); font-size:11px; font-family:var(--font-mono);">${p.current_worker_id || '-'}</td>
-          <td><span style="font-family:var(--font-mono);">${p.failed_count}</span></td>
-          <td style="display:flex; gap:6px;">
-            <button class="btn btn-secondary btn-xs font-mono" onclick="resetProxy(${p.id})">Reset IDLE</button>
+          <td><span style="font-family:var(--font-mono); font-weight:700; color:${p.failed_count > 0 ? '#ef4444' : '#10b981'}">${p.failed_count}</span></td>
+          <td style="display:flex; gap:6px; align-items:center;">
+            ${slotId ? `<button class="btn btn-secondary btn-xs font-mono" style="color:#38bdf8; border-color:rgba(56, 189, 248, 0.4);" onclick="rotateSingleHypeProxy('${slotId}')" title="Rotasi IP Slot Ini">⚡ Rotasi IP</button>` : ''}
+            <button class="btn btn-secondary btn-xs font-mono" onclick="resetProxy(${p.id})">Reset</button>
             <button class="btn btn-danger btn-xs font-mono" onclick="deleteProxy(${p.id})">Hapus</button>
           </td>
         </tr>
-      `).join("");
+      `;
+      }).join("");
     }
   } catch (e) {}
 }
@@ -1123,23 +1250,9 @@ function toggleProxyImportBox() {
 }
 
 async function syncProxiesFromFile() {
-  try {
-    const resp = await fetch("/api/admin/proxy/sync-file", {
-      method: "POST",
-      headers: getAdminHeaders()
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      showToast("success", data.message, "Proxy Tersinkron");
-      loadAdminProxies();
-      loadAdminOverview();
-    } else {
-      showToast("error", data.error || "Gagal sinkronisasi proxy");
-    }
-  } catch (e) {
-    showToast("error", "Error: " + e);
-  }
+  return syncHypeProxy();
 }
+
 
 async function submitImportProxies() {
   const textEl = document.getElementById("admProxyImportText");

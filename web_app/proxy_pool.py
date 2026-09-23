@@ -8,7 +8,9 @@ Mengontrol status proxy secara real-time:
 """
 
 import logging
+import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -89,9 +91,26 @@ class ProxyPoolManager:
     def report_failure(cls, proxy_url: str, reason: str = "") -> None:
         """
         Mencatat kegagalan proxy. Jika sudah >= 3 kali gagal, tandai DEAD.
+        Memicu auto-rotasi IP HypeProxy di background jika proxy berasal dari HypeProxy.
         """
         if not proxy_url:
             return
+
+        # Auto-rotasi IP HypeProxy di background jika proxy mengalami kegagalan
+        try:
+            m = re.search(r"user(\d+)", proxy_url, re.IGNORECASE)
+            if m:
+                pid = int(m.group(1))
+                def _bg_rotate():
+                    try:
+                        from proxy_manager import HypeProxyClient
+                        HypeProxyClient.rotate_proxy(pid)
+                        logger.info(f"[HypeProxy] Auto-rotate IP terpicu untuk proxy #{pid} karena kegagalan ({reason})")
+                    except Exception as err:
+                        logger.debug(f"[HypeProxy] Auto-rotate err: {err}")
+                threading.Thread(target=_bg_rotate, daemon=True).start()
+        except Exception:
+            pass
 
         with db_session() as conn:
             cursor = conn.cursor()
@@ -170,15 +189,73 @@ class ProxyPoolManager:
             return [dict(r) for r in cursor.fetchall()]
 
     @classmethod
+    def sync_from_hypeproxy(cls, wipe_stale: bool = True) -> Dict[str, Any]:
+        """
+        Sinkronisasi resmi langsung dari HypeProxy API:
+        1. Mengambil 10 proxy resmi milik akun pengguna via HypeProxyClient.
+        2. Menuliskan ke proxies.txt (root & stealth_bot).
+        3. Menghapus data proxy lama yang sudah tidak valid/bukan milik user dari SQLite.
+        4. Menyimpan 10 proxy resmi ke tabel proxies dengan status IDLE.
+        """
+        from proxy_manager import HypeProxyClient
+
+        # Ambil profil & daftar proxy resmi akun
+        prof = HypeProxyClient.get_profile()
+        user_proxies_data = HypeProxyClient.get_proxies(user_only=True)
+        active_urls = HypeProxyClient.sync_to_files(user_only=True)
+
+        added = 0
+        removed = 0
+
+        with db_session() as conn:
+            cursor = conn.cursor()
+
+            if wipe_stale:
+                # Bersihkan proxy yang tidak ada di daftar resmi HypeProxy akun ini
+                if active_urls:
+                    placeholders = ",".join("?" for _ in active_urls)
+                    cursor.execute(f"""
+                    DELETE FROM proxies 
+                    WHERE proxy_url NOT IN ({placeholders});
+                    """, active_urls)
+                    removed = cursor.rowcount
+                else:
+                    cursor.execute("DELETE FROM proxies;")
+                    removed = cursor.rowcount
+
+            # Masukkan / update setiap proxy resmi
+            for p_url in active_urls:
+                cursor.execute("""
+                INSERT INTO proxies (proxy_url, status, failed_count, last_checked_at)
+                VALUES (?, 'IDLE', 0, datetime('now'))
+                ON CONFLICT(proxy_url) DO UPDATE SET
+                    status = CASE WHEN status = 'DEAD' THEN 'IDLE' ELSE status END,
+                    last_checked_at = datetime('now');
+                """, (p_url,))
+                added += 1
+
+        summary = cls.get_summary()
+        return {
+            "ok": True,
+            "added": added,
+            "removed": removed,
+            "total": summary["total"],
+            "idle": summary["idle"],
+            "user": prof.get("user", {}),
+            "proxies_count": len(active_urls),
+            "proxies": active_urls,
+            "message": f"Berhasil mensinkronkan {len(active_urls)} proxy resmi dari HypeProxy API! (Dibersihkan: {removed} proxy lama)",
+        }
+
+    @classmethod
     def sync_from_files(cls) -> Dict[str, int]:
         """
-        Membaca proxies.txt dari root, stealth_bot/, dan archive untuk sinkronisasi otomatis.
+        Membaca proxies.txt dari root dan stealth_bot/ untuk sinkronisasi lokal.
         """
         base_dir = Path(__file__).parent.parent
         files_to_check = [
             base_dir / "proxies.txt",
             base_dir / "stealth_bot" / "proxies.txt",
-            base_dir / "legacy_archive" / "web_app_core" / "proxies.txt",
         ]
 
         all_proxies = set()
@@ -233,3 +310,4 @@ class ProxyPoolManager:
                         added += 1
         summary = cls.get_summary()
         return {"added": added, "total": summary["total"], "idle": summary["idle"]}
+

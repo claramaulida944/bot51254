@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -618,6 +618,19 @@ class AdminRawTextRequest(BaseModel):
     raw_text: str
 
 
+class AdminHypeProxyRotateRequest(BaseModel):
+    proxy_id: Optional[Union[int, str]] = None
+
+
+class AdminHypeProxyStartRequest(BaseModel):
+    proxy_id: Union[int, str]
+
+
+class AdminHypeProxyExtendRequest(BaseModel):
+    proxy_id: Union[int, str]
+    days: int = 7
+
+
 class AdminBotRegisterRequest(BaseModel):
     count: int = 5
     country: str = "RANDOM"
@@ -753,12 +766,16 @@ async def api_admin_delete_proxy(req: AdminProxyIdRequest, request: Request):
 async def api_admin_proxy_sync_file(request: Request):
     if not verify_admin_session(request):
         return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
-    res = ProxyPoolManager.sync_from_files()
-    return {
-        "ok": True,
-        "message": f"Sinkronisasi berhasil! {res['added']} proxy baru ditambahkan. Total armada: {res['total']} proxy ({res['idle']} siap).",
-        "stats": res,
-    }
+    try:
+        res = ProxyPoolManager.sync_from_hypeproxy(wipe_stale=True)
+        return res
+    except Exception as e:
+        res = ProxyPoolManager.sync_from_files()
+        return {
+            "ok": True,
+            "message": f"Sinkronisasi berkas berhasil! {res['added']} proxy baru ditambahkan. Total armada: {res['total']} proxy ({res['idle']} siap).",
+            "stats": res,
+        }
 
 
 @app.post("/api/admin/proxy/import")
@@ -771,6 +788,71 @@ async def api_admin_proxy_import(req: AdminRawTextRequest, request: Request):
         "message": f"Berhasil mengimpor {res['added']} proxy baru. Total armada: {res['total']} proxy ({res['idle']} siap).",
         "stats": res,
     }
+
+
+# =============================================================================
+# HYPEPROXY CLOUD API INTEGRATION
+# =============================================================================
+@app.get("/api/admin/hypeproxy/status")
+async def api_admin_hypeproxy_status(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    from proxy_manager import HypeProxyClient
+    prof = HypeProxyClient.get_profile()
+    my_proxies = HypeProxyClient.get_proxies(user_only=True)
+    summary = ProxyPoolManager.get_summary()
+    return {
+        "ok": True,
+        "profile": prof.get("user", {}),
+        "proxies": my_proxies,
+        "total_owned": len(my_proxies),
+        "pool_summary": summary,
+    }
+
+
+@app.post("/api/admin/hypeproxy/sync")
+async def api_admin_hypeproxy_sync(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    res = ProxyPoolManager.sync_from_hypeproxy(wipe_stale=True)
+    return res
+
+
+@app.post("/api/admin/hypeproxy/rotate")
+async def api_admin_hypeproxy_rotate(req: Optional[AdminHypeProxyRotateRequest] = None, request: Request = None):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    from proxy_manager import HypeProxyClient
+    pid = req.proxy_id if req else None
+    if pid is not None and str(pid).strip() and str(pid).lower() not in ("all", "0", ""):
+        res = HypeProxyClient.rotate_proxy(pid, force=True)
+        return {
+            "ok": res.get("ok", False),
+            "message": res.get("message") or f"Rotasi IP slot #{pid} berhasil diinisiasi.",
+            "details": res
+        }
+    else:
+        res = HypeProxyClient.rotate_all_proxies()
+        return res
+
+
+@app.post("/api/admin/hypeproxy/start")
+async def api_admin_hypeproxy_start(req: AdminHypeProxyStartRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    from proxy_manager import HypeProxyClient
+    res = HypeProxyClient.start_proxy(req.proxy_id)
+    return res
+
+
+@app.post("/api/admin/hypeproxy/extend")
+async def api_admin_hypeproxy_extend(req: AdminHypeProxyExtendRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    from proxy_manager import HypeProxyClient
+    res = HypeProxyClient.extend_proxy(req.proxy_id, days=req.days)
+    return res
+
 
 
 ADMIN_BOT_REGISTRATION: Dict[str, Any] = {
