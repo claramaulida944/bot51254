@@ -88,9 +88,10 @@ function formatRupiah(num) {
 }
 
 function getAuthHeaders() {
-  const token = localStorage.getItem("rinara_session") || "";
+  const token = localStorage.getItem("rinara_session") || sessionStorage.getItem("rinara_session") || "";
   return {
     "Content-Type": "application/json",
+    "Authorization": `Bearer ${token}`,
     "x-session-token": token,
   };
 }
@@ -214,7 +215,7 @@ function toggleSidebar(open) {
 // AUTHENTICATION MODULE
 // =============================================================================
 async function checkAuthMe() {
-  const token = localStorage.getItem("rinara_session");
+  const token = localStorage.getItem("rinara_session") || sessionStorage.getItem("rinara_session");
   if (!token) {
     renderUserState(null);
     return;
@@ -228,6 +229,7 @@ async function checkAuthMe() {
       renderUserState(currentUser);
     } else {
       localStorage.removeItem("rinara_session");
+      sessionStorage.removeItem("rinara_session");
       renderUserState(null);
     }
   } catch (e) {
@@ -258,7 +260,10 @@ function renderUserState(user) {
 
 function openAuthModal(tab = "login") {
   const modal = document.getElementById("authModal");
-  if (modal) modal.style.display = "flex";
+  if (modal) {
+    modal.style.display = "flex";
+    modal.style.opacity = "1";
+  }
   switchAuthTab(tab);
 }
 
@@ -273,36 +278,169 @@ function switchAuthTab(tab) {
   const tabLogin = document.getElementById("tabBtnLogin");
   const tabReg = document.getElementById("tabBtnRegister");
   const title = document.getElementById("authModalTitle");
+  const subtitle = document.getElementById("authModalSubtitle");
+
+  // Reset errors
+  const lErr = document.getElementById("loginErrorBox");
+  const rErr = document.getElementById("regErrorBox");
+  if (lErr) lErr.style.display = "none";
+  if (rErr) rErr.style.display = "none";
 
   if (tab === "login") {
     if (loginForm) loginForm.style.display = "block";
     if (regForm) regForm.style.display = "none";
     if (tabLogin) tabLogin.classList.add("active");
     if (tabReg) tabReg.classList.remove("active");
-    if (title) title.textContent = "Masuk ke Akun";
+    if (title) title.textContent = "Masuk ke Platform";
+    if (subtitle) subtitle.textContent = "Akses aman armada bot & kendalikan pembaca novel";
+    setTimeout(() => {
+      const idEl = document.getElementById("loginIdentifier");
+      if (idEl) idEl.focus();
+    }, 100);
   } else {
     if (loginForm) loginForm.style.display = "none";
     if (regForm) regForm.style.display = "block";
     if (tabLogin) tabLogin.classList.remove("active");
     if (tabReg) tabReg.classList.add("active");
-    if (title) title.textContent = "Daftar Akun Baru";
+    if (title) title.textContent = "Buka Akun Baru";
+    if (subtitle) subtitle.textContent = "Daftarkan identitas aman terenkripsi PBKDF2";
+    setTimeout(() => {
+      const uEl = document.getElementById("regUsername");
+      if (uEl) uEl.focus();
+    }, 100);
   }
+}
+
+function togglePasswordVisibility(inputId, btnEl) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const isPass = input.type === "password";
+  input.type = isPass ? "text" : "password";
+
+  if (btnEl) {
+    const openIcon = btnEl.querySelector(".eye-open");
+    const closedIcon = btnEl.querySelector(".eye-closed");
+    if (openIcon && closedIcon) {
+      openIcon.style.display = isPass ? "none" : "block";
+      closedIcon.style.display = isPass ? "block" : "none";
+    }
+  }
+}
+
+function evaluatePasswordStrength(password) {
+  const p = password || "";
+  const hasLen = p.length >= 8;
+  const hasLetter = /[a-zA-Z]/.test(p);
+  const hasNum = /[0-9]/.test(p);
+  const hasSpecial = /[^a-zA-Z0-9]/.test(p);
+
+  const updateReq = (id, valid) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (valid) el.classList.add("valid");
+    else el.classList.remove("valid");
+  };
+
+  updateReq("reqLen", hasLen);
+  updateReq("reqLetter", hasLetter);
+  updateReq("reqNum", hasNum);
+  updateReq("reqSpecial", hasSpecial);
+
+  let score = 0;
+  if (hasLen) score++;
+  if (hasLetter) score++;
+  if (hasNum) score++;
+  if (hasSpecial) score++;
+
+  const seg1 = document.getElementById("pwdSeg1");
+  const seg2 = document.getElementById("pwdSeg2");
+  const seg3 = document.getElementById("pwdSeg3");
+  const seg4 = document.getElementById("pwdSeg4");
+  const label = document.getElementById("pwdStrengthLabel");
+
+  const segments = [seg1, seg2, seg3, seg4];
+  segments.forEach(s => { if (s) s.style.background = "rgba(255, 255, 255, 0.08)"; });
+
+  if (p.length === 0) {
+    if (label) {
+      label.textContent = "Belum Terisi";
+      label.style.color = "var(--text-muted)";
+    }
+    return;
+  }
+
+  if (score <= 1) {
+    if (seg1) seg1.style.background = "#f43f5e";
+    if (label) { label.textContent = "Sangat Lemah"; label.style.color = "#f43f5e"; }
+  } else if (score === 2) {
+    if (seg1) seg1.style.background = "#f59e0b";
+    if (seg2) seg2.style.background = "#f59e0b";
+    if (label) { label.textContent = "Cukup"; label.style.color = "#f59e0b"; }
+  } else if (score === 3) {
+    if (seg1) seg1.style.background = "#38bdf8";
+    if (seg2) seg2.style.background = "#38bdf8";
+    if (seg3) seg3.style.background = "#38bdf8";
+    if (label) { label.textContent = "Kuat & Aman"; label.style.color = "#38bdf8"; }
+  } else {
+    segments.forEach(s => { if (s) s.style.background = "#10b981"; });
+    if (label) { label.textContent = "Sangat Kuat (Maksimal)"; label.style.color = "#10b981"; }
+  }
+
+  checkPasswordMatch();
+}
+
+function checkPasswordMatch() {
+  const p1 = document.getElementById("regPassword")?.value || "";
+  const p2 = document.getElementById("regConfirmPassword")?.value || "";
+  const badge = document.getElementById("pwdMatchBadge");
+
+  if (!badge) return;
+  if (!p2) {
+    badge.textContent = "";
+    return;
+  }
+  if (p1 === p2) {
+    badge.textContent = "✓ Sandi Cocok";
+    badge.style.color = "#10b981";
+  } else {
+    badge.textContent = "✗ Sandi Belum Sama";
+    badge.style.color = "#f43f5e";
+  }
+}
+
+function triggerAuthShake() {
+  const card = document.getElementById("authCardContainer");
+  if (!card) return;
+  card.classList.remove("shake-animation");
+  void card.offsetWidth; // Trigger reflow
+  card.classList.add("shake-animation");
+  setTimeout(() => card.classList.remove("shake-animation"), 450);
 }
 
 async function submitLogin() {
   const idEl = document.getElementById("loginIdentifier");
   const passEl = document.getElementById("loginPassword");
   const errBox = document.getElementById("loginErrorBox");
+  const errText = document.getElementById("loginErrorText");
+  const btn = document.getElementById("btnLoginSubmit");
+  const rememberMe = document.getElementById("loginRememberMe")?.checked ?? true;
 
   const identifier = idEl ? idEl.value.trim() : "";
-  const password = passEl ? passEl.value.trim() : "";
+  const password = passEl ? passEl.value : "";
+
+  if (errBox) errBox.style.display = "none";
 
   if (!identifier || !password) {
-    if (errBox) {
-      errBox.textContent = "Harap isi username/email dan kata sandi.";
-      errBox.style.display = "block";
-    }
+    if (errText) errText.textContent = "Harap masukkan username/email dan kata sandi.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
     return;
+  }
+
+  // Set loading state
+  if (btn) {
+    btn.disabled = true;
+    btn.querySelector(".btn-text").textContent = "Memverifikasi Akun...";
   }
 
   try {
@@ -313,22 +451,33 @@ async function submitLogin() {
     });
     const data = await resp.json();
 
-    if (data.ok) {
-      localStorage.setItem("rinara_session", data.user.session_token);
+    if (data.ok && data.user) {
+      if (rememberMe) {
+        localStorage.setItem("rinara_session", data.user.session_token);
+        sessionStorage.removeItem("rinara_session");
+      } else {
+        sessionStorage.setItem("rinara_session", data.user.session_token);
+        localStorage.removeItem("rinara_session");
+      }
+
       currentUser = data.user;
       renderUserState(currentUser);
       closeAuthModal();
       showToast("success", `Selamat datang kembali, @${data.user.username}!`, "Login Berhasil");
+      if (passEl) passEl.value = "";
     } else {
-      if (errBox) {
-        errBox.textContent = data.error || "Gagal masuk ke akun.";
-        errBox.style.display = "block";
-      }
+      triggerAuthShake();
+      if (errText) errText.textContent = data.error || "Gagal masuk ke akun.";
+      if (errBox) errBox.style.display = "flex";
     }
   } catch (e) {
-    if (errBox) {
-      errBox.textContent = "Koneksi terputus: " + e;
-      errBox.style.display = "block";
+    triggerAuthShake();
+    if (errText) errText.textContent = "Gagal terhubung ke server: " + e;
+    if (errBox) errBox.style.display = "flex";
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.querySelector(".btn-text").innerHTML = "Masuk ke Platform Sekarang &rarr;";
     }
   }
 }
@@ -337,53 +486,112 @@ async function submitRegister() {
   const uEl = document.getElementById("regUsername");
   const eEl = document.getElementById("regEmail");
   const pEl = document.getElementById("regPassword");
+  const cEl = document.getElementById("regConfirmPassword");
   const errBox = document.getElementById("regErrorBox");
+  const errText = document.getElementById("regErrorText");
+  const btn = document.getElementById("btnRegSubmit");
 
   const username = uEl ? uEl.value.trim() : "";
   const email = eEl ? eEl.value.trim() : "";
-  const password = pEl ? pEl.value.trim() : "";
+  const password = pEl ? pEl.value : "";
+  const confirmPassword = cEl ? cEl.value : "";
+
+  if (errBox) errBox.style.display = "none";
 
   if (!username || !email || !password) {
-    if (errBox) {
-      errBox.textContent = "Semua bidang wajib diisi.";
-      errBox.style.display = "block";
-    }
+    if (errText) errText.textContent = "Semua bidang wajib diisi secara lengkap.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
     return;
+  }
+
+  if (username.length < 3 || username.length > 24) {
+    if (errText) errText.textContent = "Username harus antara 3 sampai 24 karakter.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
+    return;
+  }
+
+  if (password.length < 8) {
+    if (errText) errText.textContent = "Kata sandi minimal 8 karakter demi keamanan Anda.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
+    return;
+  }
+
+  const hasLetter = /[a-zA-Z]/.test(password);
+  const hasDigit = /[0-9]/.test(password);
+  if (!hasLetter || !hasDigit) {
+    if (errText) errText.textContent = "Kata sandi harus mengandung kombinasi huruf dan angka.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
+    return;
+  }
+
+  if (password !== confirmPassword) {
+    if (errText) errText.textContent = "Konfirmasi kata sandi tidak cocok. Mohon ketik ulang.";
+    if (errBox) errBox.style.display = "flex";
+    triggerAuthShake();
+    return;
+  }
+
+  // Set loading state
+  if (btn) {
+    btn.disabled = true;
+    btn.querySelector(".btn-text").textContent = "Mendaftarkan Profil Aman...";
   }
 
   try {
     const resp = await fetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, email, password }),
+      body: JSON.stringify({
+        username,
+        email,
+        password,
+        confirm_password: confirmPassword
+      }),
     });
     const data = await resp.json();
 
-    if (data.ok) {
+    if (data.ok && data.user) {
       localStorage.setItem("rinara_session", data.user.session_token);
       currentUser = data.user;
       renderUserState(currentUser);
       closeAuthModal();
-      showToast("success", `Akun @${data.user.username} berhasil dibuat!`, "Pendaftaran Selesai");
+      showToast("success", `Akun @${data.user.username} berhasil dibuat & dilindungi enkripsi!`, "Pendaftaran Sukses");
+      if (pEl) pEl.value = "";
+      if (cEl) cEl.value = "";
     } else {
-      if (errBox) {
-        errBox.textContent = data.error || "Gagal mendaftar akun.";
-        errBox.style.display = "block";
-      }
+      triggerAuthShake();
+      if (errText) errText.textContent = data.error || "Gagal mendaftarkan akun baru.";
+      if (errBox) errBox.style.display = "flex";
     }
   } catch (e) {
-    if (errBox) {
-      errBox.textContent = "Koneksi terputus: " + e;
-      errBox.style.display = "block";
+    triggerAuthShake();
+    if (errText) errText.textContent = "Gagal terhubung ke server: " + e;
+    if (errBox) errBox.style.display = "flex";
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.querySelector(".btn-text").innerHTML = "🚀 Buat Akun &amp; Buka Akses Bot";
     }
   }
 }
 
 function submitLogout() {
+  const token = localStorage.getItem("rinara_session") || sessionStorage.getItem("rinara_session");
+  if (token) {
+    fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}` }
+    }).catch(() => {});
+  }
   localStorage.removeItem("rinara_session");
+  sessionStorage.removeItem("rinara_session");
   currentUser = null;
   renderUserState(null);
-  showToast("info", "Anda telah keluar dari akun.");
+  showToast("info", "Sesi aman telah ditutup. Anda telah keluar dari akun.", "Logout Sukses");
 }
 
 // =============================================================================

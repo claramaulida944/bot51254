@@ -103,7 +103,8 @@ RATE_PER_VALID_READER = 450  # Rp 450 per pembaca valid tamat 25 bab
 class UserRegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=24)
     email: str = Field(..., min_length=5, max_length=120)
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=8, max_length=100)
+    confirm_password: Optional[str] = Field(None, max_length=100)
 
 
 class UserLoginRequest(BaseModel):
@@ -182,7 +183,7 @@ async def api_register(req: UserRegisterRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(f"reg_{client_ip}", max_requests=5, window_seconds=300):
         return JSONResponse(status_code=429, content={"ok": False, "error": "Terlalu banyak permintaan pendaftaran. Coba lagi dalam 5 menit."})
-    ok, msg, user = AuthManager.register(req.username, req.email, req.password)
+    ok, msg, user = AuthManager.register(req.username, req.email, req.password, req.confirm_password)
     if not ok:
         return JSONResponse(status_code=400, content={"ok": False, "error": msg})
     return {"ok": True, "message": msg, "user": user, "token": user.get("session_token")}
@@ -193,7 +194,7 @@ async def api_login(req: UserLoginRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(f"login_{client_ip}", max_requests=10, window_seconds=120):
         return JSONResponse(status_code=429, content={"ok": False, "error": "Terlalu banyak percobaan login. Coba lagi dalam 2 menit."})
-    ok, msg, user = AuthManager.login(req.identifier, req.password)
+    ok, msg, user = AuthManager.login(req.identifier, req.password, client_ip=client_ip)
     if not ok:
         return JSONResponse(status_code=401, content={"ok": False, "error": msg})
     return {"ok": True, "message": msg, "user": user, "token": user.get("session_token")}
