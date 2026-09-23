@@ -613,6 +613,17 @@ class AdminProxyIdRequest(BaseModel):
     proxy_id: int
 
 
+class AdminRawTextRequest(BaseModel):
+    raw_text: str
+
+
+class AdminBotRegisterRequest(BaseModel):
+    count: int = 5
+    country: str = "RANDOM"
+    verify_email: bool = True
+    email_provider: str = "RANDOM"
+
+
 @app.post("/api/admin/login")
 async def api_admin_login(req: AdminLoginRequest):
     if req.pin.strip() == get_admin_pin():
@@ -735,6 +746,248 @@ async def api_admin_delete_proxy(req: AdminProxyIdRequest, request: Request):
         cursor = conn.cursor()
         cursor.execute("DELETE FROM proxies WHERE id = ?;", (req.proxy_id,))
         return {"ok": True, "message": "Proxy berhasil dihapus dari pool."}
+
+
+@app.post("/api/admin/proxy/sync-file")
+async def api_admin_proxy_sync_file(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    res = ProxyPoolManager.sync_from_files()
+    return {
+        "ok": True,
+        "message": f"Sinkronisasi berhasil! {res['added']} proxy baru ditambahkan. Total armada: {res['total']} proxy ({res['idle']} siap).",
+        "stats": res,
+    }
+
+
+@app.post("/api/admin/proxy/import")
+async def api_admin_proxy_import(req: AdminRawTextRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    res = ProxyPoolManager.import_proxies(req.raw_text)
+    return {
+        "ok": True,
+        "message": f"Berhasil mengimpor {res['added']} proxy baru. Total armada: {res['total']} proxy ({res['idle']} siap).",
+        "stats": res,
+    }
+
+
+ADMIN_BOT_REGISTRATION: Dict[str, Any] = {
+    "running": False,
+    "total_target": 0,
+    "completed": 0,
+    "success_count": 0,
+    "failed_count": 0,
+    "logs": [],
+    "cancel_event": None,
+}
+
+
+async def run_admin_bot_registration(count: int, country: str, verify_email: bool, email_provider: str):
+    import random
+    from stealth_bot.client import StealthApiClient
+    from stealth_bot.profile import ProfileGenerator
+    from stealth_bot.email_verifier import TempTfVerifier
+    from stealth_bot.proxy import pick_weighted_country
+    from account_pool import AccountPoolManager
+    from proxy_pool import ProxyPoolManager
+
+    ADMIN_BOT_REGISTRATION["running"] = True
+    ADMIN_BOT_REGISTRATION["total_target"] = count
+    ADMIN_BOT_REGISTRATION["completed"] = 0
+    ADMIN_BOT_REGISTRATION["success_count"] = 0
+    ADMIN_BOT_REGISTRATION["failed_count"] = 0
+    ADMIN_BOT_REGISTRATION["logs"] = []
+    cancel_ev = asyncio.Event()
+    ADMIN_BOT_REGISTRATION["cancel_event"] = cancel_ev
+
+    def add_log(msg: str, level: str = "info"):
+        t_str = datetime.now().strftime("%H:%M:%S")
+        ADMIN_BOT_REGISTRATION["logs"].append({"time": t_str, "message": msg, "level": level})
+        if len(ADMIN_BOT_REGISTRATION["logs"]) > 200:
+            ADMIN_BOT_REGISTRATION["logs"].pop(0)
+
+    add_log(f"Memulai registrasi {count} akun baru [Mode: {'Verifikasi OTP Temp.tf' if verify_email else 'Direct Signup'} | Provider: {email_provider} | Negara: {country}]", "info")
+
+    verifier = TempTfVerifier() if verify_email else None
+
+    # Load existing emails to avoid duplicates
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT email FROM bot_accounts;")
+        existing_emails = {r["email"].lower() for r in cursor.fetchall()}
+
+    for i in range(1, count + 1):
+        if cancel_ev.is_set():
+            add_log("Pendaftaran dihentikan oleh admin.", "warn")
+            break
+
+        c_country = pick_weighted_country() if country.upper() in ("RANDOM", "ALL", "") else country.upper()
+        add_log(f"[{i}/{count}] Membuat profil & identitas perangkat Android baru ({c_country})...", "info")
+
+        temp_email = None
+        if verifier:
+            prov = email_provider.lower()
+            if prov in ("random", "all", ""):
+                prov = random.choice(["gmail", "outlook", "hotmail"])
+            
+            add_log(f"[{i}/{count}] Mengambil email dari temp.tf (provider: {prov})...", "info")
+            for _ in range(12):
+                c_mail = await verifier.get_email(provider=prov, use_dot=(prov == "gmail"), use_plus=(prov != "gmail"))
+                if c_mail and c_mail.lower() not in existing_emails:
+                    temp_email = c_mail.lower()
+                    existing_emails.add(temp_email)
+                    break
+                await asyncio.sleep(0.4)
+
+            if temp_email:
+                add_log(f"[{i}/{count}] Email didapat: {temp_email}", "success")
+            else:
+                add_log(f"[{i}/{count}] Gagal ambil email temp.tf, fallback email sintetis.", "warn")
+
+        profile = ProfileGenerator.generate_profile(country_code=c_country, email=temp_email)
+        
+        # Ambil proxy dari pool
+        proxy_url = ProxyPoolManager.acquire_proxy(task_id="ADMIN_REGISTER", worker_id=f"REG_{i}")
+
+        client = StealthApiClient(
+            profile=profile,
+            current_proxy=proxy_url,
+        )
+
+        try:
+            add_log(f"[{i}/{count}] Mengirim registrasi & atribusi AppsFlyer...", "info")
+            ok, msg = await client.perform_organic_signup()
+            if ok:
+                is_verified = False
+                if verifier and temp_email:
+                    add_log(f"[{i}/{count}] Mengirim permintaan kode verifikasi OTP...", "info")
+                    send_ok, send_msg = await client.send_email_verification()
+                    if send_ok:
+                        add_log(f"[{i}/{count}] Menunggu OTP masuk di temp.tf...", "info")
+                        otp_code = await verifier.poll_for_otp(temp_email, timeout_sec=90, interval_sec=4)
+                        if otp_code:
+                            v_ok, v_msg = await client.verify_email_code(otp_code)
+                            if v_ok:
+                                is_verified = True
+                                add_log(f"[{i}/{count}] ✓ Berhasil diverifikasi resmi dengan kode OTP: {otp_code}!", "success")
+                            else:
+                                add_log(f"[{i}/{count}] Kode OTP ditolak: {v_msg}", "warn")
+                        else:
+                            add_log(f"[{i}/{count}] Timeout: OTP tidak diterima dalam 90 detik.", "warn")
+                    else:
+                        add_log(f"[{i}/{count}] Gagal request kirim OTP: {send_msg}", "warn")
+
+                # Claim daily Q coin
+                claim_res = await client.claim_daily_q()
+                q_bal = claim_res.get("balance", 0)
+
+                acc_data = {
+                    "email": profile.email,
+                    "password": profile.password,
+                    "nickname": profile.nickname,
+                    "access_token": client.access_token,
+                    "refresh_token": client.refresh_token,
+                    "country": profile.country,
+                    "device_id": profile.device_id,
+                    "anonymous_id": profile.anonymous_id,
+                    "user_agent": profile.user_agent,
+                    "q_balance": q_bal,
+                    "is_email_verified": is_verified,
+                }
+                AccountPoolManager.add_or_update_account(acc_data)
+                ADMIN_BOT_REGISTRATION["success_count"] += 1
+                add_log(f"[{i}/{count}] ✅ SUKSES! Akun {profile.email} tersimpan (Koin: {q_bal} Q).", "success")
+            else:
+                ADMIN_BOT_REGISTRATION["failed_count"] += 1
+                add_log(f"[{i}/{count}] ❌ Gagal mendaftar: {msg}", "error")
+
+        except Exception as e:
+            ADMIN_BOT_REGISTRATION["failed_count"] += 1
+            add_log(f"[{i}/{count}] Error pendaftaran: {e}", "error")
+        finally:
+            if proxy_url:
+                ProxyPoolManager.release_proxy(proxy_url)
+            await client.close()
+
+        ADMIN_BOT_REGISTRATION["completed"] = i
+        if i < count and not cancel_ev.is_set():
+            delay = random.uniform(3.0, 7.0)
+            add_log(f"Jeda anti-clustering wajar {int(delay)} detik...", "info")
+            await asyncio.sleep(delay)
+
+    ADMIN_BOT_REGISTRATION["running"] = False
+    add_log(f"Selesai! Berhasil membuat {ADMIN_BOT_REGISTRATION['success_count']} akun baru berkualitas tinggi.", "success")
+
+
+@app.post("/api/admin/bot-accounts/register")
+async def api_admin_bot_accounts_register(req: AdminBotRegisterRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    if ADMIN_BOT_REGISTRATION["running"]:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Proses pendaftaran akun masih sedang berjalan."})
+
+    target_count = max(1, min(50, req.count))
+    asyncio.create_task(run_admin_bot_registration(
+        count=target_count,
+        country=req.country,
+        verify_email=req.verify_email,
+        email_provider=req.email_provider
+    ))
+    return {
+        "ok": True,
+        "message": f"Memulai registrasi {target_count} akun baru di latar belakang...",
+        "target": target_count
+    }
+
+
+@app.get("/api/admin/bot-accounts/register-status")
+async def api_admin_bot_accounts_register_status(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    return {
+        "ok": True,
+        "running": ADMIN_BOT_REGISTRATION["running"],
+        "total_target": ADMIN_BOT_REGISTRATION["total_target"],
+        "completed": ADMIN_BOT_REGISTRATION["completed"],
+        "success_count": ADMIN_BOT_REGISTRATION["success_count"],
+        "failed_count": ADMIN_BOT_REGISTRATION["failed_count"],
+        "logs": ADMIN_BOT_REGISTRATION["logs"],
+    }
+
+
+@app.post("/api/admin/bot-accounts/stop-register")
+async def api_admin_bot_accounts_stop_register(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    if ADMIN_BOT_REGISTRATION["cancel_event"]:
+        ADMIN_BOT_REGISTRATION["cancel_event"].set()
+        return {"ok": True, "message": "Perintah penghentian registrasi dikirim."}
+    return {"ok": False, "error": "Tidak ada registrasi yang sedang berjalan."}
+
+
+@app.post("/api/admin/bot-accounts/sync-file")
+async def api_admin_bot_accounts_sync_file(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    res = AccountPoolManager.sync_from_file()
+    return {
+        "ok": True,
+        "message": f"Sinkronisasi berhasil! {res['added']} akun baru dimasukkan ke database. Total akun aktif: {res['total']}.",
+        "stats": res,
+    }
+
+
+@app.post("/api/admin/bot-accounts/import")
+async def api_admin_bot_accounts_import(req: AdminRawTextRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    res = AccountPoolManager.import_accounts(req.raw_text)
+    return {
+        "ok": True,
+        "message": f"Berhasil mengimpor {res['added']} akun baru ke database. Total akun: {res['total']}.",
+        "stats": res,
+    }
 
 
 @app.get("/api/admin/accounts")

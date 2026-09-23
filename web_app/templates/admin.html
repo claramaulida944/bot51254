@@ -610,9 +610,24 @@
           <span class="card-title">🌐 Proxy Pool Fleet</span>
           <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">Pool proxy eksklusif yang dipinjam sesi terminal aktif</div>
         </div>
-        <button class="btn btn-secondary btn-sm" onclick="loadAdminProxies()">🔄 Refresh</button>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary btn-sm" onclick="syncProxiesFromFile()">⚡ Sinkronkan proxies.txt</button>
+          <button class="btn btn-secondary btn-sm" onclick="toggleProxyImportBox()">📥 Import Massal</button>
+          <button class="btn btn-secondary btn-sm" onclick="loadAdminProxies()">🔄 Refresh</button>
+        </div>
       </div>
       <div class="card-body">
+
+        <!-- IMPORT PROXY BOX (COLLAPSIBLE) -->
+        <div id="admProxyImportBox" style="display:none; background:#0e0e12; border:1px solid rgba(56, 189, 248, 0.25); border-radius:var(--radius-sm); padding:16px; margin-bottom:20px;">
+          <div style="font-size:13px; font-weight:700; color:#38bdf8; margin-bottom:6px;">📥 Import Proxy Massal (1 baris per proxy)</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-bottom:10px;">Format: <code>http://user:pass@host:port</code>, <code>socks5://host:port</code>, atau <code>host:port:user:pass</code></div>
+          <textarea id="admProxyImportText" class="form-input" style="height:110px; font-family:var(--font-mono); font-size:12px; line-height:1.5; resize:vertical;" placeholder="http://prx1:8080&#10;http://user:pass@prx2:8080&#10;192.168.1.1:8080:usr:pwd"></textarea>
+          <div style="margin-top:10px; display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary btn-sm" onclick="toggleProxyImportBox()">Batal</button>
+            <button class="btn btn-primary btn-sm" onclick="submitImportProxies()">🚀 Eksekusi Import Proxy</button>
+          </div>
+        </div>
         
         <!-- ADD PROXY FORM -->
         <div style="background:#0e0e12; border:1px solid rgba(255,255,255,0.1); border-radius:var(--radius-sm); padding:16px; margin-bottom:20px;">
@@ -651,9 +666,109 @@
           <span class="card-title">🤖 Inventaris Akun Stealth Bot</span>
           <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">Status saldo koin Q dan kuota baca akun Android resmi</div>
         </div>
-        <button class="btn btn-secondary btn-sm" onclick="loadAdminAccounts()">🔄 Refresh</button>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary btn-sm" onclick="syncAccountsFromFile()">⚡ Sinkronkan akun_stealth.txt</button>
+          <button class="btn btn-secondary btn-sm" onclick="toggleAccountImportBox()">📥 Import JSON</button>
+          <button class="btn btn-secondary btn-sm" onclick="loadAdminAccounts()">🔄 Refresh</button>
+        </div>
       </div>
       <div class="card-body">
+
+        <!-- IMPORT ACCOUNTS BOX (COLLAPSIBLE) -->
+        <div id="admAccountImportBox" style="display:none; background:#0e0e12; border:1px solid rgba(16, 185, 129, 0.25); border-radius:var(--radius-sm); padding:16px; margin-bottom:20px;">
+          <div style="font-size:13px; font-weight:700; color:#10b981; margin-bottom:6px;">📥 Import Akun Stealth (JSON Array / Objects)</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-bottom:10px;">Tempel format array JSON atau baris JSON akun stealth (email, password, access_token, device_id, dll).</div>
+          <textarea id="admAccountImportText" class="form-input" style="height:110px; font-family:var(--font-mono); font-size:12px; line-height:1.5; resize:vertical;" placeholder='[{"email":"bot1@domain.com","password":"...","access_token":"...","device_id":"..."}]'></textarea>
+          <div style="margin-top:10px; display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-secondary btn-sm" onclick="toggleAccountImportBox()">Batal</button>
+            <button class="btn btn-primary btn-sm" onclick="submitImportAccounts()">🚀 Eksekusi Import Akun</button>
+          </div>
+        </div>
+
+        <!-- AUTO BOT REGISTRATION PANEL (CLI ENGINE v5) -->
+        <div style="background:#0e0e12; border:1px solid rgba(16, 185, 129, 0.3); border-radius:var(--radius-sm); padding:18px; margin-bottom:24px; position:relative; overflow:hidden;">
+          <div style="position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg, #10b981, #3b82f6); opacity:0.8;"></div>
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+            <div>
+              <div style="font-size:14px; font-weight:700; color:#ffffff; display:flex; align-items:center; gap:8px;">
+                <span>🚀 Pendaftaran Akun Stealth Otomatis (CLI Engine v5)</span>
+                <span class="tag emerald" id="admRegBadgeStatus">IDLE</span>
+              </div>
+              <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+                Daftarkan akun Android resmi langsung dari web: generate device profile, request OTP temp-mail, bypass AppsFlyer, dan claim koin Q harian otomatis.
+              </div>
+            </div>
+            <div id="admRegActions" style="display:flex; gap:8px;">
+              <button class="btn btn-primary" id="btnStartBotReg" onclick="startAdminBotRegister()">
+                🔥 Mulai Daftarkan Akun
+              </button>
+              <button class="btn btn-danger" id="btnStopBotReg" style="display:none;" onclick="stopAdminBotRegister()">
+                🛑 Hentikan Proses
+              </button>
+            </div>
+          </div>
+
+          <!-- REGISTRATION PARAMS -->
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px; margin-bottom:14px;">
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" style="font-size:11px;">Target Jumlah Akun</label>
+              <input type="number" id="admRegCount" class="form-input" min="1" max="50" value="5" placeholder="Contoh: 5">
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" style="font-size:11px;">Verifikasi OTP Email</label>
+              <select id="admRegVerifyEmail" class="form-input">
+                <option value="true" selected>Ya (Verifikasi OTP Temp.tf)</option>
+                <option value="false">Tidak (Direct Synthetic)</option>
+              </select>
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" style="font-size:11px;">Provider Domain Email</label>
+              <select id="admRegEmailProv" class="form-input">
+                <option value="all" selected>Semua (Acak Gmail/Outlook)</option>
+                <option value="gmail">Gmail</option>
+                <option value="outlook">Outlook / Hotmail</option>
+              </select>
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" style="font-size:11px;">Region Device Fingerprint</label>
+              <select id="admRegCountry" class="form-input">
+                <option value="RANDOM" selected>Acak Berbobot (ID/US/GB/dll)</option>
+                <option value="ID">Indonesia (ID Khusus)</option>
+                <option value="US">Amerika Serikat (US)</option>
+                <option value="GB">Inggris (GB)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- REGISTRATION PROGRESS BAR & STATS -->
+          <div id="admRegProgressContainer" style="display:none; margin-bottom:14px; background:#141419; border:1px solid rgba(255,255,255,0.06); border-radius:6px; padding:10px 14px;">
+            <div style="display:flex; justify-content:space-between; font-size:12px; font-family:var(--font-mono); margin-bottom:6px;">
+              <span id="admRegProgressText" style="color:var(--text-light);">Mempersiapkan pendaftaran...</span>
+              <span>
+                <b style="color:#10b981;" id="admRegSuccessCount">0</b> Berhasil / 
+                <b style="color:#f43f5e;" id="admRegFailedCount">0</b> Gagal / 
+                <b style="color:#ffffff;" id="admRegTargetCount">0</b> Target
+              </span>
+            </div>
+            <div style="width:100%; height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
+              <div id="admRegProgressBar" style="width:0%; height:100%; background:linear-gradient(90deg, #10b981, #38bdf8); transition:width 0.3s ease;"></div>
+            </div>
+          </div>
+
+          <!-- TERMINAL MONITOR LOG -->
+          <div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">
+                🖥️ Live Terminal Log Registrasi
+              </span>
+              <button class="btn btn-secondary btn-xs font-mono" onclick="document.getElementById('admRegConsole').innerHTML=''">Bersihkan Log</button>
+            </div>
+            <div id="admRegConsole" style="background:#050508; border:1px solid rgba(255,255,255,0.08); border-radius:6px; padding:12px; height:180px; overflow-y:auto; font-family:var(--font-mono); font-size:11.5px; line-height:1.6; color:#94a3b8;">
+              <div style="color:var(--text-dim);">[Menunggu perintah pendaftaran...] Tentukan parameter lalu klik "Mulai Daftarkan Akun".</div>
+            </div>
+          </div>
+        </div>
+
         <div class="table-responsive">
           <table class="data-table">
             <thead>
@@ -983,6 +1098,7 @@ async function deleteProxy(id) {
 
 async function loadAdminAccounts() {
   const tbody = document.getElementById("admAccountsTbody");
+  pollBotRegStatus();
   try {
     const resp = await fetch("/api/admin/accounts", { headers: getAdminHeaders() });
     const data = await resp.json();
@@ -997,6 +1113,234 @@ async function loadAdminAccounts() {
           <td><span style="font-family:var(--font-mono);">${a.total_novels_read || 0} buku</span></td>
         </tr>
       `).join("");
+    }
+  } catch (e) {}
+}
+
+function toggleProxyImportBox() {
+  const el = document.getElementById("admProxyImportBox");
+  if (el) el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+async function syncProxiesFromFile() {
+  try {
+    const resp = await fetch("/api/admin/proxy/sync-file", {
+      method: "POST",
+      headers: getAdminHeaders()
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message, "Proxy Tersinkron");
+      loadAdminProxies();
+      loadAdminOverview();
+    } else {
+      showToast("error", data.error || "Gagal sinkronisasi proxy");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+async function submitImportProxies() {
+  const textEl = document.getElementById("admProxyImportText");
+  const rawText = textEl ? textEl.value.trim() : "";
+  if (!rawText) {
+    showToast("warning", "Tempelkan daftar proxy terlebih dahulu.");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/admin/proxy/import", {
+      method: "POST",
+      headers: getAdminHeaders(),
+      body: JSON.stringify({ raw_text: rawText })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message, "Import Sukses");
+      textEl.value = "";
+      toggleProxyImportBox();
+      loadAdminProxies();
+      loadAdminOverview();
+    } else {
+      showToast("error", data.error || "Gagal mengimpor proxy");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+function toggleAccountImportBox() {
+  const el = document.getElementById("admAccountImportBox");
+  if (el) el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+async function syncAccountsFromFile() {
+  try {
+    const resp = await fetch("/api/admin/bot-accounts/sync-file", {
+      method: "POST",
+      headers: getAdminHeaders()
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message, "Akun Tersinkron");
+      loadAdminAccounts();
+      loadAdminOverview();
+    } else {
+      showToast("error", data.error || "Gagal sinkronisasi akun");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+async function submitImportAccounts() {
+  const textEl = document.getElementById("admAccountImportText");
+  const rawText = textEl ? textEl.value.trim() : "";
+  if (!rawText) {
+    showToast("warning", "Tempelkan JSON akun terlebih dahulu.");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/admin/bot-accounts/import", {
+      method: "POST",
+      headers: getAdminHeaders(),
+      body: JSON.stringify({ raw_text: rawText })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message, "Import Akun Sukses");
+      textEl.value = "";
+      toggleAccountImportBox();
+      loadAdminAccounts();
+      loadAdminOverview();
+    } else {
+      showToast("error", data.error || "Gagal mengimpor akun");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+let botRegPollTimer = null;
+
+async function startAdminBotRegister() {
+  const count = parseInt(document.getElementById("admRegCount").value) || 5;
+  const verifyEmail = document.getElementById("admRegVerifyEmail").value === "true";
+  const emailProv = document.getElementById("admRegEmailProv").value || "all";
+  const country = document.getElementById("admRegCountry").value || "RANDOM";
+
+  try {
+    const resp = await fetch("/api/admin/bot-accounts/register", {
+      method: "POST",
+      headers: getAdminHeaders(),
+      body: JSON.stringify({
+        count: count,
+        verify_email: verifyEmail,
+        email_provider: emailProv,
+        country: country
+      })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("success", data.message, "Engine Dimulai");
+      document.getElementById("admRegProgressContainer").style.display = "block";
+      document.getElementById("btnStartBotReg").style.display = "none";
+      document.getElementById("btnStopBotReg").style.display = "inline-flex";
+      document.getElementById("admRegBadgeStatus").textContent = "RUNNING";
+      document.getElementById("admRegBadgeStatus").className = "tag blue";
+      startBotRegPolling();
+    } else {
+      showToast("error", data.error || "Gagal memulai registrasi akun.");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+async function stopAdminBotRegister() {
+  try {
+    const resp = await fetch("/api/admin/bot-accounts/stop-register", {
+      method: "POST",
+      headers: getAdminHeaders()
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      showToast("info", data.message, "Menghentikan");
+    } else {
+      showToast("warning", data.error || "Gagal mengirim stop command.");
+    }
+  } catch (e) {
+    showToast("error", "Error: " + e);
+  }
+}
+
+function startBotRegPolling() {
+  if (botRegPollTimer) clearInterval(botRegPollTimer);
+  botRegPollTimer = setInterval(pollBotRegStatus, 2000);
+  pollBotRegStatus();
+}
+
+async function pollBotRegStatus() {
+  try {
+    const resp = await fetch("/api/admin/bot-accounts/register-status", { headers: getAdminHeaders() });
+    if (!resp.ok) return;
+    const d = await resp.json();
+    if (!d.ok) return;
+
+    const badge = document.getElementById("admRegBadgeStatus");
+    const pBox = document.getElementById("admRegProgressContainer");
+    const pText = document.getElementById("admRegProgressText");
+    const pBar = document.getElementById("admRegProgressBar");
+    const sCount = document.getElementById("admRegSuccessCount");
+    const fCount = document.getElementById("admRegFailedCount");
+    const tCount = document.getElementById("admRegTargetCount");
+    const consoleEl = document.getElementById("admRegConsole");
+
+    if (tCount) tCount.textContent = d.total_target || 0;
+    if (sCount) sCount.textContent = d.success_count || 0;
+    if (fCount) fCount.textContent = d.failed_count || 0;
+
+    const total = d.total_target || 1;
+    const done = (d.completed || 0);
+    const pct = Math.min(100, Math.round((done / total) * 100));
+    if (pBar) pBar.style.width = pct + "%";
+
+    if (d.running) {
+      if (pBox) pBox.style.display = "block";
+      if (badge) { badge.textContent = "RUNNING"; badge.className = "tag blue"; }
+      if (pText) pText.textContent = `Sedang memproses akun #${done + 1} dari ${total} (${pct}%)...`;
+      const btnStart = document.getElementById("btnStartBotReg");
+      const btnStop = document.getElementById("btnStopBotReg");
+      if (btnStart) btnStart.style.display = "none";
+      if (btnStop) btnStop.style.display = "inline-flex";
+    } else {
+      const btnStart = document.getElementById("btnStartBotReg");
+      const btnStop = document.getElementById("btnStopBotReg");
+      if (btnStart) btnStart.style.display = "inline-flex";
+      if (btnStop) btnStop.style.display = "none";
+      if (done > 0) {
+        if (badge) { badge.textContent = "COMPLETED"; badge.className = "tag emerald"; }
+        if (pText) pText.textContent = `Pendaftaran selesai: ${d.success_count} berhasil, ${d.failed_count} gagal dari ${total} akun.`;
+      } else {
+        if (badge) { badge.textContent = "IDLE"; badge.className = "tag emerald"; }
+      }
+      if (botRegPollTimer && !d.running) {
+        clearInterval(botRegPollTimer);
+        botRegPollTimer = null;
+        loadAdminAccounts();
+        loadAdminOverview();
+      }
+    }
+
+    if (d.logs && d.logs.length > 0 && consoleEl) {
+      consoleEl.innerHTML = d.logs.map(l => {
+        let col = "#94a3b8";
+        if (l.level === "success") col = "#10b981";
+        else if (l.level === "error") col = "#f43f5e";
+        else if (l.level === "warn") col = "#f59e0b";
+        return `<div style="color:${col}; margin-bottom:2px;"><span style="color:var(--text-dim); font-size:10px;">[${l.time}]</span> ${l.message}</div>`;
+      }).join("");
+      consoleEl.scrollTop = consoleEl.scrollHeight;
     }
   } catch (e) {}
 }

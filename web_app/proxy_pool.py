@@ -168,3 +168,68 @@ class ProxyPoolManager:
             ORDER BY id ASC;
             """)
             return [dict(r) for r in cursor.fetchall()]
+
+    @classmethod
+    def sync_from_files(cls) -> Dict[str, int]:
+        """
+        Membaca proxies.txt dari root, stealth_bot/, dan archive untuk sinkronisasi otomatis.
+        """
+        base_dir = Path(__file__).parent.parent
+        files_to_check = [
+            base_dir / "proxies.txt",
+            base_dir / "stealth_bot" / "proxies.txt",
+            base_dir / "legacy_archive" / "web_app_core" / "proxies.txt",
+        ]
+
+        all_proxies = set()
+        for fpath in files_to_check:
+            if fpath.exists():
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            p = line.strip()
+                            if p and not p.startswith("#"):
+                                if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://")):
+                                    p = f"http://{p}"
+                                all_proxies.add(p)
+                except Exception as e:
+                    logger.warning(f"Error membaca {fpath}: {e}")
+
+        added = 0
+        with db_session() as conn:
+            cursor = conn.cursor()
+            for p in all_proxies:
+                cursor.execute("""
+                INSERT OR IGNORE INTO proxies (proxy_url, status)
+                VALUES (?, 'IDLE');
+                """, (p,))
+                if cursor.rowcount > 0:
+                    added += 1
+
+        summary = cls.get_summary()
+        return {
+            "added": added,
+            "total": summary["total"],
+            "idle": summary["idle"]
+        }
+
+    @classmethod
+    def import_proxies(cls, raw_text: str) -> Dict[str, int]:
+        """Memasukkan daftar proxy dari textarea teks manual."""
+        lines = raw_text.strip().splitlines()
+        added = 0
+        with db_session() as conn:
+            cursor = conn.cursor()
+            for line in lines:
+                p = line.strip()
+                if p and not p.startswith("#"):
+                    if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://")):
+                        p = f"http://{p}"
+                    cursor.execute("""
+                    INSERT OR IGNORE INTO proxies (proxy_url, status)
+                    VALUES (?, 'IDLE');
+                    """, (p,))
+                    if cursor.rowcount > 0:
+                        added += 1
+        summary = cls.get_summary()
+        return {"added": added, "total": summary["total"], "idle": summary["idle"]}

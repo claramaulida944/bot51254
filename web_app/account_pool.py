@@ -198,3 +198,85 @@ class AccountPoolManager:
         except Exception as e:
             logger.warning(f"Gagal mencatat akun ke akun_stealth.txt: {e}")
 
+    @classmethod
+    def sync_from_file(cls) -> Dict[str, int]:
+        """Menyinkronkan data akun dari akun_stealth.txt ke tabel bot_accounts."""
+        txt_path = Path(__file__).parent.parent / "stealth_bot" / "akun_stealth.txt"
+        if not txt_path.exists():
+            return {"added": 0, "total": 0}
+
+        added = 0
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    acc = json.loads(line)
+                    email = acc.get("email")
+                    if email:
+                        with db_session() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                            INSERT INTO bot_accounts (
+                                email, password, nickname, access_token, refresh_token,
+                                country, device_id, anonymous_id, user_agent,
+                                q_balance, last_q_claim_date, status
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+                            ON CONFLICT(email) DO UPDATE SET
+                                access_token = excluded.access_token,
+                                refresh_token = excluded.refresh_token,
+                                nickname = excluded.nickname,
+                                q_balance = excluded.q_balance,
+                                last_q_claim_date = excluded.last_q_claim_date;
+                            """, (
+                                email,
+                                acc.get("password", ""),
+                                acc.get("nickname", ""),
+                                acc.get("access_token", ""),
+                                acc.get("refresh_token", ""),
+                                acc.get("country", "ID"),
+                                acc.get("device_id", ""),
+                                acc.get("anonymous_id", ""),
+                                acc.get("user_agent", "okhttp/4.12.0"),
+                                acc.get("q_balance", 0),
+                                acc.get("last_q_claim_date", ""),
+                            ))
+                            if cursor.rowcount > 0:
+                                added += 1
+                except Exception:
+                    pass
+
+        summary = cls.get_summary()
+        return {"added": added, "total": summary["total"], "active": summary["active"], "total_q": summary["total_q"]}
+
+    @classmethod
+    def import_accounts(cls, raw_text: str) -> Dict[str, int]:
+        """Mengimpor banyak akun dari teks JSON lines atau baris email:password."""
+        lines = raw_text.strip().splitlines()
+        added = 0
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            acc_data = None
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    acc_data = json.loads(line)
+                except Exception:
+                    pass
+            elif ":" in line:
+                parts = line.split(":", 1)
+                acc_data = {
+                    "email": parts[0].strip(),
+                    "password": parts[1].strip(),
+                    "nickname": parts[0].split("@")[0],
+                }
+
+            if acc_data and acc_data.get("email"):
+                cls.add_or_update_account(acc_data)
+                added += 1
+
+        summary = cls.get_summary()
+        return {"added": added, "total": summary["total"]}
+
