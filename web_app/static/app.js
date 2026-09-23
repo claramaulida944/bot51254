@@ -870,7 +870,7 @@ function updateCostCalculation() {
 
   if (btnStart) {
     if (!currentUser) {
-      btnStart.disabled = true;
+      btnStart.disabled = false;
       btnStart.textContent = "Masuk Akun untuk Memulai";
     } else if (currentBal < minRequired) {
       btnStart.disabled = true;
