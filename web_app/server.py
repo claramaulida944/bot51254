@@ -539,26 +539,53 @@ async def api_check_payment(ref_id: str, request: Request):
 
 
 @app.post("/api/payment/callback")
+@app.post("/api/payment/callback/wijayapay")
 async def api_payment_callback(request: Request):
     """Webhook callback otomatis dari server WijayaPay."""
     try:
-        body = await request.body()
-        data = json.loads(body.decode("utf-8"))
+        data = {}
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.body()
+            if body:
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+        else:
+            try:
+                form = await request.form()
+                data = dict(form)
+            except Exception:
+                body = await request.body()
+                if body:
+                    data = json.loads(body.decode("utf-8", errors="ignore"))
+
         logger.info(f"Webhook WijayaPay diterima: {data}")
 
-        ref_id = data.get("ref_id") or data.get("reference_id")
-        tx_status = (data.get("status") or "").upper().strip()
-        amount = int(data.get("nominal") or data.get("amount") or 0)
-        signature = request.headers.get("x-callback-signature") or data.get("signature", "")
+        # Support payload direct or nested inside data
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
 
-        # Verifikasi signature
-        if signature and not default_wijayapay_client.verify_signature(ref_id, signature):
+        ref_id = payload.get("ref_id") or payload.get("reference_id") or payload.get("merchant_ref") or data.get("ref_id") or data.get("merchant_ref")
+        tx_status = str(payload.get("status") or data.get("status") or "").upper().strip()
+        raw_nominal = payload.get("nominal") or payload.get("amount") or payload.get("total_amount") or data.get("nominal") or 0
+        try:
+            amount = int(float(raw_nominal))
+        except (ValueError, TypeError):
+            amount = 0
+
+        signature = (
+            request.headers.get("x-callback-signature")
+            or request.headers.get("x-signature")
+            or payload.get("signature")
+            or data.get("signature", "")
+        )
+
+        # Verifikasi signature jika ref_id & signature disertakan
+        if signature and ref_id and not default_wijayapay_client.verify_signature(ref_id, signature):
             logger.warning(f"Signature callback tidak cocok untuk ref {ref_id}")
             return JSONResponse(status_code=400, content={"status": False, "message": "Invalid signature"})
 
-        if tx_status in ("PAID", "SUCCESS", "BERHASIL") and ref_id and amount > 0:
+        if tx_status in ("PAID", "SUCCESS", "BERHASIL", "1", "SETTLED") and ref_id and amount > 0:
             # Ambil user_id dari ref_id "TOPUP-{user_id}-..."
-            parts = ref_id.split("-")
+            parts = str(ref_id).split("-")
             if len(parts) >= 2 and parts[1].isdigit():
                 user_id = int(parts[1])
                 with db_session() as conn:
@@ -577,6 +604,7 @@ async def api_payment_callback(request: Request):
     except Exception as e:
         logger.error(f"Error webhook: {e}")
         return JSONResponse(status_code=500, content={"status": False, "message": str(e)})
+
 
 
 @app.get("/admin", response_class=HTMLResponse)
