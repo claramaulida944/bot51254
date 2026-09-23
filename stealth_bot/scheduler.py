@@ -59,7 +59,7 @@ from .config import (
 from .client import StealthApiClient
 from .email_verifier import TempTfVerifier
 from .profile import AccountProfile, ProfileGenerator
-from .proxy import StealthProxyManager, default_proxy_manager
+from .proxy import StealthProxyManager, default_proxy_manager, pick_weighted_country
 
 logger = logging.getLogger("StealthScheduler")
 
@@ -98,6 +98,25 @@ class StealthScheduler:
         with open(self.accounts_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(acc_dict, ensure_ascii=False) + "\n")
 
+    def update_account(self, updated_acc: Dict[str, Any]):
+        """Memperbarui satu data akun di akun_stealth.txt secara aman dan sinkron."""
+        email = str(updated_acc.get("email", "")).strip().lower()
+        if not email:
+            return
+        accs = self.load_accounts()
+        found = False
+        for i, a in enumerate(accs):
+            if str(a.get("email", "")).strip().lower() == email:
+                accs[i].update(updated_acc)
+                found = True
+                break
+        if not found:
+            accs.append(updated_acc)
+
+        with open(self.accounts_file, "w", encoding="utf-8") as f:
+            for a in accs:
+                f.write(json.dumps(a, ensure_ascii=False) + "\n")
+
     async def register_spaced_accounts(
         self,
         total_count: int,
@@ -131,11 +150,9 @@ class StealthScheduler:
                 self.log("[yellow]Pendaftaran dihentikan oleh pengguna.[/]")
                 break
 
-            # 1. Resolusi Negara per Akun (Otomatis Acak Bobot Tinggi atau Spesifik)
+            # 1. Resolusi Negara per Akun (Otomatis Acak Bobot: 30% US, 20% KR, 10% ID, 40% Global)
             if country_code.upper() in ("RANDOM", "ALL", "AUTO", ""):
-                candidate_countries = ["KR", "US", "JP", "GB", "ID", "DE", "CA", "AU", "FR", "SG"]
-                weights = [25, 25, 15, 10, 5, 5, 5, 5, 3, 2]  # Pasar utama KR & US
-                current_country = random.choices(candidate_countries, weights=weights, k=1)[0]
+                current_country = pick_weighted_country()
             else:
                 current_country = country_code.upper().strip()
 

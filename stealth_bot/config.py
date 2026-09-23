@@ -21,9 +21,9 @@ PLATFORM = "android"
 DEFAULT_TARGET_NOVEL_ID = "Py7LDdwpEQ8e1YKX"  # "TERMS OF SURRENDER"
 
 # Parameter Anti-Fraud: Kecepatan Baca Manusia (Words Per Minute)
-MIN_WPM = 175  # Kecepatan santai
-MAX_WPM = 250  # Kecepatan membaca cepat
-WPM_JITTER_PCT = 0.20  # Variasi mikro acak (+/- 20%) antar bab
+MIN_WPM = 260  # Kecepatan membaca digital mobile normal
+MAX_WPM = 380  # Kecepatan membaca cepat / scrolling skimmer
+WPM_JITTER_PCT = 0.15  # Variasi mikro acak (+/- 15%) antar bab
 
 # Parameter Anti-Fraud: Diversifikasi & Kamuflase
 CAMOUFLAGE_NOVEL_RATIO = 0.65  # 65% membaca novel populer lain di katalog, 35% novel target
@@ -35,5 +35,5 @@ MAX_SIGNUP_INTERVAL_SEC = 180.0  # Jeda maksimum antar registrasi
 
 # Header Capabilities Resmi Android
 FRONTEND_CAPABILITY = "member_payout_telemetry.v1"
-MISSION_CAPABILITIES = "global-reading-v1,global-comment-v1,exploration-v1,recommend"
+MISSION_CAPABILITIES = "global-reading-v1,global-comment-v1,exploration-v1,recommendation-review-mission-v1"
 BOOKSTORE_GENRE_GATE = "resolved"

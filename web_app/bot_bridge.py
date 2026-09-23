@@ -1,89 +1,127 @@
 """
-Bridge penghubung antara Backend Web (FastAPI) dan Mesin Bot (core).
-Menyediakan antarmuka asinkron dengan event streaming untuk Server-Sent Events (SSE),
-serta pemotongan saldo real-time per log sukses.
+Bridge penghubung antara Backend Web SaaS (FastAPI) dan Mesin Bot Stealth.
+Mendukung:
+- Multi-Terminal (Sesi bersamaan 1 - 5 terminal per tugas)
+- Dynamic Proxy Pool Lease (Locking IDLE, Release on Complete/Cancel)
+- Auto-skip Akun & History (Mencegah duplikasi baca, like, follow, bookmark)
+- Server-Sent Events (SSE) Live Log per Terminal
+- Pemotongan Saldo Rupiah Real-time per Pembaca Sukses
 """
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
-import secrets
+import random
+import re
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
-# Tambahkan web_app/core ke sys.path
-CORE_DIR = Path(__file__).parent / "core"
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
+# Tambahkan root path & web_app ke sys.path
+ROOT_DIR = Path(__file__).parent.parent.resolve()
+WEB_APP_DIR = Path(__file__).parent.resolve()
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(WEB_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(WEB_APP_DIR))
 
-from token_manager import TokenManager, OWNER_WHATSAPP
-from proxy_manager import (
-    ProxyManager, default_proxy_manager, HypeProxyClient,
-    get_weighted_royalty_country, SUPPORTED_QUARTERFULL_COUNTRIES, resolve_service_country
-)
-from auto_reader import NovelTargetResolver, MemberReaderSession, GuestReaderSession
-from full_auto_runner import FullAutoWorker
-from interaction_manager import SocialInteractionBot
-from account_history import AccountHistoryManager
+from database import db_session, get_setting, get_all_settings
+from proxy_pool import ProxyPoolManager
+from account_pool import AccountPoolManager
+from auth import AuthManager
+
+# Import engine stealth bot resmi Android
+from stealth_bot.client import StealthApiClient
+from stealth_bot.timing import ReadingSimulator
+from stealth_bot.profile import ProfileGenerator
+from stealth_bot.camouflage import CamouflageEngine
+from stealth_bot.email_verifier import TempTfVerifier
+from stealth_bot.scheduler import format_natural_email
 
 logger = logging.getLogger("WebBotBridge")
 
-# Registry tugas aktif di memori
-ACTIVE_TASKS: Dict[str, Dict[str, Any]] = {}
+ACTIVE_TASKS: Dict[str, "WebTask"] = {}
 
 
 class WebTask:
-    """Representasi tugas bot yang sedang berjalan dengan SSE queue."""
+    """Representasi tugas bot pembaca dengan dukungan multi-terminal, mode tamu, dan antrean SSE."""
 
-    def __init__(self, task_id: str, token_code: str, novel_id: str, mode: str, config: Dict[str, Any]):
+    def __init__(
+        self,
+        task_id: str,
+        user_id: int,
+        novel_id: str,
+        mode: str,
+        target_readers: int = 5,
+        concurrent_terminals: int = 1,
+        max_chapters: int = 25,
+        reading_delay: float = 140.0,
+        author_id: str = "",
+        novel_title: str = "",
+        rate_per_reader: int = 450,
+        addon_fee: int = 0,
+        addon_guest_conversion: bool = False,
+    ):
         self.task_id = task_id
-        self.token_code = token_code
+        self.user_id = user_id
         self.novel_id = novel_id
-        self.mode = mode
-        self.config = config
+        self.novel_title = novel_title or f"Novel #{novel_id}"
+        self.author_id = author_id
+        self.mode = mode  # "valid" atau "guest"
+        self.target_readers = target_readers
+        self.concurrent_terminals = max(1, min(concurrent_terminals, 5))  # 1 sampai 5
+        self.max_chapters = max_chapters
+        self.reading_delay = reading_delay
+        self.rate_per_reader = rate_per_reader
+        self.addon_fee = addon_fee
+        self.addon_guest_conversion = addon_guest_conversion
+        
         self.subscribers: Set[asyncio.Queue] = set()
         self.logs_history: List[Dict[str, Any]] = []
         self.is_running = True
         self.is_cancelled = False
         self.created_at = datetime.now(timezone.utc).isoformat()
-        self.novel_info: Dict[str, Any] = {}
+        
         self.stats = {
-            "accounts_total": 0,
-            "accounts_done": 0,
+            "target_readers": target_readers,
+            "completed_readers": 0,
             "chapters_read": 0,
             "likes": 0,
             "bookmarks": 0,
             "follows": 0,
+            "converted_accounts": 0,
             "total_spent": 0,
             "current_balance": 0,
+            "active_terminals": self.concurrent_terminals,
+            "addon_guest_conversion": self.addon_guest_conversion,
         }
+        
+        # Tracking proxy yang sedang dipinjam oleh task ini agar aman di-release saat cancel
+        self.active_proxies: Set[str] = set()
+        self.active_accounts: Set[str] = set()
 
     def subscribe(self) -> asyncio.Queue:
-        """Mendaftarkan listener SSE baru."""
+        """Mendaftarkan listener SSE baru untuk live streaming log."""
         q: asyncio.Queue = asyncio.Queue()
         self.subscribers.add(q)
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
-        """Menghapus listener SSE saat koneksi ditutup atau refresh browser."""
+        """Menghapus listener SSE saat user menutup tab / refresh."""
         self.subscribers.discard(q)
 
-    async def emit_log(self, message: str, level: str = "info", extra: Optional[Dict[str, Any]] = None) -> None:
-        """Mengirim pesan log ke semua subscriber SSE dan menyimpan history untuk replay."""
+    async def emit_log(self, message: str, level: str = "info", terminal_id: Optional[int] = None) -> None:
+        """Mengirim pesan log ke semua subscriber SSE."""
+        prefix = f"[Terminal-{terminal_id}] " if terminal_id else ""
         payload = {
             "type": "log",
             "time": datetime.now().strftime("%H:%M:%S"),
             "level": level,
-            "message": message,
+            "terminal": terminal_id,
+            "message": f"{prefix}{message}",
         }
-        if extra:
-            payload.update(extra)
         self.logs_history.append(payload)
         if len(self.logs_history) > 300:
             self.logs_history.pop(0)
@@ -95,7 +133,24 @@ class WebTask:
                 pass
 
     async def emit_stats(self) -> None:
-        """Mengirim update metrik statistik real-time ke semua subscriber."""
+        """Mengirim update metrik statistik real-time dengan kalkulasi estimasi selesai (ETA)."""
+        import math
+        from datetime import datetime, timedelta
+
+        remaining_readers = max(0, self.stats["target_readers"] - self.stats["completed_readers"])
+        if self.mode == "guest":
+            # Jika ada addon konversi, butuh waktu tambahan signup + polling OTP (~135s)
+            time_per_reader = 135.0 if self.addon_guest_conversion else 75.0
+        else:
+            time_per_reader = self.max_chapters * self.reading_delay
+
+        rounds = math.ceil(remaining_readers / max(1, self.concurrent_terminals))
+        est_seconds_left = int(rounds * time_per_reader) if self.is_running else 0
+        finish_time = (datetime.now() + timedelta(seconds=est_seconds_left)).strftime("%H:%M WIB")
+
+        self.stats["estimated_seconds_left"] = est_seconds_left
+        self.stats["estimated_finish_time"] = finish_time
+
         payload = {
             "type": "stats",
             "stats": self.stats,
@@ -106,12 +161,11 @@ class WebTask:
             except Exception:
                 pass
 
-    async def emit_done(self, wa_link: str) -> None:
-        """Mengirim sinyal tugas selesai ke semua subscriber."""
+    async def emit_done(self) -> None:
+        """Mengirim sinyal tugas selesai ke web UI."""
         payload = {
             "type": "done",
             "stats": self.stats,
-            "wa_link": wa_link,
         }
         for q in list(self.subscribers):
             try:
@@ -120,814 +174,682 @@ class WebTask:
                 pass
 
     def cancel(self) -> None:
-        """Membatalkan eksekusi tugas."""
+        """Membatalkan tugas dan membebaskan semua proxy yang dipegang."""
         self.is_cancelled = True
         self.is_running = False
+        # Release semua proxy yang sedang aktif
+        for proxy_url in list(self.active_proxies):
+            ProxyPoolManager.release_proxy(proxy_url)
+        self.active_proxies.clear()
+        logger.info(f"Task {self.task_id} berhasil dibatalkan dan semua proxy telah di-release.")
 
 
 class BotBridge:
-    """Orkestrator bot untuk antarmuka web dengan alokasi server terisolasi per token."""
+    """Orkestrator bot utama untuk eksekusi multi-terminal di web."""
 
     @classmethod
-    def load_accounts(cls, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Membaca seluruh akun dari web_app/core/akun.txt."""
-        accounts_file = CORE_DIR / "akun.txt"
-        if not accounts_file.exists():
-            accounts_file = Path(__file__).parent.parent / "akun.txt"
-        
-        accounts = []
-        if accounts_file.exists():
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        try:
-                            acc = json.loads(line)
-                            if acc.get("access_token") and acc.get("user_id"):
-                                accounts.append(acc)
-                        except Exception:
-                            pass
-        if limit and limit > 0:
-            return accounts[:limit]
-        return accounts
-
-    @classmethod
-    def get_token_account_allocation(
-        cls,
-        token_code: str,
-        count: int = 5,
-        target_country: Optional[str] = None,
-        novel_id: Optional[str] = None,
-        exclude_used: bool = False
-    ) -> List[Dict[str, Any]]:
-        """
-        Mengalokasikan partisi akun server yang unik dan terisolasi untuk tiap token.
-        Mencegah tabrakan akun antar token berbeda menggunakan consistent token hashing.
-        Mendukung pemfilteran pool akun berdasarkan lock country (misal: ID, US, JP, dll).
-        Mendukung pengecualian akun yang sudah pernah berinteraksi jika novel_id & exclude_used diaktifkan.
-        """
-        all_accounts = cls.load_accounts()
-        if not all_accounts:
-            return []
-        
-        # Filter berdasarkan negara jika user memilih lock country spesifik
-        if target_country and target_country.upper().strip() not in ("RANDOM", "ALL", "AUTO"):
-            req_cc = target_country.upper().strip()
-            if req_cc not in SUPPORTED_QUARTERFULL_COUNTRIES:
-                req_cc = "ID"
-            matching_accounts = [acc for acc in all_accounts if acc.get("country", "").upper() == req_cc]
-            candidate_pool = matching_accounts if matching_accounts else all_accounts
-        else:
-            candidate_pool = all_accounts
-
-        if novel_id and exclude_used:
-            fresh, _ = AccountHistoryManager.filter_fresh_accounts(candidate_pool, novel_id)
-            if fresh:
-                candidate_pool = fresh
-
-        if not candidate_pool:
-            return []
-        
-        # Hitung hash unik dari token_code
-        token_hash = int(hashlib.sha256(token_code.strip().upper().encode()).hexdigest(), 16)
-        total_pool = len(candidate_pool)
-        
-        # Tentukan titik offset awal partisi berdasarkan token hash
-        start_offset = token_hash % total_pool
-        
-        # Ambil subset akun secara berurutan dengan rotasi circular
-        allocated = []
-        for i in range(min(count, total_pool)):
-            idx = (start_offset + i) % total_pool
-            allocated.append(candidate_pool[idx])
-            
-        return allocated
-
-    @classmethod
-    def get_token_dedicated_proxy(cls, token_code: str, target_country: Optional[str] = None) -> Optional[str]:
-        """
-        Mengalokasikan node proxy dengan Slot Lease Governor agar lalu lintas jaringan
-        terbagi merata pada slot yang minim beban, menghindari tabrakan dan perebutan port.
-        """
-        if not default_proxy_manager or not default_proxy_manager.has_proxies:
+    def extract_novel_id(cls, raw: str) -> Optional[str]:
+        """Mengekstrak ID novel 16 karakter dari link atau teks."""
+        if not raw:
             return None
-
-        req_cc = None
-        if target_country and target_country.upper().strip() not in ("RANDOM", "ALL", "AUTO"):
-            req_cc = target_country.upper().strip()
-            if req_cc not in SUPPORTED_QUARTERFULL_COUNTRIES:
-                req_cc = "ID"
-
-        sess_id = f"tok_{token_code.lower().replace('-', '')[:8]}"
-        return default_proxy_manager.acquire_proxy_slot(country_code=req_cc, session_id=sess_id)
+        raw = raw.strip()
+        query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", raw)
+        if query_hash:
+            return query_hash.group(1)
+        match = re.search(r"([a-zA-Z0-9]{16})", raw)
+        return match.group(1) if match else None
 
     @classmethod
     async def get_novel_info(cls, raw_url_or_id: str) -> Dict[str, Any]:
-        """Mengambil data novel (judul, author, cover, readable chapters) dari link atau ID."""
-        novel_id = NovelTargetResolver.extract_novel_id(raw_url_or_id)
+        """Mengambil data novel (judul, author, cover, readable chapters)."""
+        novel_id = cls.extract_novel_id(raw_url_or_id)
         if not novel_id:
-            return {"ok": False, "error": "URL atau ID Novel tidak valid (harus berisi 16 karakter hash ID)"}
+            return {"ok": False, "error": "URL atau ID Novel tidak valid (harus 16 karakter)"}
 
+        # Pinjam 1 proxy sementara jika ada
+        proxy = ProxyPoolManager.acquire_proxy("info_fetch", "worker_info")
         try:
-            proxy_url = default_proxy_manager.get_proxy() if default_proxy_manager.has_proxies else None
-            try:
-                details = await NovelTargetResolver.fetch_novel_details(novel_id, proxy=proxy_url)
-            except Exception:
-                details = await NovelTargetResolver.fetch_novel_details(novel_id, proxy=None)
-            
-            origin_cc = details.get("origin_country", "ID")
-            try:
-                chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
-            except Exception:
-                chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=None)
-            
-            author_data = details.get("author", {})
-            author_pid = author_data.get("profile_id") or author_data.get("hash_id") or author_data.get("id") or details.get("author_id")
-            return {
-                "ok": True,
-                "novel_id": novel_id,
-                "title": details.get("title", f"Novel #{novel_id}"),
-                "author": author_data.get("pen_name") or author_data.get("name") or author_data.get("nickname") or "Penulis",
-                "author_id": author_data.get("hash_id") or author_data.get("id"),
-                "author_profile_id": author_pid,
-                "cover_url": details.get("cover_url") or details.get("cover") or details.get("thumbnail"),
-                "total_chapters": len(chapters),
-                "synopsis": str(details.get("synopsis", details.get("description", "")))[:250],
-                "origin_country": origin_cc,
-                "is_adult_only": bool(details.get("is_adult_only", False)),
-                "chapters": chapters,
-                "chapters_preview": [{"id": c.get("id") or c.get("hash_id"), "num": c.get("chapter_num"), "title": c.get("title")} for c in chapters[:10]],
+            import httpx
+            kwargs = {
+                "base_url": "https://api.quarterfull.io",
+                "timeout": 15.0,
+                "headers": {
+                    "user-agent": "okhttp/4.12.0",
+                    "accept": "application/json",
+                    "platform": "android",
+                }
             }
-        except Exception as exc:
-            return {"ok": False, "error": f"Gagal mengambil data novel: {exc}", "novel_id": novel_id}
+            if proxy:
+                kwargs["proxy"] = proxy
+
+            async with httpx.AsyncClient(**kwargs) as client:
+                resp = await client.get(f"/api/v1/novels/{novel_id}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    author_data = data.get("author", {}) or {}
+                    author_id = author_data.get("id") or author_data.get("hash_id") or data.get("author_id", "")
+                    
+                    # Ambil bab
+                    c_resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
+                    ch_count = 0
+                    if c_resp.status_code == 200:
+                        c_data = c_resp.json()
+                        ch_list = c_data.get("chapters", []) or c_data.get("items", []) or []
+                        ch_count = len(ch_list)
+
+                    return {
+                        "ok": True,
+                        "novel_id": novel_id,
+                        "title": data.get("title", f"Novel #{novel_id}"),
+                        "author": author_data.get("name") or author_data.get("nickname") or "Penulis",
+                        "author_id": str(author_id),
+                        "cover_url": data.get("cover_url") or data.get("cover_image_url") or "",
+                        "synopsis": (data.get("synopsis") or "")[:200],
+                        "total_chapters": ch_count,
+                    }
+                else:
+                    return {"ok": False, "error": f"Server menolak: HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"ok": False, "error": f"Gagal mengambil info novel: {str(e)}"}
+        finally:
+            if proxy:
+                ProxyPoolManager.release_proxy(proxy)
 
     @classmethod
     async def run_task_lifecycle(cls, task: WebTask) -> None:
-        """Siklus hidup eksekusi bot di background dengan pemotongan saldo per sukses."""
-        ACTIVE_TASKS[task.task_id] = {"task": task, "status": "running"}
-        token_code = task.token_code
-        mode = task.mode
-        cfg = task.config
-        is_free_trial = (mode == "free_trial" or token_code == "FREE_TRIAL")
+        """Siklus hidup utama eksekusi tugas bot dengan multi-terminal paralel."""
+        ACTIVE_TASKS[task.task_id] = {"task": task}
+        
+        # Ambil saldo user saat ini
+        with db_session() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT balance FROM users WHERE id = ?;", (task.user_id,))
+            row = cursor.fetchone()
+            task.stats["current_balance"] = row["balance"] if row else 0
 
-        try:
-            # 1. Verifikasi saldo awal jika bukan free trial
-            if not is_free_trial:
-                token = TokenManager.get_token(token_code)
-                if not token:
-                    await task.emit_log("Token akses tidak valid atau tidak ditemukan!", level="error")
-                    return
+        # Simpan ke tabel tasks
+        with db_session() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT OR REPLACE INTO tasks (
+                task_id, user_id, novel_id, novel_title, target_readers,
+                completed_readers, concurrent_terminals, price_per_reader, mode, status
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'RUNNING');
+            """, (
+                task.task_id, task.user_id, task.novel_id, task.novel_title,
+                task.target_readers, task.concurrent_terminals, task.rate_per_reader, task.mode
+            ))
 
-                task.stats["current_balance"] = token.get("current_balance", 0)
-                await task.emit_log(f"Token terverifikasi: {token_code} (Saldo: Rp {task.stats['current_balance']:,})", level="info")
-                await task.emit_stats()
-            else:
-                task.stats["current_balance"] = 0
-                await task.emit_log("🎁 Memulai sesi Free Trial Gratis (Tanpa Token Akses)...", level="info")
-                await task.emit_stats()
+        mode_name = "Akun Valid (25 Bab)" if task.mode == "valid" else "Pembaca Tamu (Guest)"
+        await task.emit_log(f"🚀 Memulai tugas [{mode_name}] untuk '{task.novel_title}' (Target: {task.target_readers} Pembaca, {task.concurrent_terminals} Terminal, Tarif: Rp {task.rate_per_reader:,}/pembaca)...", "info")
+        await task.emit_stats()
 
-            # Pastikan proxy ter-update jika owner baru saja menambah/membeli proxy baru
-            if default_proxy_manager:
-                default_proxy_manager.reload_if_modified()
-                if default_proxy_manager.is_hypeproxy:
-                    threading.Thread(target=default_proxy_manager.sync_from_hypeproxy, daemon=True).start()
+        # Shared state antrean pembaca yang belum selesai
+        remaining_lock = asyncio.Lock()
+        completed_count = 0
 
-            # 2. Resolusi Info Novel
-            await task.emit_log(f"Menginspeksi novel target ID: {task.novel_id}...", level="info")
-            novel_info = await cls.get_novel_info(task.novel_id)
-            if not novel_info.get("ok"):
-                await task.emit_log(f"Gagal memproses novel: {novel_info.get('error')}", level="error")
-                return
+        async def terminal_worker(term_id: int):
+            nonlocal completed_count
+            
+            # Berikan jeda staggered start untuk tiap terminal
+            if term_id > 1:
+                stagger_delay = random.uniform(5.0, 15.0) * (term_id - 1)
+                await task.emit_log(f"Menunggu {int(stagger_delay)} detik agar tidak bentrok dengan terminal lain...", "debug", term_id)
+                await asyncio.sleep(stagger_delay)
 
-            task.novel_info = novel_info
-            await task.emit_log(
-                f"Target Novel: \"{novel_info['title']}\" oleh {novel_info['author']} "
-                f"({novel_info['total_chapters']} Bab Tersedia)",
-                level="success"
-            )
+            while task.is_running and not task.is_cancelled:
+                # Cek apakah target sudah tercapai
+                async with remaining_lock:
+                    if completed_count >= task.target_readers:
+                        break
+                
+                # Cek saldo user mencukupi untuk 1 pembaca
+                with db_session() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT balance FROM users WHERE id = ?;", (task.user_id,))
+                    u_row = cursor.fetchone()
+                    bal = u_row["balance"] if u_row else 0
+                    if bal < task.rate_per_reader:
+                        await task.emit_log(f"⚠️ Saldo tidak mencukupi (Sisa Rp {bal:,}, butuh Rp {task.rate_per_reader:,}). Tugas dihentikan.", "warn", term_id)
+                        task.cancel()
+                        break
 
-            # 3. Eksekusi Berdasarkan Mode
-            if is_free_trial:
-                await cls._execute_free_trial(task)
-            elif mode in ("full_auto", "member_read"):
-                await cls._execute_member_readers(task)
-            elif mode == "guest_read":
-                await cls._execute_guest_readers(task)
-            elif mode in ("like_only", "bookmark_only", "follow_only"):
-                await cls._execute_single_interactions(task)
-            else:
-                await task.emit_log(f"Mode '{mode}' tidak dikenali.", level="error")
-
-        except asyncio.CancelledError:
-            await task.emit_log("Tugas dibatalkan oleh pengguna.", level="warning")
-        except Exception as exc:
-            await task.emit_log(f"Terjadi kesalahan internal: {exc}", level="error")
-        finally:
-            task.is_running = False
-            if not is_free_trial:
-                token = TokenManager.get_token(token_code)
-                final_balance = token.get("current_balance", 0) if token else 0
-                task.stats["current_balance"] = final_balance
-                await task.emit_log(
-                    f"Tugas selesai. Total sesi sukses: {task.stats['accounts_done']} | "
-                    f"Total bab dibaca: {task.stats['chapters_read']} | Sisa saldo: Rp {final_balance:,}",
-                    level="success"
-                )
-                await task.emit_done(TokenManager.get_whatsapp_url(token_code, 20000))
-            else:
-                await task.emit_log(
-                    f"🎉 Free Trial Selesai! Sesi sukses: {task.stats['accounts_done']} akun | "
-                    f"Like: {task.stats['likes']} | Follow: {task.stats['follows']}",
-                    level="success"
-                )
-                await task.emit_done(TokenManager.get_whatsapp_url("FREE_TRIAL", 20000))
-            if task.task_id in ACTIVE_TASKS:
-                ACTIVE_TASKS[task.task_id]["status"] = "completed"
-            asyncio.create_task(cls._cleanup_task_later(task.task_id, delay=300))
-
-    @classmethod
-    async def _cleanup_task_later(cls, task_id: str, delay: int = 300) -> None:
-        """Membersihkan task selesai dari memori setelah delay tertentu."""
-        try:
-            await asyncio.sleep(delay)
-            ACTIVE_TASKS.pop(task_id, None)
-        except Exception:
-            pass
-
-    @classmethod
-    async def _execute_member_readers(cls, task: WebTask) -> None:
-        """
-        Menjalankan pembaca akun Valid Readers (baca bab + like + bookmark + follow).
-        Dilengkapi logika proteksi anti-duplikasi:
-        Jika sebuah akun terdeteksi sudah pernah membaca, menyukai (like), atau menyimpan
-        (bookmark) buku ini, maka akun tersebut OTOMATIS TIDAK DIGUNAKAN LAGI dan dilewati (Skip),
-        lalu sistem beralih ke akun segar (fresh) berikutnya hingga target sesi terpenuhi.
-        """
-        target_country = (task.config.get("country") or "RANDOM").upper().strip()
-        is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
-        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
-            await task.emit_log(
-                f"[GEO] Target negara '{target_country}' tidak didukung Quarterfull. Dialihkan otomatis ke 'ID'.",
-                level="warning"
-            )
-            target_country = "ID"
-        country_display = target_country if is_locked else "Global / Multi-Negara"
-
-        target_sessions = min(int(task.config.get("accounts_count", 5)), 100)
-        novel_id = task.novel_id
-
-        # 1. Ambil seluruh kandidat akun yang cocok dengan alokasi token & negara
-        all_candidates = cls.get_token_account_allocation(
-            task.token_code,
-            count=9999,
-            target_country=target_country
-        )
-        if not all_candidates:
-            await task.emit_log("Antrean node sedang penuh atau belum ada akun terdaftar.", level="error")
-            return
-
-        # 2. Filter akun yang belum pernah berinteraksi berdasarkan database riwayat lokal
-        fresh_accounts, used_accounts = AccountHistoryManager.filter_fresh_accounts(all_candidates, novel_id)
-        if used_accounts:
-            await task.emit_log(
-                f"🛡️ Anti-Duplikasi: {len(used_accounts)} akun dilewati karena terdeteksi sudah pernah membaca/like/simpan buku ini.",
-                level="info"
-            )
-
-        if not fresh_accounts:
-            await task.emit_log(
-                f"⚠️ Seluruh akun yang tersedia ({len(all_candidates)} akun) sudah pernah membaca/menyukai/menyimpan buku ini. Tidak ada akun baru yang dapat digunakan.",
-                level="warning"
-            )
-            return
-
-        task.stats["accounts_total"] = min(target_sessions, len(fresh_accounts))
-        proxy_mgr = default_proxy_manager
-        delay_sec = float(task.config.get("reading_delay", 5.0))
-
-        await task.emit_log(
-            f"Memulai sesi Valid Readers (Target: {target_sessions} Sesi Unik | Tersedia: {len(fresh_accounts)} Akun Segar) | "
-            f"Target Wilayah: {country_display} | Termasuk Baca Bab + Suka + Simpan + Ikuti Penulis",
-            level="info"
-        )
-
-        successful_sessions = 0
-        candidate_idx = 0
-
-        for acc in fresh_accounts:
-            if task.is_cancelled:
-                await task.emit_log("Tugas dibatalkan oleh pengguna. Saldo sesi yang telah membaca bab tetap dipotong.", level="warning")
-                break
-
-            if successful_sessions >= target_sessions:
-                break
-
-            candidate_idx += 1
-
-            # Cek saldo token apakah masih mencukupi tarif 1 sesi
-            valid_reader_rate = TokenManager.get_rate("valid_reader")
-            token = TokenManager.get_token(task.token_code)
-            curr_bal = token.get("current_balance", 0) if token else 0
-            if curr_bal < valid_reader_rate:
-                await task.emit_log(
-                    f"Saldo tidak mencukupi (Sisa: Rp {curr_bal:,}). Dibutuhkan Rp {valid_reader_rate:,} untuk sesi berikutnya. "
-                    f"Sesi dihentikan. Hubungi WhatsApp untuk isi ulang: wa.me/{OWNER_WHATSAPP}",
-                    level="warning",
-                    extra={"balance_exhausted": True, "wa_url": TokenManager.get_whatsapp_url(task.token_code, 20000)}
-                )
-                break
-
-            acc_data = dict(acc)
-            if is_locked:
-                acc_data["country"] = target_country
-
-            proxy_country = target_country if is_locked else acc_data.get("country")
-            sess_id = f"mbr_{task.token_code[:6]}_{candidate_idx}_{secrets.token_hex(2)}"
-            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_country, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
-
-            session = MemberReaderSession(
-                worker_id=f"W-{successful_sessions + 1:02d}",
-                account_data=acc_data,
-                novel_title=task.novel_info.get("title", "Novel"),
-                proxy=proxy_url,
-                proxy_manager=proxy_mgr,
-            )
-
-            try:
-                # Validasi Real-time ke Server: Pastikan akun belum pernah membaca/like/bookmark di server
-                try:
-                    client = await session.get_client()
-                    server_check = await AccountHistoryManager.check_server_interaction(client, acc_data, novel_id)
-                    if server_check.get("already_interacted"):
-                        await task.emit_log(
-                            f"Akun #{candidate_idx} ({acc.get('email')}) dilewati (Skip): Terdeteksi {server_check['reason']} di server. Mencari akun segar berikutnya...",
-                            level="warning"
-                        )
+                # -------------------------------------------------------------
+                # JALANKAN SESUAI MODE (GUEST VS VALID)
+                # -------------------------------------------------------------
+                if task.mode == "guest":
+                    # Mode Tamu: Menggunakan anonymous session & rotasi proxy
+                    proxy_url = ProxyPoolManager.acquire_proxy(task.task_id, f"Terminal-{term_id}", task.user_id)
+                    if not proxy_url:
+                        await task.emit_log("⏳ Menunggu slot proxy nganggur...", "warn", term_id)
+                        await asyncio.sleep(6.0)
                         continue
-                except Exception as e_check:
-                    logger.debug("Pre-check server gagal, melanjutkan dengan akun: %s", e_check)
 
-                # Akun Segar Terverifikasi -> Jalankan Sesi
-                curr_worker = successful_sessions + 1
-                await task.emit_log(
-                    f"[{curr_worker}/{target_sessions}] Menjalankan sesi pembaca unik #{curr_worker} (Akun: {acc.get('email')}, Wilayah: {proxy_country})...",
-                    level="info"
-                )
-
-                # Ambil bab (gunakan cache hasil inspeksi atau fetch dengan origin country)
-                chapters = (task.novel_info or {}).get("chapters")
-                if not chapters:
-                    origin_cc = (task.novel_info or {}).get("origin_country", "ID")
-                    chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
-                if not chapters:
-                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Tidak ada bab yang dapat dibaca.", level="warning")
-                    continue
-
-                max_ch = min(len(chapters), int(task.config.get("max_chapters", 5)))
-                target_chapters = chapters[:max_ch]
-
-                # Interaksi Sosial (Like, Bookmark, Follow)
-                try:
-                    client = await session.get_client()
-
-                    # A. Like Novel
+                    task.active_proxies.add(proxy_url)
                     try:
-                        r_like = await client.post(f"/api/v1/novels/{novel_id}/like")
-                        if r_like.status_code == 200:
-                            l_data = r_like.json()
-                            if not l_data.get("is_liked", True):
-                                await asyncio.sleep(0.3)
-                                await client.post(f"/api/v1/novels/{novel_id}/like")
-                            AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
-                            task.stats["likes"] += 1
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyukai (Like) novel.", level="info")
-                        else:
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Like server: HTTP {r_like.status_code}", level="warning")
-                    except Exception as ex_like:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Like: {ex_like}", level="warning")
-
-                    await asyncio.sleep(0.5)
-
-                    # B. Bookmark Novel
-                    try:
-                        r_bm = await client.post(f"/api/v1/novels/{novel_id}/bookmark")
-                        if r_bm.status_code == 200:
-                            b_data = r_bm.json()
-                            if not b_data.get("is_saved", True):
-                                await asyncio.sleep(0.3)
-                                await client.post(f"/api/v1/novels/{novel_id}/bookmark")
-                            AccountHistoryManager.record_interaction(acc_data, novel_id, bookmarked=True)
-                            task.stats["bookmarks"] += 1
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil menyimpan (Bookmark) novel.", level="info")
-                        else:
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Respon Bookmark server: HTTP {r_bm.status_code}", level="warning")
-                    except Exception as ex_bm:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Bookmark: {ex_bm}", level="warning")
-
-                    await asyncio.sleep(0.5)
-
-                    # C. Follow Author jika profile_id tersedia
-                    author_pid = (task.novel_info or {}).get("author_profile_id")
-                    if author_pid:
-                        try:
-                            r_fol = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
-                            if r_fol.status_code in (200, 204):
-                                task.stats["follows"] += 1
-                                await task.emit_log(f"[{curr_worker}/{target_sessions}] Berhasil mengikuti (Follow) penulis novel.", level="info")
-                        except Exception as ex_fol:
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan Follow: {ex_fol}", level="warning")
-
-                except Exception as e_social:
-                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Catatan interaksi sosial: {e_social}", level="warning")
-
-                # Eksekusi Pembacaan Bab
-                first_ch_read = False
-                session_read_success = False
-
-                for ch_idx, ch in enumerate(target_chapters, 1):
-                    if task.is_cancelled:
-                        break
-                    try:
-                        ok, msg = await session.read_chapter(novel_id, ch, reading_delay_sec=delay_sec)
-                        if ok:
-                            task.stats["chapters_read"] += 1
-                            session_read_success = True
-                            ch_num_val = ch.get("chapter_num", ch_idx)
-                            AccountHistoryManager.record_interaction(acc_data, novel_id, read=True, chapter_num=ch_num_val)
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Sukses membaca Bab #{ch_num_val}", level="info")
-
-                            # Potong saldo segera saat bab pertama berhasil dibaca
-                            if not first_ch_read:
-                                rate = TokenManager.get_rate("valid_reader")
-                                deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
-                                    task.token_code,
-                                    item_type="valid_reader",
-                                    quantity=1,
-                                    note=f"Sesi akun #{curr_worker} ({acc.get('email')}) membaca bab {ch_num_val}"
-                                )
-                                if deduct_ok:
-                                    task.stats["total_spent"] += rate
-                                    task.stats["current_balance"] = new_bal
-                                    await task.emit_log(f"[{curr_worker}/{target_sessions}] Pembayaran sesi sukses (-Rp {rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
-                                first_ch_read = True
-
-                            await task.emit_stats()
-                        else:
-                            await task.emit_log(f"[{curr_worker}/{target_sessions}] Bab #{ch.get('chapter_num', ch_idx)} tidak tercatat: {msg}", level="warning")
-                    except Exception as e:
-                        await task.emit_log(f"[{curr_worker}/{target_sessions}] Kesalahan membaca bab: {e}", level="warning")
-
-                    await asyncio.sleep(delay_sec)
-
-                if session_read_success:
-                    successful_sessions += 1
-                    task.stats["accounts_done"] = successful_sessions
-                    await task.emit_stats()
-                    if proxy_url and proxy_mgr:
-                        proxy_mgr.mark_used(proxy_url)
-            finally:
-                if proxy_url and proxy_mgr:
-                    proxy_mgr.release_proxy_slot(proxy_url)
-                try:
-                    await session.close()
-                except Exception:
-                    pass
-
-            # Jeda antar sesi pembaca unik
-            await asyncio.sleep(1.5)
-
-        if successful_sessions >= target_sessions:
-            await task.emit_log(f"Target {target_sessions} sesi pembaca unik berhasil diselesaikan secara sempurna!", level="success")
-        elif not task.is_cancelled:
-            await task.emit_log(f"Selesai dengan {successful_sessions}/{target_sessions} sesi unik. Seluruh stok akun segar untuk buku ini telah selesai digunakan.", level="info")
-
-    @classmethod
-    async def _execute_guest_readers(cls, task: WebTask) -> None:
-        """Menjalankan pembaca tamu (Guest Heartbeat Simulator) masif tanpa otentikasi login."""
-        guest_count = int(task.config.get("accounts_count", 20))
-        target_country = (task.config.get("country") or "RANDOM").upper().strip()
-        is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
-        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
-            await task.emit_log(
-                f"[GEO] Target negara '{target_country}' tidak didukung resmi oleh Quarterfull. Mengalihkan otomatis ke 'ID'.",
-                level="warning"
-            )
-            target_country = "ID"
-        country_display = target_country if is_locked else "Global / Multi-Negara"
-
-        task.stats["accounts_total"] = guest_count
-        novel_id = task.novel_id
-        proxy_mgr = default_proxy_manager
-
-        await task.emit_log(
-            f"Memulai sesi Pembaca Tamu ({guest_count} Sesi) | Target Wilayah: {country_display} | Simulasi Heartbeat & Dwell...",
-            level="info"
-        )
-
-        for i in range(1, guest_count + 1):
-            if task.is_cancelled:
-                await task.emit_log("Tugas dibatalkan oleh pengguna.", level="warning")
-                break
-
-            if is_locked:
-                proxy_cc = target_country
-            else:
-                try:
-                    proxy_cc = get_weighted_royalty_country()
-                except Exception:
-                    proxy_cc = "ID"
-
-            sess_id = f"gst_{task.token_code[:6]}_{i}_{secrets.token_hex(2)}"
-            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_cc, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
-
-            session = GuestReaderSession(
-                worker_id=f"G-{i:03d}",
-                country=proxy_cc,
-                novel_title=task.novel_info.get("title", "Novel"),
-                proxy=proxy_url,
-                proxy_manager=proxy_mgr,
-            )
-
-            try:
-                chapters = (task.novel_info or {}).get("chapters")
-                if not chapters:
-                    origin_cc = (task.novel_info or {}).get("origin_country", "ID")
-                    chapters = await NovelTargetResolver.fetch_readable_chapters(novel_id, origin_country=origin_cc, proxy=proxy_url)
-                if not chapters:
-                    await task.emit_log(f"[{i}/{guest_count}] Tidak ada bab yang dapat dibaca.", level="warning")
-                    continue
-
-                target_ch = chapters[0]
-
-                ok, msg = await session.read_guest_session(novel_id, target_ch, dwell_seconds=float(task.config.get("reading_delay", 4.0)))
-                if ok:
-                    task.stats["accounts_done"] += 1
-                    task.stats["chapters_read"] += 1
-
-                    gr_rate = TokenManager.get_rate("guest_reader")
-                    deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
-                        task.token_code,
-                        item_type="guest_reader",
-                        quantity=1,
-                        note=f"Sesi pembaca tamu #{task.stats['accounts_done']}"
-                    )
-                    if deduct_ok:
-                        task.stats["total_spent"] += gr_rate
-                        task.stats["current_balance"] = new_bal
-                        await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} sukses (-Rp {gr_rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
-                    else:
-                        await task.emit_log(f"[{i}/{guest_count}] Saldo token tidak mencukupi untuk melanjutkan sesi tamu.", level="error")
-                        break
-                    await task.emit_stats()
-                    if proxy_url and proxy_mgr:
-                        proxy_mgr.mark_used(proxy_url)
-                else:
-                    await task.emit_log(f"[{i}/{guest_count}] Sesi Tamu #{i} gagal: {msg}", level="warning")
-            except Exception as e:
-                await task.emit_log(f"[{i}/{guest_count}] Exception sesi tamu #{i}: {e}", level="warning")
-            finally:
-                if proxy_url and proxy_mgr:
-                    proxy_mgr.release_proxy_slot(proxy_url)
-                try:
-                    await session.close()
-                except Exception:
-                    pass
-
-            await asyncio.sleep(0.5)
-
-    @classmethod
-    async def _execute_single_interactions(cls, task: WebTask) -> None:
-        """Menjalankan like/bookmark/follow massal dengan akun partisi token, dengan proteksi anti-duplikasi."""
-        target_country = (task.config.get("country") or "RANDOM").upper().strip()
-        is_locked = target_country not in ("RANDOM", "ALL", "AUTO")
-        if is_locked and target_country not in SUPPORTED_QUARTERFULL_COUNTRIES:
-            await task.emit_log(
-                f"[GEO] Target negara '{target_country}' tidak didukung Quarterfull. Dialihkan otomatis ke 'ID'.",
-                level="warning"
-            )
-            target_country = "ID"
-        country_display = target_country if is_locked else "Global / Multi-Negara"
-
-        target_count = min(int(task.config.get("accounts_count", 5)), 100)
-        novel_id = task.novel_id
-        all_candidates = cls.get_token_account_allocation(task.token_code, count=9999, target_country=target_country)
-        fresh_accounts, _ = AccountHistoryManager.filter_fresh_accounts(all_candidates, novel_id)
-
-        mode = task.mode
-        item_name = "Like" if mode == "like_only" else ("Bookmark" if mode == "bookmark_only" else "Follow")
-        await task.emit_log(f"Memulai pengiriman {item_name} (Target: {target_count} Akun Unik | Tersedia: {len(fresh_accounts)}) | Target Wilayah: {country_display}...", level="info")
-
-        proxy_mgr = default_proxy_manager
-
-        successful_count = 0
-        for acc in fresh_accounts:
-            if task.is_cancelled or successful_count >= target_count:
-                break
-            acc_data = dict(acc)
-            if is_locked:
-                acc_data["country"] = target_country
-
-            proxy_country = target_country if is_locked else acc_data.get("country")
-            sess_id = f"si_{task.token_code[:6]}_{successful_count + 1}_{secrets.token_hex(2)}"
-            proxy_url = proxy_mgr.acquire_proxy_slot(country_code=proxy_country, session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
-            session = MemberReaderSession(
-                worker_id=f"I-{successful_count + 1:02d}",
-                account_data=acc_data,
-                novel_title=task.novel_info.get("title", "Novel"),
-                proxy=proxy_url,
-                proxy_manager=proxy_mgr,
-            )
-
-            try:
-                client = await session.get_client()
-                server_check = await AccountHistoryManager.check_server_interaction(client, acc_data, novel_id)
-                if server_check.get("already_interacted"):
-                    await task.emit_log(f"Akun ({acc.get('email')}) dilewati: Terdeteksi {server_check['reason']}.", level="warning")
-                    continue
-
-                success = False
-                if mode == "like_only":
-                    r = await client.post(f"/api/v1/novels/{novel_id}/like")
-                    if r.status_code == 200:
-                        AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
-                        task.stats["likes"] += 1
-                        success = True
-                elif mode == "bookmark_only":
-                    r = await client.post(f"/api/v1/novels/{novel_id}/bookmark")
-                    if r.status_code == 200:
-                        AccountHistoryManager.record_interaction(acc_data, novel_id, bookmarked=True)
-                        task.stats["bookmarks"] += 1
-                        success = True
-                elif mode == "follow_only":
-                    author_pid = (task.novel_info or {}).get("author_profile_id")
-                    if author_pid:
-                        r = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
-                        if r.status_code in (200, 204):
-                            task.stats["follows"] += 1
-                            success = True
-                    else:
-                        await task.emit_log("Profile ID penulis tidak ditemukan.", level="warning")
-                        break
-
-                if success:
-                    successful_count += 1
-                    task.stats["accounts_done"] = successful_count
-                    rate_key = "like" if mode == "like_only" else ("bookmark" if mode == "bookmark_only" else "follow")
-                    interaction_rate = TokenManager.get_rate(rate_key)
-                    
-                    if interaction_rate > 0:
-                        deduct_ok, new_bal, d_msg = TokenManager.deduct_balance(
-                            task.token_code,
-                            item_type=rate_key,
-                            quantity=1,
-                            note=f"Kirim {item_name} via akun #{successful_count}"
+                        reader_success = await cls._execute_guest_reader_session(
+                            task=task,
+                            term_id=term_id,
+                            proxy_url=proxy_url
                         )
-                        if deduct_ok:
-                            task.stats["total_spent"] += interaction_rate
-                            task.stats["current_balance"] = new_bal
-                            await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')}) (-Rp {interaction_rate:,}). Sisa Saldo: Rp {new_bal:,}", level="success")
-                        else:
-                            await task.emit_log(f"Saldo token tidak mencukupi untuk interaksi {item_name}.", level="error")
-                            break
-                    else:
-                        await task.emit_log(f"[{successful_count}/{target_count}] Berhasil mengirim {item_name} via akun ({acc.get('email')})", level="info")
-                    
-                    await task.emit_stats()
-                    if proxy_url and proxy_mgr:
-                        proxy_mgr.mark_used(proxy_url)
-                else:
-                    await task.emit_log(f"Respon server {item_name} tidak sukses via ({acc.get('email')})", level="warning")
-            except Exception as e:
-                await task.emit_log(f"Gagal kirim {item_name}: {e}", level="warning")
-            finally:
-                if proxy_url and proxy_mgr:
-                    proxy_mgr.release_proxy_slot(proxy_url)
-                try:
-                    await session.close()
-                except Exception:
-                    pass
+                        if reader_success:
+                            async with remaining_lock:
+                                completed_count += 1
+                                task.stats["completed_readers"] = completed_count
+                                task.stats["total_spent"] += task.rate_per_reader
 
-            await asyncio.sleep(1.0)
+                            AuthManager.deduct_balance(
+                                user_id=task.user_id,
+                                amount=task.rate_per_reader,
+                                description=f"Pembaca Tamu #{completed_count} ({task.novel_title[:30]})",
+                                reference_id=task.task_id
+                            )
+
+                            with db_session() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT balance FROM users WHERE id = ?;", (task.user_id,))
+                                ubal = cursor.fetchone()["balance"]
+                                task.stats["current_balance"] = ubal
+                                cursor.execute("UPDATE tasks SET completed_readers = ?, updated_at = datetime('now') WHERE task_id = ?;", (completed_count, task.task_id))
+
+                            await task.emit_log(f"✅ [SUKSES] Pembaca Tamu #{completed_count} tuntas! Saldo terpotong Rp {task.rate_per_reader:,} (Sisa: Rp {ubal:,})", "success", term_id)
+                            await task.emit_stats()
+                    except Exception as e:
+                        await task.emit_log(f"❌ Kesalahan pada terminal tamu: {str(e)}", "error", term_id)
+                    finally:
+                        task.active_proxies.discard(proxy_url)
+                        ProxyPoolManager.release_proxy(proxy_url)
+
+                else:
+                    # Mode Valid: Alokasi akun stealth & anti-duplikasi
+                    account_data = AccountPoolManager.get_eligible_account(
+                        book_id=task.novel_id,
+                        author_id=task.author_id,
+                        excluded_emails=list(task.active_accounts)
+                    )
+
+                    if not account_data:
+                        await task.emit_log("⚠️ Tidak ada akun bot yang memenuhi syarat (semua akun sudah pernah membaca novel ini atau sedang limit harian).", "warn", term_id)
+                        await asyncio.sleep(5.0)
+                        break
+
+                    bot_email = account_data["email"]
+                    task.active_accounts.add(bot_email)
+
+                    proxy_url = ProxyPoolManager.acquire_proxy(task.task_id, f"Terminal-{term_id}", task.user_id)
+                    if not proxy_url:
+                        await task.emit_log("⏳ Semua proxy sedang digunakan oleh sesi lain. Menunggu slot proxy nganggur...", "warn", term_id)
+                        task.active_accounts.discard(bot_email)
+                        await asyncio.sleep(8.0)
+                        continue
+
+                    task.active_proxies.add(proxy_url)
+
+                    try:
+                        reader_success = await cls._execute_single_reader_session(
+                            task=task,
+                            term_id=term_id,
+                            account_data=account_data,
+                            proxy_url=proxy_url
+                        )
+
+                        if reader_success:
+                            async with remaining_lock:
+                                completed_count += 1
+                                task.stats["completed_readers"] = completed_count
+                                task.stats["total_spent"] += task.rate_per_reader
+
+                            AuthManager.deduct_balance(
+                                user_id=task.user_id,
+                                amount=task.rate_per_reader,
+                                description=f"Pembaca Valid #{completed_count} ({task.novel_title[:30]})",
+                                reference_id=task.task_id
+                            )
+
+                            with db_session() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT balance FROM users WHERE id = ?;", (task.user_id,))
+                                ubal = cursor.fetchone()["balance"]
+                                task.stats["current_balance"] = ubal
+
+                            AccountPoolManager.record_action(bot_email, task.novel_id, task.author_id, "READ_VALID")
+
+                            with db_session() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("UPDATE tasks SET completed_readers = ?, updated_at = datetime('now') WHERE task_id = ?;", (completed_count, task.task_id))
+
+                            await task.emit_log(f"✅ [SUKSES] Pembaca Valid #{completed_count} tuntas! Saldo terpotong Rp {task.rate_per_reader:,} (Sisa: Rp {ubal:,})", "success", term_id)
+                            await task.emit_stats()
+
+                    except Exception as e:
+                        await task.emit_log(f"❌ Terjadi kesalahan pada terminal: {str(e)}", "error", term_id)
+                        ProxyPoolManager.report_failure(proxy_url, str(e))
+                    finally:
+                        task.active_proxies.discard(proxy_url)
+                        task.active_accounts.discard(bot_email)
+                        ProxyPoolManager.release_proxy(proxy_url)
+
+                # Delay acak antar pembaca di terminal yang sama
+                if task.is_running and not task.is_cancelled:
+                    cooldown = random.uniform(4.0, 10.0)
+                    await task.emit_log(f"Jeda antarpembaca {int(cooldown)}s...", "debug", term_id)
+                    await asyncio.sleep(cooldown)
+
+        # Luncurkan worker terminal sebanyak concurrent_terminals
+        workers = [
+            asyncio.create_task(terminal_worker(i + 1))
+            for i in range(task.concurrent_terminals)
+        ]
+
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        # Finalisasi status tugas
+        task.is_running = False
+        final_status = "CANCELLED" if task.is_cancelled else "COMPLETED"
+        with db_session() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            UPDATE tasks SET status = ?, updated_at = datetime('now') WHERE task_id = ?;
+            """, (final_status, task.task_id))
+
+        await task.emit_log(f"🏁 Tugas selesai ({final_status}). Total {task.stats['completed_readers']}/{task.target_readers} pembaca tuntas.", "info")
+        await task.emit_done()
+        ACTIVE_TASKS.pop(task.task_id, None)
 
     @classmethod
-    async def _execute_free_trial(cls, task: WebTask) -> None:
-        """
-        Menjalankan sesi Free Trial tanpa token:
-        - Login N akun resmi (dinamis dari owner config)
-        - Like novel
-        - Follow profil penulis
-        - Emisi progress real-time ke Live Console client
-        """
-        novel_id = task.novel_id
-        trial_cfg = TokenManager.get_pricing_config().get("free_trial", {})
-        target_accounts = int(task.config.get("accounts_count") or trial_cfg.get("accounts_count", 5))
-        do_like = bool(task.config.get("do_like", trial_cfg.get("do_like", True)))
-        do_follow = bool(task.config.get("do_follow", trial_cfg.get("do_follow", True)))
+    async def _execute_single_reader_session(
+        cls,
+        task: WebTask,
+        term_id: int,
+        account_data: Dict[str, Any],
+        proxy_url: str
+    ) -> bool:
+        """Mengeksekusi pembacaan bab oleh Akun Valid dengan engine StealthApiClient resmi Android."""
+        email = account_data["email"]
+        nickname = account_data.get("nickname") or email.split("@")[0]
+        country = account_data.get("country", "ID")
 
-        all_candidates = cls.get_token_account_allocation("FREE_TRIAL", count=9999)
-        if not all_candidates:
-            all_candidates = cls.load_accounts()
+        await task.emit_log(f"👤 Memulai sesi: {nickname} ({email}) | Asal: {country} | Proxy: {proxy_url.split('@')[-1]}", "info", term_id)
 
-        fresh_accounts, _ = AccountHistoryManager.filter_fresh_accounts(all_candidates, novel_id)
-        if not fresh_accounts:
-            fresh_accounts = all_candidates
-
-        if not fresh_accounts:
-            await task.emit_log("Pool akun server sedang tidak tersedia untuk Free Trial. Hubungi Admin.", level="error")
-            return
-
-        task.stats["accounts_total"] = min(target_accounts, len(fresh_accounts))
-        await task.emit_log(
-            f"🎁 Menjalankan Free Trial: Target {target_accounts} Akun Resmi | "
-            f"Suka (Like): {'Ya' if do_like else 'Tidak'} | Ikuti (Follow): {'Ya' if do_follow else 'Tidak'}",
-            level="info"
+        # Inisialisasi StealthApiClient resmi Android
+        profile = ProfileGenerator.generate_profile(country=country)
+        bot = StealthApiClient(
+            profile=profile,
+            access_token=account_data.get("access_token"),
+            refresh_token=account_data.get("refresh_token"),
+            current_proxy=proxy_url,
+            account_data=account_data,
         )
 
-        proxy_mgr = default_proxy_manager
-        author_pid = (task.novel_info or {}).get("author_profile_id") or (task.novel_info or {}).get("author_id")
+        try:
+            # 1. Pastikan sesi aktif & token valid (auto refresh jika kedaluwarsa)
+            is_active = await bot.ensure_active_session()
+            if not is_active:
+                await task.emit_log("Gagal verifikasi login akun. Melewati akun ini.", "warn", term_id)
+                return False
 
-        successful_count = 0
-        for idx, acc in enumerate(fresh_accounts, 1):
-            if task.is_cancelled or successful_count >= target_accounts:
-                break
+            # Update token jika baru
+            if bot.access_token != account_data.get("access_token"):
+                AccountPoolManager.update_account_tokens(email, bot.access_token, bot.refresh_token or "")
 
-            curr_worker = successful_count + 1
-            acc_data = dict(acc)
-            sess_id = f"trial_{curr_worker}_{secrets.token_hex(2)}"
-            proxy_url = proxy_mgr.acquire_proxy_slot(session_id=sess_id) if (proxy_mgr and proxy_mgr.has_proxies) else None
-
-            session = MemberReaderSession(
-                worker_id=f"TRIAL-{curr_worker:02d}",
-                account_data=acc_data,
-                novel_title=task.novel_info.get("title", "Novel"),
-                proxy=proxy_url,
-                proxy_manager=proxy_mgr,
-            )
-
+            # Klaim benefit Q harian akun jika belum
             try:
-                client = await session.get_client()
-                email_raw = acc.get("email", f"akun_{idx}")
-                if "@" in email_raw:
-                    name_p, dom_p = email_raw.split("@", 1)
-                    email_masked = f"{name_p[:3]}***@{dom_p}"
-                else:
-                    email_masked = f"{email_raw[:5]}***"
+                await bot.claim_daily_q()
+            except Exception:
+                pass
 
-                await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil Login.", level="info")
+            # 2. Ambil daftar bab novel
+            chapters = await bot.get_novel_chapters(task.novel_id)
+            if not chapters:
+                await task.emit_log("Gagal memuat daftar bab novel.", "error", term_id)
+                return False
 
-                # Like Novel
-                if do_like:
-                    try:
-                        r_like = await client.post(f"/api/v1/novels/{novel_id}/like")
-                        if r_like.status_code == 200:
-                            task.stats["likes"] += 1
-                            AccountHistoryManager.record_interaction(acc_data, novel_id, liked=True)
-                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil menyukai (Like) novel.", level="info")
-                        else:
-                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Respon Like server: HTTP {r_like.status_code}", level="warning")
-                    except Exception as e_lk:
-                        await task.emit_log(f"[{curr_worker}/{target_accounts}] Catatan Like: {e_lk}", level="warning")
+            total_avail = len(chapters)
+            read_target = min(task.max_chapters, total_avail)
 
-                await asyncio.sleep(0.5)
-
-                # Follow Author
-                if do_follow and author_pid:
-                    try:
-                        r_fol = await client.put(f"/api/v1/social/profiles/{author_pid}/follow")
-                        if r_fol.status_code in (200, 204):
-                            task.stats["follows"] += 1
-                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun {email_masked} berhasil mengikuti (Follow) penulis.", level="info")
-                        else:
-                            await task.emit_log(f"[{curr_worker}/{target_accounts}] Respon Follow server: HTTP {r_fol.status_code}", level="warning")
-                    except Exception as e_fl:
-                        await task.emit_log(f"[{curr_worker}/{target_accounts}] Catatan Follow: {e_fl}", level="warning")
-
-                successful_count += 1
-                task.stats["accounts_done"] = successful_count
-                await task.emit_stats()
-                if proxy_url and proxy_mgr:
-                    proxy_mgr.mark_used(proxy_url)
-
-            except Exception as exc:
-                await task.emit_log(f"[{curr_worker}/{target_accounts}] Akun gagal menjalankan sesi trial: {exc}", level="warning")
-            finally:
-                if proxy_url and proxy_mgr:
-                    proxy_mgr.release_proxy_slot(proxy_url)
+            # 2a. Kamuflase Organik (Discovery Trail & Anti-Fingerprinting)
+            # Membaca novel populer lain acak agar akun tidak di-flag bot karena hanya membaca 1 novel terus-menerus
+            if random.random() < 0.65:
+                camo_list = [
+                    ("VqQK9b6Z99bEvYnG", "Billionaire's Secret Bride"),
+                    ("kpQJ0dNk7V8eLOvE", "Moonlight Shadow in the Dark"),
+                    ("DXMVyb8jKjevAZEJ", "Silent Promises to You"),
+                    ("kQWjnegmEDbwZ1p0", "Destined to Reign with Him"),
+                ]
+                c_id, c_title = random.choice(camo_list)
+                c_delay = random.uniform(15.0, 28.0)
+                await task.emit_log(
+                    f"🎭 [Kamuflase Organik] Membaca Bab 1 novel acak '{c_title}' ({int(c_delay)} detik) agar riwayat akun memiliki jejak perilaku wajar dan tidak dicurigai bot oleh algoritma Quarterfull.",
+                    "info", term_id
+                )
                 try:
-                    await session.close()
+                    await bot.send_reading_telemetry(novel_id=c_id, chapter_id="camo_head", chapter_num=1, reading_time_sec=c_delay, depth_percent=100, completed=True)
                 except Exception:
                     pass
+                
+                spent_camo = 0.0
+                while spent_camo < c_delay:
+                    if not task.is_running or task.is_cancelled:
+                        return False
+                    step = min(4.0, c_delay - spent_camo)
+                    await asyncio.sleep(step)
+                    spent_camo += step
 
-            await asyncio.sleep(1.0)
+            await task.emit_log(f"📖 [Target Novel] Memulai pembacaan {read_target} bab novel '{task.novel_title[:30]}'...", "info", term_id)
 
-        if successful_count >= target_accounts:
-            await task.emit_log(
-                f"🎉 Free Trial Berhasil! {successful_count} Akun telah selesai Login, Memberi Like, & Follow Penulis.",
-                level="success"
-            )
-        else:
-            await task.emit_log(
-                f"Free Trial selesai: {successful_count}/{target_accounts} akun berhasil diproses.",
-                level="info"
-            )
+            # 3. Interaksi Sosial (HANYA 1X per novel/author seumur hidup)
+            # Cek apakah akun ini pernah like
+            if not AccountPoolManager.has_performed_action(email, task.novel_id, "LIKE"):
+                if random.random() < 0.70:
+                    liked = await bot.like_novel(task.novel_id)
+                    if liked:
+                        AccountPoolManager.record_action(email, task.novel_id, task.author_id, "LIKE")
+                        task.stats["likes"] += 1
+                        await task.emit_log(f"❤️ [Interaksi Like] Menyukai novel '{task.novel_title[:25]}' untuk menaikkan skor engagement & ranking buku di feed rekomendasi.", "info", term_id)
 
+            # Cek apakah akun ini pernah bookmark (simpan rak buku)
+            if not AccountPoolManager.has_performed_action(email, task.novel_id, "BOOKMARK"):
+                if random.random() < 0.65:
+                    bmed = await bot.bookmark_novel(task.novel_id)
+                    if bmed:
+                        AccountPoolManager.record_action(email, task.novel_id, task.author_id, "BOOKMARK")
+                        task.stats["bookmarks"] += 1
+                        await task.emit_log(f"🔖 [Interaksi Simpan] Menyimpan novel ke Rak Buku pembaca untuk memperkuat retensi pembaca novel.", "info", term_id)
+
+            # Cek apakah akun ini pernah follow author
+            if task.author_id and not AccountPoolManager.has_performed_action(email, task.author_id, "FOLLOW"):
+                if random.random() < 0.40:
+                    fllwd = await bot.follow_author(task.author_id)
+                    if fllwd:
+                        AccountPoolManager.record_action(email, task.novel_id, task.author_id, "FOLLOW")
+                        task.stats["follows"] += 1
+                        await task.emit_log(f"➕ [Interaksi Follow] Mengikuti akun penulis untuk meningkatkan jumlah pengikut resmi author.", "info", term_id)
+
+            total_read_seconds = 0
+            simulator = ReadingSimulator()
+
+            # 4. Loop Membaca Bab dengan Timing Manusia (140s+ per bab)
+            for idx in range(read_target):
+                if not task.is_running or task.is_cancelled:
+                    return False
+
+                ch = chapters[idx]
+                ch_id = ch.get("id") or ch.get("hash_id")
+                ch_num = idx + 1
+
+                # Ambil teks isi bab jika tersedia untuk estimasi kata nyata (WPM)
+                ch_detail = await bot.get_chapter_detail(task.novel_id, ch_id)
+                content = ch_detail.get("content", "") if ch_detail else ""
+                delay_sec, pace_pct = simulator.calculate_reading_duration(content)
+                # Pastikan minimal batas anti-fraud task.reading_delay (default 140s)
+                delay_sec = max(delay_sec, task.reading_delay)
+
+                pace_info = f" ({'+' if pace_pct > 0 else ''}{pace_pct}% vs sebelumnya)" if pace_pct != 0 else ""
+                await task.emit_log(f"📖 Membaca Bab {ch_num}/{read_target} (Durasi: {int(delay_sec)} detik{pace_info} | Standar WPM Manusia)...", "info", term_id)
+
+                # Simulasi progres membaca bertahap (kuadran 25%, 50%, 75%, 100%)
+                spent = 0.0
+                milestones = [25, 50, 75, 100]
+                m_idx = 0
+                while spent < delay_sec:
+                    if not task.is_running or task.is_cancelled:
+                        return False
+                    step = min(5.0, delay_sec - spent)
+                    await asyncio.sleep(step)
+                    spent += step
+                    pct = int((spent / delay_sec) * 100)
+                    if m_idx < len(milestones) and pct >= milestones[m_idx]:
+                        # Kirim telemetri royalti resmi (Post-view log, Heartbeat, dan Analytics)
+                        await bot.send_reading_telemetry(
+                            novel_id=task.novel_id,
+                            chapter_id=ch_id,
+                            chapter_num=ch_num,
+                            reading_time_sec=spent,
+                            depth_percent=milestones[m_idx],
+                            completed=(milestones[m_idx] == 100)
+                        )
+                        m_idx += 1
+
+                total_read_seconds += int(delay_sec)
+                task.stats["chapters_read"] += 1
+                await task.emit_log(f"✔️ Bab {ch_num}/{read_target} selesai dibaca secara sah ({int(delay_sec)}s).", "debug", term_id)
+                await task.emit_stats()
+
+                # Jeda manusiawi antar bab (5 - 12 detik)
+                if idx < read_target - 1:
+                    await asyncio.sleep(random.uniform(5.0, 12.0))
+
+            # Catat durasi baca ke profil akun
+            AccountPoolManager.update_reading_progress(email, total_read_seconds)
+            ProxyPoolManager.report_success(proxy_url)
+            return True
+
+        except Exception as e:
+            logger.error(f"Error sesi pembaca {email}: {e}")
+            ProxyPoolManager.report_failure(proxy_url, str(e))
+            return False
+        finally:
+            await bot.close()
+
+    @classmethod
+    async def _execute_guest_reader_session(
+        cls,
+        task: WebTask,
+        term_id: int,
+        proxy_url: str
+    ) -> bool:
+        """
+        Mengeksekusi sesi pembaca tamu anonim (Guest Reader) sesuai standar resmi Android Quarterfull:
+        1. Emulasi Device Android & Cold-Start Handshake (/api/auth/app-version, /api/auth/flags)
+        2. Inisiasi Sesi Tamu Resmi (/api/guest-reading/session) & penanaman cookie qf_guest_reader
+        3. Membaca detail & sinopsis novel target (12-20s)
+        4. Membaca 1 - 2 bab gratis dengan standar WPM manusia (35 - 75s per bab)
+        5. Mengirimkan telemetri resmi guest progress (PUT /api/guest-reading/progress) bertahap
+        """
+        clean_proxy = proxy_url.split("@")[-1]
+        await task.emit_log(f"🌐 [Mode Tamu] Membuka sesi Android Guest resmi via Proxy: {clean_proxy}...", "info", term_id)
+
+        profile = ProfileGenerator.generate_profile()
+        bot = StealthApiClient(profile=profile, current_proxy=proxy_url)
+
+        try:
+            # 1. Inisiasi sesi tamu resmi (Cold Start Android)
+            await task.emit_log("📲 [Mode Tamu] Menjalankan Cold-Start Android & inisiasi sesi tamu resmi (/api/guest-reading/session)...", "debug", term_id)
+            ok, msg = await bot.init_guest_session()
+            if not ok:
+                await task.emit_log(f"⚠️ Gagal inisiasi tamu via proxy ini: {msg}. Melewati...", "warn", term_id)
+                ProxyPoolManager.report_failure(proxy_url, msg)
+                return False
+
+            await task.emit_log("✓ Sesi tamu aktif & Cookie resmi qf_guest_reader terpasang.", "debug", term_id)
+
+            # 2. Buka novel target & baca sinopsis layaknya pengunjung baru
+            novel_info = await bot.get_novel_detail(task.novel_id)
+            title = novel_info.get("title", task.novel_title) if novel_info else task.novel_title
+            syn_time = random.uniform(12.0, 20.0)
+            await task.emit_log(f"👀 [Mode Tamu] Membuka halaman novel '{title[:30]}' & membaca sinopsis ({int(syn_time)}s)...", "info", term_id)
+
+            spent = 0.0
+            while spent < syn_time:
+                if not task.is_running or task.is_cancelled:
+                    return False
+                step = min(4.0, syn_time - spent)
+                await asyncio.sleep(step)
+                spent += step
+
+            # 3. Ambil daftar bab novel
+            chapters = await bot.get_novel_chapters(task.novel_id)
+            if not chapters:
+                await task.emit_log("⚠️ Gagal memuat bab novel target.", "warn", term_id)
+                return False
+
+            # Tamu membaca 1 - 2 bab gratis (perilaku alami pengunjung anonim sebelum drop-off)
+            num_guest_chapters = min(len(chapters), random.choice([1, 2]))
+            simulator = ReadingSimulator(min_wpm=220, max_wpm=320)  # Skimming / reading speed wajar
+
+            for idx in range(num_guest_chapters):
+                if not task.is_running or task.is_cancelled:
+                    return False
+
+                ch = chapters[idx]
+                ch_id = ch.get("id") or ch.get("hash_id")
+                ch_num = idx + 1
+                ch_title = ch.get("title", f"Bab {ch_num}")
+
+                # Ambil teks isi bab jika ada
+                ch_detail = await bot.get_chapter_detail(task.novel_id, ch_id)
+                content = ch_detail.get("content", "") if ch_detail else ""
+
+                # Hitung durasi baca wajar (skimming tamu: 35s - 75s per bab)
+                words = simulator.estimate_effective_words(content)
+                calc_duration = (words / random.uniform(240, 320)) * 60.0
+                read_duration = max(35.0, min(calc_duration, 75.0))
+
+                await task.emit_log(f"📖 [Mode Tamu] Membaca Bab {ch_num} '{ch_title[:20]}' ({int(read_duration)}s | WPM Skimming Pengunjung)...", "info", term_id)
+
+                # Progress ticks bertahap ke /api/guest-reading/progress
+                spent = 0.0
+                milestones = [30, 60, 100]
+                m_idx = 0
+                while spent < read_duration:
+                    if not task.is_running or task.is_cancelled:
+                        return False
+                    step = min(4.0, read_duration - spent)
+                    await asyncio.sleep(step)
+                    spent += step
+                    pct = int((spent / read_duration) * 100)
+                    if m_idx < len(milestones) and pct >= milestones[m_idx]:
+                        is_last = (milestones[m_idx] == 100)
+                        await bot.send_guest_progress(
+                            novel_id=task.novel_id,
+                            chapter_id=ch_id,
+                            active_reading_seconds=spent,
+                            scroll_percent=milestones[m_idx] / 100.0,
+                            completed=is_last
+                        )
+                        m_idx += 1
+
+                task.stats["chapters_read"] += 1
+                await task.emit_log(f"✔️ [Mode Tamu] Selesai membaca Bab {ch_num} ({int(read_duration)}s).", "debug", term_id)
+                await task.emit_stats()
+
+                # Jeda sejenak antar bab tamu jika membaca bab ke-2
+                if idx < num_guest_chapters - 1:
+                    await asyncio.sleep(random.uniform(4.0, 8.0))
+
+            # 4. FASE ADDON KONVERSI KE MEMBER RESMI (JIKA DIAKTIFKAN USER)
+            if task.addon_guest_conversion and task.is_running and not task.is_cancelled:
+                await task.emit_log("🔄 [Addon Konversi] Memulai alur konversi organik: Tamu ➔ Member Terdaftar...", "info", term_id)
+                verifier = TempTfVerifier()
+                
+                temp_email = None
+                for _ in range(5):
+                    prov = random.choice(["outlook", "hotmail", "gmail"])
+                    cand = await verifier.get_email(provider=prov, use_dot=(prov == "gmail"), use_plus=(prov != "gmail"))
+                    if cand:
+                        cand = format_natural_email(cand)
+                        temp_email = cand.lower()
+                        break
+                    await asyncio.sleep(0.5)
+
+                if temp_email:
+                    bot.profile.email = temp_email
+                    bot.profile.password = ProfileGenerator.generate_password()
+                    await task.emit_log(f"📲 [Addon Konversi] Mendaftarkan akun resmi Android dari sesi ini: {temp_email}...", "info", term_id)
+
+                    signup_ok, signup_msg = await bot.perform_organic_signup()
+                    if signup_ok:
+                        await task.emit_log(f"✉️ [Addon Konversi] Memicu kode verifikasi email untuk {temp_email}...", "debug", term_id)
+                        send_ok, send_msg = await bot.send_email_verification()
+                        if send_ok:
+                            def on_otp_poll_log(msg: str):
+                                asyncio.create_task(task.emit_log(f"⏳ [OTP Polling] {msg}", "debug", term_id))
+
+                            otp_code = await verifier.poll_for_otp(temp_email, timeout_sec=75, interval_sec=3, log_callback=on_otp_poll_log)
+                            if otp_code:
+                                v_ok, v_msg = await bot.verify_email_code(otp_code)
+                                if v_ok:
+                                    task.stats["converted_accounts"] = task.stats.get("converted_accounts", 0) + 1
+                                    await task.emit_log(f"🎉 [KONVERSI SUKSES] Akun resmi terverifikasi: {temp_email} (Kode OTP: {otp_code})!", "success", term_id)
+                                    
+                                    # Simpan ke AccountPoolManager dan database
+                                    acc_data = {
+                                        "email": bot.profile.email,
+                                        "password": bot.profile.password,
+                                        "nickname": bot.profile.nickname,
+                                        "access_token": bot.access_token,
+                                        "refresh_token": bot.refresh_token,
+                                        "country": bot.profile.country,
+                                        "device_id": bot.profile.device_id,
+                                        "anonymous_id": bot.profile.anonymous_id,
+                                        "user_agent": bot.profile.user_agent,
+                                    }
+                                    AccountPoolManager.add_or_update_account(acc_data)
+
+                                    # Klaim koin Q harian pertama
+                                    try:
+                                        await bot.claim_daily_q()
+                                    except Exception:
+                                        pass
+
+                                    # Interaksi Sosial Member (Like, Simpan Rak, Follow Penulis)
+                                    if random.random() < 0.70:
+                                        liked = await bot.like_novel(task.novel_id)
+                                        if liked:
+                                            AccountPoolManager.record_action(temp_email, task.novel_id, task.author_id, "LIKE")
+                                            task.stats["likes"] += 1
+                                            await task.emit_log(f"❤️ [Interaksi Member] Menyukai novel '{task.novel_title[:25]}' sebagai akun terdaftar.", "info", term_id)
+
+                                    if random.random() < 0.65:
+                                        bmed = await bot.bookmark_novel(task.novel_id)
+                                        if bmed:
+                                            AccountPoolManager.record_action(temp_email, task.novel_id, task.author_id, "BOOKMARK")
+                                            task.stats["bookmarks"] += 1
+                                            await task.emit_log(f"🔖 [Interaksi Member] Menyimpan novel ke Rak Buku akun terdaftar.", "info", term_id)
+
+                                    if task.author_id and random.random() < 0.40:
+                                        fllwd = await bot.follow_author(task.author_id)
+                                        if fllwd:
+                                            AccountPoolManager.record_action(temp_email, task.novel_id, task.author_id, "FOLLOW")
+                                            task.stats["follows"] += 1
+                                            await task.emit_log(f"➕ [Interaksi Member] Mengikuti akun penulis sebagai member terdaftar.", "info", term_id)
+
+                                    # Lanjut membaca 1 bab tambahan sebagai Member terdaftar dengan telemetri royalti
+                                    if len(chapters) > num_guest_chapters:
+                                        m_idx = num_guest_chapters
+                                        m_ch = chapters[m_idx]
+                                        m_ch_id = m_ch.get("id") or m_ch.get("hash_id")
+                                        m_ch_num = m_idx + 1
+                                        m_delay = random.uniform(30.0, 50.0)
+                                        await task.emit_log(f"📖 [Member Telemetry] Membaca Bab {m_ch_num} sebagai Member ({int(m_delay)}s | Payout Royalty Log)...", "info", term_id)
+                                        await bot.send_reading_telemetry(
+                                            novel_id=task.novel_id,
+                                            chapter_id=m_ch_id,
+                                            chapter_num=m_ch_num,
+                                            reading_time_sec=m_delay,
+                                            depth_percent=100,
+                                            completed=True
+                                        )
+                                        await asyncio.sleep(min(15.0, m_delay))
+                                        task.stats["chapters_read"] += 1
+                                        AccountPoolManager.record_action(temp_email, task.novel_id, task.author_id, "READ_VALID")
+
+                                    await task.emit_stats()
+                                else:
+                                    await task.emit_log(f"⚠️ Kode OTP ditolak server: {v_msg}", "warn", term_id)
+                            else:
+                                await task.emit_log("⚠️ Timeout: OTP tidak diterima dalam batas waktu. Melewati konversi.", "warn", term_id)
+                        else:
+                            await task.emit_log(f"⚠️ Gagal mengirim verifikasi email: {send_msg}", "warn", term_id)
+                    else:
+                        await task.emit_log(f"⚠️ Registrasi gagal: {signup_msg}", "warn", term_id)
+
+            ProxyPoolManager.report_success(proxy_url)
+            return True
+
+        except Exception as e:
+            logger.warning(f"Error sesi tamu: {e}")
+            ProxyPoolManager.report_failure(proxy_url, str(e))
+            return False
+        finally:
+            await bot.close()

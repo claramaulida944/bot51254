@@ -10,6 +10,7 @@ Menghilangkan pola robotik:
 import asyncio
 import math
 import random
+import re
 import time
 from typing import Callable, List, Optional, Tuple
 
@@ -25,16 +26,37 @@ class ReadingSimulator:
         self.last_reading_time_sec: Optional[float] = None
         self.chapters_read_count: int = 0
 
+    def estimate_effective_words(self, chapter_text: str) -> int:
+        """
+        Menghitung estimasi kata secara cerdas lintas bahasa:
+        - Bahasa Latin & Korea: memiliki spasi antar kata.
+        - Bahasa Jepang (Kanji/Hiragana/Katakana) & Mandarin: tidak memakai spasi.
+          Rata-rata kecepatan baca Jepang adalah 400 - 600 karakter/menit (setara 200 WPM, ~2.5 char/kata).
+        """
+        if not chapter_text:
+            return 800
+
+        cjk_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', chapter_text))
+        if cjk_chars > 80:
+            # Teks Jepang / CJK
+            equivalent_words = int(cjk_chars / 2.5)
+            latin_words = len(re.findall(r'[a-zA-Z0-9]+', chapter_text))
+            return max(equivalent_words + latin_words, 700)
+
+        # Latin / Korea
+        words = len(chapter_text.split())
+        return max(words, 600)
+
     def calculate_reading_duration(self, chapter_text: str) -> Tuple[float, float]:
         """
         Menghitung durasi membaca realistis:
-        - Menghitung jumlah kata nyata dari teks bab.
+        - Menghitung jumlah kata nyata/ekuivalen dari teks bab.
         - Menerapkan WPM acak dalam rentang normal manusia (175 - 250 WPM).
-        - Menambahkan variasi jitter mikro (gangguan konsentrasi / jeda paragraf).
+        - Menambahkan variasi jitter mikro.
+        - Memastikan batas aman anti-fraud (minimal 2.5 menit / 150 detik per bab penuh).
         - Mengembalikan: (durasi_detik, pace_change_pct)
         """
-        words = len(chapter_text.split()) if chapter_text else 350
-        words = max(words, 150)  # Minimal 150 kata jika teks kosong/sangat pendek
+        words = self.estimate_effective_words(chapter_text)
 
         # Pilih base WPM acak per bab (manusia membaca tidak pernah berkecepatan konstan)
         base_wpm = random.uniform(self.min_wpm, self.max_wpm)
@@ -46,9 +68,11 @@ class ReadingSimulator:
         # Durasi dasar (menit -> detik)
         duration_sec = (words / effective_wpm) * 60.0
 
-        # Tambahkan jeda awal buka bab & jeda akhir bab (2 - 5 detik)
-        prep_delay = random.uniform(2.0, 5.0)
-        total_duration = max(duration_sec + prep_delay, 12.0)
+        # Tambahkan jeda awal buka bab & jeda akhir bab (3 - 6 detik)
+        prep_delay = random.uniform(3.0, 6.0)
+        # Batas aman: Minimal 140s (2.3 menit) agar lolos anti-fraud, maksimal 360s (6 menit) agar efisien
+        calc_dur = duration_sec + prep_delay
+        total_duration = max(min(calc_dur, 360.0), 140.0)
 
         # Hitung perubahan kecepatan dibanding bab sebelumnya (pace_change_pct)
         pace_change_pct = 0.0

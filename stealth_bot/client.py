@@ -11,7 +11,7 @@ import logging
 import random
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -40,19 +40,23 @@ class StealthApiClient:
 
     def __init__(
         self,
-        profile: AccountProfile,
+        profile: Optional[AccountProfile] = None,
         access_token: Optional[str] = None,
         refresh_token: Optional[str] = None,
         proxy_manager: Optional[StealthProxyManager] = None,
         current_proxy: Optional[str] = None,
+        account_data: Optional[Dict[str, Any]] = None,
+        save_account_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
-        self.profile = profile
+        self.profile = profile or ProfileGenerator.generate_profile()
         self.access_token = access_token or ""
         self.refresh_token = refresh_token or ""
         self.guest_id: Optional[str] = None
         self.guest_token: Optional[str] = None
         self.proxy_manager = proxy_manager or default_proxy_manager
         self.current_proxy = current_proxy
+        self.account_data = account_data
+        self.save_account_cb = save_account_cb
         self.session_id = ProfileGenerator.generate_session_id()
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -102,7 +106,7 @@ class StealthApiClient:
 
             client_kwargs: Dict[str, Any] = {
                 "base_url": BASE_URL,
-                "timeout": httpx.Timeout(20.0, connect=3.5, read=15.0),
+                "timeout": httpx.Timeout(30.0, connect=8.0, read=20.0),
                 "headers": self.get_headers(),
                 "http2": False if self.current_proxy else True,
             }
@@ -142,6 +146,277 @@ class StealthApiClient:
             return resp.status_code == 200
         except Exception:
             return True
+
+    async def refresh_access_token(self) -> bool:
+        """Memperbarui access_token menggunakan refresh_token."""
+        if not self.refresh_token:
+            return False
+        try:
+            headers = self.get_headers()
+            headers.pop("authorization", None)
+            kwargs: Dict[str, Any] = {
+                "base_url": BASE_URL,
+                "timeout": httpx.Timeout(15.0),
+                "headers": headers,
+                "http2": False if self.current_proxy else True,
+            }
+            if self.current_proxy:
+                kwargs["proxy"] = self.current_proxy
+
+            async with httpx.AsyncClient(**kwargs) as client:
+                resp = await client.post(
+                    "/api/auth/token/refresh",
+                    json={"refresh_token": self.refresh_token},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_acc = data.get("access_token")
+                    new_ref = data.get("refresh_token")
+                    if new_acc:
+                        self.access_token = new_acc
+                        if new_ref:
+                            self.refresh_token = new_ref
+                        if self._client and not self._client.is_closed:
+                            await self._client.aclose()
+                        self._client = None
+                        if self.account_data:
+                            self.account_data["access_token"] = new_acc
+                            if new_ref:
+                                self.account_data["refresh_token"] = new_ref
+                            if self.save_account_cb:
+                                self.save_account_cb(self.account_data)
+                        logger.info("Access token berhasil diperbarui otomatis via refresh_token.")
+                        return True
+        except Exception as exc:
+            logger.debug("Gagal refresh_access_token: %s", exc)
+        return False
+
+    async def relogin_with_password(self) -> bool:
+        """Melakukan login ulang penuh menggunakan email & password akun."""
+        email = getattr(self.profile, "email", "") or (self.account_data.get("email", "") if self.account_data else "")
+        password = getattr(self.profile, "password", "") or (self.account_data.get("password", "") if self.account_data else "")
+        if not email or not password:
+            return False
+        try:
+            headers = self.get_headers()
+            headers.pop("authorization", None)
+            kwargs: Dict[str, Any] = {
+                "base_url": BASE_URL,
+                "timeout": httpx.Timeout(15.0),
+                "headers": headers,
+                "http2": False if self.current_proxy else True,
+            }
+            if self.current_proxy:
+                kwargs["proxy"] = self.current_proxy
+
+            async with httpx.AsyncClient(**kwargs) as client:
+                resp = await client.post(
+                    "/api/auth/login",
+                    json={"login_id": email, "password": password},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_acc = data.get("access_token")
+                    new_ref = data.get("refresh_token")
+                    if new_acc:
+                        self.access_token = new_acc
+                        if new_ref:
+                            self.refresh_token = new_ref
+                        if self._client and not self._client.is_closed:
+                            await self._client.aclose()
+                        self._client = None
+                        if self.account_data:
+                            self.account_data["access_token"] = new_acc
+                            if new_ref:
+                                self.account_data["refresh_token"] = new_ref
+                            if self.save_account_cb:
+                                self.save_account_cb(self.account_data)
+                        logger.info("Login ulang berhasil untuk %s.", email)
+                        return True
+        except Exception as exc:
+            logger.debug("Gagal relogin_with_password: %s", exc)
+        return False
+
+    async def ensure_active_session(self, max_attempts: int = 3) -> bool:
+        """Memastikan token masih aktif; jika kedaluwarsa, lakukan refresh atau relogin otomatis dengan auto-rotate proxy."""
+        for attempt in range(1, max_attempts + 1):
+            if not self.access_token:
+                ok = await self.relogin_with_password()
+                if ok:
+                    return True
+                if attempt < max_attempts:
+                    await self.rotate_proxy_if_needed("relogin without token failed")
+                    continue
+                return False
+
+            try:
+                client = await self.get_client()
+                r = await client.get("/api/q/account")
+                if r.status_code == 200:
+                    return True
+                if r.status_code in (401, 403):
+                    logger.info("Token kedaluwarsa (HTTP %d). Memperbarui sesi...", r.status_code)
+                    if await self.refresh_access_token():
+                        return True
+                    if await self.relogin_with_password():
+                        return True
+                    return False
+                elif r.status_code in (429, 502, 503, 504):
+                    await self.rotate_proxy_if_needed(f"HTTP {r.status_code}")
+                    continue
+            except Exception as exc:
+                logger.debug("Koneksi gagal pada ensure_active_session (%s). Rotasi proxy (%d/%d)...", exc, attempt, max_attempts)
+                await self.rotate_proxy_if_needed(exc)
+                continue
+
+        return False
+
+    async def update_nickname(self, new_nickname: str) -> Tuple[bool, str]:
+        """
+        Mengubah nama pengguna (nickname) akun di API server (/api/auth/profile).
+        """
+        # Selalu pastikan sesi aktif (refresh token jika expired)
+        try:
+            ok = await self.ensure_active_session()
+            if not ok:
+                return False, "Gagal refresh token / login ulang"
+        except Exception as exc:
+            return False, f"Session error: {exc}"
+
+        try:
+            client = await self.get_client()
+            resp = await client.patch(
+                "/api/auth/profile",
+                json={"nickname": new_nickname.strip()},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                final_nick = data.get("nickname") or new_nickname.strip()
+                self.profile.nickname = final_nick
+                if self.account_data:
+                    self.account_data["nickname"] = final_nick
+                    if self.save_account_cb:
+                        self.save_account_cb(self.account_data)
+                return True, final_nick
+            # Ambil detail error dari response body
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("message") or err_body.get("detail") or resp.text[:120]
+            except Exception:
+                err_msg = resp.text[:120] if resp.text else "(empty response)"
+            return False, f"HTTP {resp.status_code}: {err_msg}"
+        except Exception as exc:
+            return False, str(exc)
+
+    async def claim_daily_q(self, log_func=None) -> Dict[str, Any]:
+        """
+        Mengklaim benefit / Q harian akun secara otomatis (1x per hari).
+        - Menjalankan reader-report touch & bookstore exposure.
+        - Memanggil /api/q/summary?fresh=true untuk membaca misi aktif.
+        - Mengklaim misi 'attend' (Daily Attendance bernilai 1000 Q) dan misi selesai lainnya.
+        - Menyimpan riwayat tanggal klaim dan saldo ke data akun.
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        # Jika sudah klaim hari ini dan saldo > 0, skip
+        if self.account_data and self.account_data.get("last_q_claim_date") == today and self.account_data.get("q_balance", 0) > 0:
+            if log_func:
+                log_func(f"[dim]Klaim Q harian sudah dilakukan hari ini ({today}) - Saldo: {self.account_data.get('q_balance', 0)} Q.[/]")
+            return {"status": "already_claimed", "date": today, "balance": self.account_data.get("q_balance", 0)}
+
+        ok = await self.ensure_active_session()
+        if not ok:
+            if log_func:
+                log_func("[bold red]✗ Gagal verifikasi sesi / login akun[/]")
+            return {"status": "error", "message": "Session inactive", "balance": 0, "earned": 0}
+
+        client = await self.get_client()
+
+        # 1. Pemicu telemetri kunjungan & exposure (persis aplikasi resmi)
+        try:
+            await client.post("/api/v1/reader-report/visits/touch")
+        except Exception:
+            pass
+
+        try:
+            await client.post("/api/v1/reader-report/exposure/claim", json={"surface": "bookstore"})
+        except Exception:
+            pass
+
+        # 2. Ambil ringkasan misi Q aktif & saldo awal
+        initial_balance = 0
+        missions = []
+        try:
+            summary_r = await client.get("/api/q/summary?fresh=true")
+            if summary_r.status_code == 200:
+                s_data = summary_r.json()
+                initial_balance = s_data.get("balance", 0)
+                missions = s_data.get("missions", [])
+            else:
+                bal_r = await client.get("/api/q/account")
+                if bal_r.status_code == 200:
+                    initial_balance = bal_r.json().get("balance", 0)
+        except Exception:
+            pass
+
+        # 3. Klaim misi Daily Attendance (attend = 1000 Q) dan misi lain yang sudah siap
+        claimed_any = False
+        granted_total = 0
+        final_balance = initial_balance
+
+        attend_mission = next((m for m in missions if m.get("id") == "attend"), None)
+        # Jika belum diklaim atau attend_mission tidak terdeteksi spesifik, klaim attend
+        if attend_mission is None or not attend_mission.get("claimed", False):
+            try:
+                claim_r = await client.post("/api/q/claim", json={"missionId": "attend"})
+                if claim_r.status_code == 200:
+                    c_data = claim_r.json()
+                    granted = c_data.get("granted", 0)
+                    granted_total += granted
+                    final_balance = c_data.get("balance", final_balance + granted)
+                    claimed_any = True
+            except Exception as exc:
+                logger.debug("Gagal klaim misi attend: %s", exc)
+
+        # Cek dan klaim misi lain yang sudah selesai (progress >= goal)
+        for m in missions:
+            m_id = m.get("id")
+            if m_id != "attend" and not m.get("claimed", False) and m.get("progress", 0) >= m.get("goal", 1):
+                try:
+                    c_r = await client.post("/api/q/claim", json={"missionId": m_id})
+                    if c_r.status_code == 200:
+                        c_data = c_r.json()
+                        granted = c_data.get("granted", 0)
+                        granted_total += granted
+                        final_balance = c_data.get("balance", final_balance + granted)
+                        claimed_any = True
+                except Exception:
+                    pass
+
+        # 4. Sinkronisasi saldo akhir dari /api/q/account
+        try:
+            bal_r2 = await client.get("/api/q/account")
+            if bal_r2.status_code == 200:
+                final_balance = bal_r2.json().get("balance", final_balance)
+        except Exception:
+            pass
+
+        if self.account_data:
+            self.account_data["last_q_claim_date"] = today
+            self.account_data["q_balance"] = final_balance
+            if self.save_account_cb:
+                self.save_account_cb(self.account_data)
+
+        earned = max(granted_total, final_balance - initial_balance)
+        if earned > 0 or claimed_any:
+            msg = f"Klaim Q Sukses! Saldo: {final_balance} Q (+{earned})"
+            if log_func:
+                log_func(f"[bold green]🎁 {msg}[/]")
+            return {"status": "success", "date": today, "balance": final_balance, "earned": earned}
+        else:
+            msg = f"Klaim Q hari ini sudah dilakukan sebelumnya. Saldo: {final_balance} Q (+0)"
+            if log_func:
+                log_func(f"[cyan]ℹ {msg}[/]")
+            return {"status": "already_claimed", "date": today, "balance": final_balance, "earned": 0}
 
     async def perform_organic_signup(self) -> Tuple[bool, str]:
         """
@@ -255,8 +530,9 @@ class StealthApiClient:
             await client.get("/api/reading/novel-last-reads?limit=50")
             await asyncio.sleep(0.3)
             await client.get("/api/v1/categories")
+            await client.post("/api/v1/reader-report/visits/touch")
             await asyncio.sleep(0.3)
-            await client.post("/api/auth/reader-onboarding/eligibility")
+            await client.get("/api/q/summary?fresh=true")
         except Exception:
             pass
 
@@ -323,21 +599,46 @@ class StealthApiClient:
     # PEMBACAAN NOVEL & TELEMETRI AKTIF
     # =========================================================================
 
+    async def get_novel_detail(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """Mengambil metadata novel (sinopsis, cover, author) untuk alur discovery katalog."""
+        for attempt in range(1, 3):
+            try:
+                client = await self.get_client()
+                resp = await client.get(f"/api/v1/novels/{novel_id}")
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+        return None
+
     async def get_novel_chapters(self, novel_id: str) -> List[Dict[str, Any]]:
-        """Mengambil daftar bab novel."""
-        client = await self.get_client()
-        resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("chapters", []) or data.get("items", []) or []
+        """Mengambil daftar bab novel dengan toleransi gangguan proxy."""
+        for attempt in range(1, 4):
+            try:
+                client = await self.get_client()
+                resp = await client.get(f"/api/v1/novels/{novel_id}/chapters?order=asc")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("chapters", []) or data.get("items", []) or []
+            except Exception as exc:
+                await self.rotate_proxy_if_needed(str(exc))
+                if attempt < 3:
+                    await asyncio.sleep(1.0)
         return []
 
     async def get_chapter_detail(self, novel_id: str, chapter_id: str) -> Optional[Dict[str, Any]]:
-        """Mengambil narasi isi teks bab."""
-        client = await self.get_client()
-        resp = await client.get(f"/api/v1/novels/{novel_id}/chapters/{chapter_id}?rewarded_reader=true")
-        if resp.status_code == 200:
-            return resp.json()
+        """Mengambil narasi isi teks bab dengan toleransi gangguan proxy."""
+        for attempt in range(1, 4):
+            try:
+                client = await self.get_client()
+                resp = await client.get(f"/api/v1/novels/{novel_id}/chapters/{chapter_id}?rewarded_reader=true")
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception as exc:
+                await self.rotate_proxy_if_needed(str(exc))
+                if attempt < 3:
+                    await asyncio.sleep(1.0)
         return None
 
     async def send_reading_telemetry(
@@ -442,30 +743,43 @@ class StealthApiClient:
         1. Cek app-version & flags aplikasi layaknya user baru instal.
         2. Kirim POST /api/guest-reading/session.
         3. Simpan guest_id & guest_token ke client headers dan cookies.
+        Dilengkapi multi-proxy auto-retry jika proxy pertama lambat / timeout.
         """
-        client = await self.get_client()
-        try:
-            # 1. Cold Start: app-version & flags
-            await client.get("/api/auth/app-version")
-            await asyncio.sleep(0.3)
-            await client.get("/api/auth/flags")
-            await asyncio.sleep(0.3)
-            await client.get(f"/api/auth/public-flags?anonymous_id={self.profile.anonymous_id}")
-            await asyncio.sleep(0.4)
+        for attempt in range(1, 4):
+            client = await self.get_client()
+            try:
+                # 1. Cold Start: app-version & flags
+                await client.get("/api/auth/app-version")
+                await asyncio.sleep(0.3)
+                await client.get("/api/auth/flags")
+                await asyncio.sleep(0.3)
+                await client.get(f"/api/auth/public-flags?anonymous_id={self.profile.anonymous_id}")
+                await asyncio.sleep(0.4)
 
-            # 2. Inisiasi Sesi Tamu Resmi
-            resp = await client.post("/api/guest-reading/session", content=b"")
-            if resp.status_code == 200:
-                data = resp.json()
-                self.guest_id = data.get("guest_id")
-                self.guest_token = data.get("guest_token") or resp.cookies.get("qf_guest_reader")
-                if self.guest_token:
-                    client.headers["x-guest-token"] = self.guest_token
-                    client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
-                    return True, "Sesi Tamu Berhasil Diinisiasi"
-            return False, f"Server menolak sesi tamu: HTTP {resp.status_code}"
-        except Exception as exc:
-            return False, f"Error inisiasi sesi tamu: {exc}"
+                # 2. Inisiasi Sesi Tamu Resmi
+                resp = await client.post("/api/guest-reading/session", content=b"")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.guest_id = data.get("guest_id")
+                    self.guest_token = data.get("guest_token") or resp.cookies.get("qf_guest_reader")
+                    if self.guest_token:
+                        client.headers["x-guest-token"] = self.guest_token
+                        client.cookies.set("qf_guest_reader", self.guest_token, domain="api.quarterfull.io", path="/")
+                        return True, "Sesi Tamu Berhasil Diinisiasi"
+                elif resp.status_code in (403, 429, 502, 503):
+                    await self.rotate_proxy_if_needed(f"HTTP {resp.status_code}")
+                    await asyncio.sleep(1.0)
+                    continue
+                else:
+                    return False, f"Server menolak sesi tamu: HTTP {resp.status_code}"
+            except Exception as exc:
+                err_msg = str(exc) or exc.__class__.__name__
+                await self.rotate_proxy_if_needed(err_msg)
+                if attempt < 3:
+                    await asyncio.sleep(1.0)
+                    continue
+                return False, f"Error inisiasi sesi tamu ({err_msg})"
+        return False, "Gagal inisiasi tamu setelah 3 percobaan proxy"
 
     async def send_guest_progress(
         self,
@@ -500,3 +814,287 @@ class StealthApiClient:
             await client.put("/api/guest-reading/progress", json=payload, headers=headers)
         except Exception:
             pass
+
+    # =========================================================================
+    # INTERAKSI SOSIAL ORGANIK (LIKE, BOOKMARK / RAK BUKU, FOLLOW PENULIS)
+    # =========================================================================
+
+    async def like_novel(self, novel_id: str) -> bool:
+        """Menyukai (Like) novel target dengan otentikasi akun member."""
+        if not self.access_token:
+            return False
+        try:
+            client = await self.get_client()
+            resp = await client.post(f"/api/v1/novels/{novel_id}/like")
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("is_liked", True):
+                    await asyncio.sleep(0.4)
+                    await client.post(f"/api/v1/novels/{novel_id}/like")
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def bookmark_novel(self, novel_id: str) -> bool:
+        """Menyimpan novel ke rak buku / bookmark / pustaka akun member."""
+        if not self.access_token:
+            return False
+        try:
+            client = await self.get_client()
+            resp = await client.post(f"/api/v1/novels/{novel_id}/bookmark")
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("is_saved", True):
+                    await asyncio.sleep(0.4)
+                    await client.post(f"/api/v1/novels/{novel_id}/bookmark")
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def follow_author(self, author_id: str) -> bool:
+        """Mengikuti (Follow) akun profil penulis novel."""
+        if not self.access_token or not author_id:
+            return False
+        try:
+            client = await self.get_client()
+            resp = await client.put(f"/api/v1/social/profiles/{author_id}/follow")
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("is_following", True):
+                    await asyncio.sleep(0.4)
+                    await client.put(f"/api/v1/social/profiles/{author_id}/follow")
+                return True
+            return resp.status_code in (200, 204)
+        except Exception:
+            pass
+        return False
+
+    async def maybe_engage_socially(
+        self,
+        novel_id: str,
+        author_id: Optional[str] = None,
+        log_func=None,
+    ) -> Dict[str, bool]:
+        """
+        Simulasi pembaca organik yang menyukai cerita ini.
+        ATURAN MUTLAK: Setiap akun cuma boleh Like, Follow, dan Simpen Buku TEPAT SATU KALI.
+        Jika sudah pernah like / follow / simpen novel/author ini sebelumnya, akan di-skip otomatis.
+        """
+        if not self.access_token:
+            return {"liked": False, "bookmarked": False, "followed": False}
+
+        liked_novels = self.account_data.setdefault("liked_novels", []) if self.account_data else []
+        bookmarked_novels = self.account_data.setdefault("bookmarked_novels", []) if self.account_data else []
+        followed_authors = self.account_data.setdefault("followed_authors", []) if self.account_data else []
+
+        results = {"liked": False, "bookmarked": False, "followed": False}
+        actions_taken = []
+        updated = False
+
+        # Peluang pembaca menyukai novel ini (~70% pembaca yang menikmati bab)
+        if random.random() < 0.70:
+            want_all = random.random() < 0.25
+
+            # Hanya izinkan jika BELUM PERNAH dilakukan sebelumnya
+            can_bookmark = (novel_id not in bookmarked_novels)
+            can_like = (novel_id not in liked_novels)
+            can_follow = (author_id is not None) and (author_id not in followed_authors)
+
+            want_bookmark = can_bookmark and (want_all or (random.random() < 0.60))
+            want_like = can_like and (want_all or (random.random() < 0.55))
+            want_follow = can_follow and (want_all or (random.random() < 0.40))
+
+            # 1. Simpan ke Rak Buku (Bookmark / Simpan Cerita) - HANYA 1X
+            if want_bookmark:
+                await asyncio.sleep(random.uniform(1.2, 2.5))
+                ok = await self.bookmark_novel(novel_id)
+                if ok:
+                    results["bookmarked"] = True
+                    actions_taken.append("Simpan Cerita")
+                    bookmarked_novels.append(novel_id)
+                    updated = True
+
+            # 2. Suka / Like Novel - HANYA 1X
+            if want_like:
+                await asyncio.sleep(random.uniform(1.2, 2.5))
+                ok = await self.like_novel(novel_id)
+                if ok:
+                    results["liked"] = True
+                    actions_taken.append("Like")
+                    liked_novels.append(novel_id)
+                    updated = True
+
+            # 3. Follow Penulis - HANYA 1X
+            if want_follow and author_id:
+                await asyncio.sleep(random.uniform(1.2, 2.5))
+                ok = await self.follow_author(author_id)
+                if ok:
+                    results["followed"] = True
+                    actions_taken.append("Follow Penulis")
+                    followed_authors.append(author_id)
+                    updated = True
+
+            if updated and self.save_account_cb and self.account_data:
+                self.save_account_cb(self.account_data)
+
+            if actions_taken and log_func:
+                if len(actions_taken) == 3:
+                    log_func(f"[bold magenta]♥ Reader SANGAT SUKA novel ini (Pertama kali & Ketiganya!):[/] [bold yellow]{' + '.join(actions_taken)}[/]")
+                else:
+                    log_func(f"[bold magenta]♥ Reader menyukai novel ini:[/] [bold yellow]{' + '.join(actions_taken)}[/]")
+
+        return results
+
+    # =========================================================================
+    # FITUR REMAKE CERITA (READER REMIXES & CABANG CERITA)
+    # =========================================================================
+
+    async def check_remix_eligibility(self, novel_id: str) -> bool:
+        """Memeriksa apakah novel target memenuhi kualifikasi untuk fitur Remix/Remake Cerita."""
+        try:
+            client = await self.get_client()
+            resp = await client.get(f"/api/v1/studio-cursor/reader-remixes/eligibility/{novel_id}")
+            if resp.status_code == 200:
+                data = resp.json()
+                return bool(data.get("eligible", False))
+        except Exception:
+            pass
+        return False
+
+    async def get_remix_roots(self, novel_id: str) -> List[Dict[str, Any]]:
+        """Mengambil daftar akar seri (series roots) remix yang tersedia untuk novel."""
+        try:
+            client = await self.get_client()
+            resp = await client.get(f"/api/v1/studio-cursor/reader-remixes/series/novel/{novel_id}/roots?limit=8")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("items", []) if isinstance(data, dict) else []
+        except Exception:
+            pass
+        return []
+
+    async def get_remix_episode(self, series_id: str, episode_num: int = 1) -> Optional[Dict[str, Any]]:
+        """Mengambil data episode cerita hasil remix pembaca lain."""
+        try:
+            client = await self.get_client()
+            resp = await client.get(f"/api/v1/studio-cursor/reader-remixes/series/{series_id}/episodes/{episode_num}")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    async def create_reader_remix(
+        self,
+        novel_id: str,
+        chapter_id: str,
+        mode: Optional[str] = None,
+        log_func=None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Mengeksekusi pembuatan Remake Cerita (Reader Remix) oleh pembaca login / tamu mendaftar:
+        1. Cek eligibilitas novel
+        2. Ambil roots seri remix aktif
+        3. Buat cabang seri (branch intervention)
+        4. Generate prompt intervensi & kirim streaming turn
+        5. Kirim choice event & PUT config
+        """
+        if not self.access_token:
+            return None
+
+        # 1. Cek eligibilitas
+        eligible = await self.check_remix_eligibility(novel_id)
+        if not eligible:
+            return None
+
+        # 2. Ambil roots series
+        roots = await self.get_remix_roots(novel_id)
+        if not roots:
+            return None
+
+        series_item = random.choice(roots)
+        series_id = series_item.get("series_id")
+        if not series_id:
+            return None
+
+        # Dapatkan source_session_id dari episode 1
+        ep_data = await self.get_remix_episode(series_id, 1)
+        source_session_id = ep_data.get("episode", {}).get("session_id") if ep_data else None
+
+        # 3. Branch intervention
+        client = await self.get_client()
+        branch_payload = {
+            "source_session_id": source_session_id,
+            "chapter_hash_id": chapter_id,
+        }
+        try:
+            b_resp = await client.post(
+                f"/api/v1/studio-cursor/reader-remixes/series/{series_id}/branch-intervention",
+                json=branch_payload,
+            )
+            if b_resp.status_code != 200:
+                return None
+            remix_session_id = b_resp.json().get("session", {}).get("id")
+        except Exception:
+            return None
+
+        if not remix_session_id:
+            return None
+
+        # 4. Generate payload & stream message
+        from .remake import RemakeModeGenerator
+        remix_data = RemakeModeGenerator.generate(mode=mode)
+        selected_mode = remix_data["mode"]
+        stream_message = remix_data["stream_message"]
+
+        # Hit & run stream turn
+        try:
+            await client.post(
+                f"/api/v1/studio-cursor/reader-remixes/{remix_session_id}/turns/stream",
+                json={
+                    "message": stream_message,
+                    "locale": "id",
+                    "message_visibility": "visible",
+                },
+                timeout=10.0,
+            )
+        except Exception:
+            pass
+
+        # PUT config update jika ada
+        if remix_data.get("put_endpoint") and remix_data.get("put_payload"):
+            try:
+                await client.put(
+                    f"/api/v1/studio-cursor/reader-remixes/{remix_session_id}/{remix_data['put_endpoint']}",
+                    json=remix_data["put_payload"],
+                )
+            except Exception:
+                pass
+
+        # Choice events (selection & exposure)
+        try:
+            await client.post(
+                f"/api/v1/studio-cursor/reader-remixes/{remix_session_id}/choice-event",
+                json={"event_type": "selection", "selected_mode": selected_mode},
+            )
+            await client.post(
+                f"/api/v1/studio-cursor/reader-remixes/{remix_session_id}/choice-event",
+                json={"event_type": "exposure"},
+            )
+        except Exception:
+            pass
+
+        if log_func:
+            log_func(
+                f"[bold magenta]⚡ Pembaca meremake cerita ini:[/] [bold yellow]{remix_data['title']}[/] "
+                f"([dim]{remix_data['summary']}[/])"
+            )
+
+        return {
+            "session_id": remix_session_id,
+            "mode": selected_mode,
+            "title": remix_data["title"],
+            "summary": remix_data["summary"],
+        }

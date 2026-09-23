@@ -1,326 +1,344 @@
 """
-FastAPI Web Server untuk Bot Toodat / Quarterfull
-Menyediakan REST API & Server-Sent Events (SSE) untuk:
-- Verifikasi akses token berlimit saldo Rupiah
-- Autentikasi dan dashboard Owner (Generate Token 10rb, 20rb, 50rb)
-- Input link novel mandiri dengan auto-inspect info novel
-- Live streaming log terminal eksekusi bot & update saldo real-time
-- Call-to-Action WhatsApp Owner (wa.me/6287734343023)
+RinaraDev Automation — Next-Gen Novel Automation Platform
+Backend FastAPI Server (Fresh Build)
+- Autentikasi Pengguna & Dompet Saldo (Register/Login/Session)
+- Auto-inspect metadata novel (cover, author, total chapters)
+- Multi-Terminal Bot Orchestrator (1 - 5 Sesi bersamaan via Proxy Pool)
+- Real-time SSE Live Console Streaming
+- Integrasi QRIS Otomatis (WijayaPay) & Top-up Manual
+- Admin Dashboard Panel
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import secrets
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("RinaraDevServer")
-
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # Setup sys.path
 BASE_DIR = Path(__file__).parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+STEALTH_DIR = BASE_DIR.parent / "stealth_bot"
+for p in [str(BASE_DIR), str(STEALTH_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from token_manager import TokenManager, OWNER_WHATSAPP, TOKEN_PRESETS
+from database import db_session, get_db_connection, init_database, sync_initial_assets
+from proxy_pool import ProxyPoolManager
+from account_pool import AccountPoolManager
+from auth import AuthManager
 from bot_bridge import BotBridge, WebTask, ACTIVE_TASKS
 from wijayapay_client import default_wijayapay_client
 
-app = FastAPI(title="RinaraDev Automation Platform", version="3.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("RinaraServer")
 
-# CORS middleware
+app = FastAPI(title="Rinara Growth Platform", version="5.0")
+
+# In-memory session and rate limiting
+ADMIN_SESSIONS: Dict[str, float] = {}
+RATE_LIMIT_BUCKET: Dict[str, List[float]] = {}
+
+def get_admin_pin() -> str:
+    return os.getenv("ADMIN_PIN", "100401naraA!").strip()
+
+def check_rate_limit(key: str, max_requests: int, window_seconds: float) -> bool:
+    now = time.time()
+    timestamps = RATE_LIMIT_BUCKET.setdefault(key, [])
+    RATE_LIMIT_BUCKET[key] = [t for t in timestamps if now - t < window_seconds]
+    if len(RATE_LIMIT_BUCKET[key]) >= max_requests:
+        return False
+    RATE_LIMIT_BUCKET[key].append(now)
+    return True
+
+# Startup lifecycle
+@app.on_event("startup")
+async def on_startup():
+    try:
+        init_database()
+        sync_initial_assets()
+        logger.info("Server RinaraDev siap! Database dan aset bot telah disinkronkan.")
+    except Exception as e:
+        logger.error(f"Error sinkronisasi database: {e}")
+
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Mount static files
+# Mount Static Files
 static_dir = BASE_DIR / "static"
+os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-# Owner Master Key (dapat disesuaikan)
-ADMIN_SECRET_PIN = "100401naraA!"
+RATE_PER_VALID_READER = 450  # Rp 450 per pembaca valid tamat 25 bab
 
 
 # =============================================================================
 # PYDANTIC SCHEMAS
 # =============================================================================
-class TokenVerifyRequest(BaseModel):
-    token: str
+class UserRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=24)
+    email: str = Field(..., min_length=5, max_length=120)
+    password: str = Field(..., min_length=6, max_length=100)
+
+
+class UserLoginRequest(BaseModel):
+    identifier: str = Field(..., min_length=3, max_length=120)
+    password: str = Field(..., min_length=1, max_length=100)
 
 
 class TaskStartRequest(BaseModel):
-    token: str
-    novel_url: str
-    mode: str = "full_auto"  # full_auto, member_read, guest_read, like_only, bookmark_only, follow_only
-    accounts_count: int = 5
-    guest_count: int = 10
-    max_chapters: int = 5
-    reading_delay: float = 6.0
-    country: str = "RANDOM"  # RANDOM or specific country code (ID, US, JP, etc.)
+    novel_url: str = Field(..., min_length=5, max_length=500)
+    target_readers: int = Field(default=10, ge=1, le=5000)
+    concurrent_terminals: int = Field(default=1, ge=1, le=10)
+    max_chapters: int = Field(default=25, ge=1, le=100)
+    reading_delay: float = Field(default=140.0, ge=1.0)
+    mode: str = "valid"  # "valid" atau "guest"
+    addon_guest_conversion: bool = False  # Addon konversi tamu ke member terdaftar OTP
+
+
+class AdminSettingsUpdateRequest(BaseModel):
+    price_valid_reader: Optional[int] = None
+    price_guest_reader: Optional[int] = None
+    addon_price_per_terminal: Optional[int] = None
+    addon_price_guest_conversion: Optional[int] = None
+    min_deposit: Optional[int] = None
+    reading_delay_seconds: Optional[int] = None
+    max_concurrent_terminals: Optional[int] = None
+
+
+class PaymentCreateRequest(BaseModel):
+    nominal: int = Field(..., ge=5000, le=5000000)
+    payment_method: str = "QRIS"
 
 
 class AdminLoginRequest(BaseModel):
     pin: str
 
 
-class AdminCreateTokenRequest(BaseModel):
-    amount: int = 20000
-    label: str = "Client Token"
-    expiry_days: Optional[int] = None
-    notes: str = ""
-
-
 class AdminTopupRequest(BaseModel):
-    amount: int = 10000
-    note: str = "Top up manual via Owner"
+    user_id: int = Field(..., ge=1)
+    amount: int = Field(..., ge=100, le=50000000)
+    note: str = "Top up manual via Admin"
 
 
-class AdminStatusRequest(BaseModel):
-    status: str  # active, suspended, revoked
+def extract_token(request: Request) -> Optional[str]:
+    token = request.headers.get("x-session-token") or request.cookies.get("session_token")
+    if not token:
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr[7:].strip()
+    return token.strip() if token else None
 
 
-class AdminGenerateAccountsRequest(BaseModel):
-    count: int = Field(default=1, ge=1, le=50)
-    country: str = "RANDOM"
-    ua_mode: str = "okhttp"
-
-
-class ClientGenerateAccountsRequest(BaseModel):
-    token: str
-    count: int = Field(default=1, ge=1, le=50)
-    country: str = "RANDOM"
-    ua_mode: str = "okhttp"
-
-
-class PaymentCreateRequest(BaseModel):
-    order_type: str = "new_token"  # new_token or topup
-    nominal: int = Field(..., ge=1000, le=10000000)
-    token_code: Optional[str] = None
-    payment_code: str = "QRIS"
-    customer_name: Optional[str] = None
-    customer_email: Optional[str] = None
-    customer_phone: Optional[str] = None
-
-
-TRIAL_IP_TIMESTAMPS: Dict[str, float] = {}
-TRIAL_NOVEL_TIMESTAMPS: Dict[str, float] = {}
-
-
-class FreeTrialStartRequest(BaseModel):
-    novel_url: str
-
-
-class AdminUpdatePricingRequest(BaseModel):
-    rates: Optional[Dict[str, Any]] = None
-    packages: Optional[List[Dict[str, Any]]] = None
-    owner_wa: Optional[str] = None
-    free_trial: Optional[Dict[str, Any]] = None
+def resolve_current_user(request: Request) -> Optional[Dict[str, Any]]:
+    token = extract_token(request)
+    if not token:
+        return None
+    return AuthManager.get_user_by_session(token)
 
 
 # =============================================================================
-# FRONTEND ROUTES
+# FRONTEND HTML ROUTE
 # =============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_file = BASE_DIR / "templates" / "index.html"
     if not index_file.exists():
-        return HTMLResponse("<h1>Index HTML tidak ditemukan</h1>", status_code=404)
+        return HTMLResponse("<h1>Error: templates/index.html tidak ditemukan</h1>", status_code=404)
     with open(index_file, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 
-@app.get("/admin", response_class=HTMLResponse)
-@app.get("/owner-portal", response_class=HTMLResponse)
-async def serve_admin():
-    """Rute rahasia khusus Owner (tersembunyi dari publik)."""
-    admin_file = BASE_DIR / "templates" / "admin.html"
-    if not admin_file.exists():
-        return HTMLResponse("<h1>Admin Panel HTML tidak ditemukan</h1>", status_code=404)
-    with open(admin_file, "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+# =============================================================================
+# AUTHENTICATION API
+# =============================================================================
+@app.post("/api/auth/register")
+async def api_register(req: UserRegisterRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(f"reg_{client_ip}", max_requests=5, window_seconds=300):
+        return JSONResponse(status_code=429, content={"ok": False, "error": "Terlalu banyak permintaan pendaftaran. Coba lagi dalam 5 menit."})
+    ok, msg, user = AuthManager.register(req.username, req.email, req.password)
+    if not ok:
+        return JSONResponse(status_code=400, content={"ok": False, "error": msg})
+    return {"ok": True, "message": msg, "user": user, "token": user.get("session_token")}
+
+
+@app.post("/api/auth/login")
+async def api_login(req: UserLoginRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(f"login_{client_ip}", max_requests=10, window_seconds=120):
+        return JSONResponse(status_code=429, content={"ok": False, "error": "Terlalu banyak percobaan login. Coba lagi dalam 2 menit."})
+    ok, msg, user = AuthManager.login(req.identifier, req.password)
+    if not ok:
+        return JSONResponse(status_code=401, content={"ok": False, "error": msg})
+    return {"ok": True, "message": msg, "user": user, "token": user.get("session_token")}
+
+
+@app.post("/api/auth/logout")
+async def api_logout(request: Request):
+    token = extract_token(request)
+    if token:
+        AuthManager.logout(token)
+    return {"ok": True, "message": "Berhasil logout."}
+
+
+@app.get("/api/auth/me")
+async def api_get_me(request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Belum masuk akun."})
+    return {"ok": True, "user": user}
+
+
+@app.get("/api/auth/transactions")
+async def api_get_transactions(request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Belum masuk akun."})
+    txs = AuthManager.get_user_transactions(user["id"], limit=50)
+    return {"ok": True, "transactions": txs}
 
 
 # =============================================================================
-# CLIENT / USER BOT RUNNER ENDPOINTS
+# NOVEL INSPECTION API
 # =============================================================================
-@app.get("/api/pricing")
-async def get_pricing():
-    """Mengembalikan konfigurasi dinamis: tarif per item, paket harga, dan kontak WhatsApp Owner."""
-    cfg = TokenManager.get_pricing_config()
-    rates = cfg.get("rates", {})
-    raw_packages = cfg.get("packages", [])
-    owner_wa = cfg.get("owner_wa", OWNER_WHATSAPP)
-    vr_rate = rates.get("valid_reader", 500)
-    gr_rate = rates.get("guest_reader", 50)
-
-    enriched_packages = []
-    for idx, p in enumerate(raw_packages):
-        price = int(p.get("price", 10000))
-        vr_sess = price // vr_rate if vr_rate > 0 else 0
-        gr_sess = price // gr_rate if gr_rate > 0 else 0
-        is_pop = bool(p.get("popular") or p.get("is_featured") or idx == 1)
-        enriched_packages.append({
-            "id": p.get("id") or f"pkg_{price}",
-            "name": str(p.get("name", f"Paket Rp {price:,}")).strip(),
-            "price": price,
-            "features": p.get("features", []),
-            "popular": is_pop,
-            "is_featured": is_pop,
-            "sessions_label": f"{vr_sess} Sesi Member / {gr_sess} Tamu",
-        })
-
-    return {
-        "ok": True,
-        "owner_whatsapp": owner_wa,
-        "owner_wa_url": f"https://wa.me/{owner_wa}",
-        "rates": {
-            "valid_reader": vr_rate,
-            "guest_reader_10": gr_rate * 10,
-            "guest_reader_1": gr_rate,
-            "guest_reader": gr_rate,
-            "account_generator": int(rates.get("account_generator", 50)),
-            "like": rates.get("like", 100),
-            "bookmark": rates.get("bookmark", 100),
-            "follow": rates.get("follow", 100),
-        },
-        "packages": enriched_packages,
-        "presets": enriched_packages,
-        "free_trial": cfg.get("free_trial", {}),
-    }
-
-
-@app.post("/api/verify-token")
-async def verify_token(req: TokenVerifyRequest):
-    """Memverifikasi keabsahan token pengguna dan mengembalikan saldo terkini."""
-    token_code = req.token.strip()
-    is_valid, msg, token = TokenManager.verify_token(token_code, min_required_balance=50)
-    if not is_valid:
-        wa_url = TokenManager.get_whatsapp_url(token_code, 20000)
-        return {
-            "ok": False,
-            "error": msg,
-            "wa_url": wa_url,
-            "token": token,
-        }
-
-    return {
-        "ok": True,
-        "message": msg,
-        "token": token.get("token"),
-        "label": token.get("label"),
-        "current_balance": token.get("current_balance", 0),
-        "total_spent": token.get("total_spent", 0),
-        "status": token.get("status"),
-        "expires_at": token.get("expires_at"),
-        "stats": token.get("stats", {}),
-    }
-
-
 @app.get("/api/novel-info")
-async def get_novel_info(url: str):
-    """Mengekstrak dan memeriksa metadata novel (judul, author, cover, readable chapters)."""
+async def api_novel_info(url: str):
     if not url or not url.strip():
-        raise HTTPException(status_code=400, detail="URL atau ID Novel tidak boleh kosong")
+        raise HTTPException(status_code=400, detail="URL atau ID Novel tidak boleh kosong.")
     res = await BotBridge.get_novel_info(url.strip())
     return res
 
 
+# =============================================================================
+# TASK EXECUTION & SSE STREAM
+# =============================================================================
 @app.post("/api/tasks/start")
-async def start_task(req: TaskStartRequest):
-    """Memvalidasi token & saldo, lalu memulai background task bot."""
-    token_code = req.token.strip()
+async def api_start_task(req: TaskStartRequest, request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Silakan login ke akun Anda terlebih dahulu."})
+
+    from database import get_setting
+    price_valid = int(get_setting("price_valid_reader", 450))
+    price_guest = int(get_setting("price_guest_reader", 50))
+    addon_rate = int(get_setting("addon_price_per_terminal", 500))
+    addon_conversion_rate = int(get_setting("addon_price_guest_conversion", 150))
+    max_terms = int(get_setting("max_concurrent_terminals", 5))
+
+    mode = "guest" if req.mode in ("guest", "guest_fast") else "valid"
+    addon_conversion = bool(req.addon_guest_conversion and mode == "guest")
+    base_rate = price_guest if mode == "guest" else price_valid
+    rate_per_reader = base_rate + (addon_conversion_rate if addon_conversion else 0)
     
-    # 1. Tentukan batas minimum saldo dinamis sesuai mode
-    rates = TokenManager.get_pricing_config().get("rates", {})
-    vr_rate = rates.get("valid_reader", 500)
-    gr_rate = rates.get("guest_reader", 50)
-    like_rate = rates.get("like", 100)
-    if req.mode in ("full_auto", "member_read"):
-        min_bal = vr_rate
-    elif req.mode in ("like_only", "bookmark_only", "follow_only"):
-        min_bal = like_rate
-    else:
-        min_bal = gr_rate
-    is_valid, msg, token = TokenManager.verify_token(token_code, min_required_balance=min_bal)
-    if not is_valid:
+    concurrent_terms = max(1, min(req.concurrent_terminals, max_terms))
+    addon_fee = (concurrent_terms - 1) * addon_rate if concurrent_terms > 1 else 0
+
+    required_initial = addon_fee + rate_per_reader
+    if user["balance"] < required_initial:
         return JSONResponse(
             status_code=400,
             content={
                 "ok": False,
-                "error": msg,
-                "wa_url": TokenManager.get_whatsapp_url(token_code, 20000),
+                "error": f"Saldo tidak mencukupi! Minimal saldo Rp {required_initial:,} (Addon Sesi: Rp {addon_fee:,} + 1 Pembaca: Rp {rate_per_reader:,}). Saldo Anda: Rp {user['balance']:,}.",
+                "balance": user["balance"],
+                "required": required_initial,
             }
         )
 
-    # 2. Resolusi ID novel
-    novel_id = req.novel_url.strip()
-    import re
-    query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", novel_id)
-    if query_hash:
-        novel_id = query_hash.group(1)
-    else:
-        match = re.search(r"([a-zA-Z0-9]{16})", novel_id)
-        if match:
-            novel_id = match.group(1)
+    # Resolusi ID Novel
+    novel_id = BotBridge.extract_novel_id(req.novel_url)
+    if not novel_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "URL atau ID Novel tidak valid (16 karakter)."})
+
+    novel_info = await BotBridge.get_novel_info(novel_id)
+    novel_title = novel_info.get("title", f"Novel #{novel_id}")
+    author_id = novel_info.get("author_id", "")
 
     task_id = f"task_{int(time.time()*1000)}_{secrets.token_hex(3)}"
-    config = {
-        "accounts_count": req.accounts_count,
-        "guest_count": req.guest_count,
-        "max_chapters": req.max_chapters,
-        "reading_delay": req.reading_delay,
-        "country": (req.country or "RANDOM").upper().strip(),
-    }
 
-    task = WebTask(task_id=task_id, token_code=token_code, novel_id=novel_id, mode=req.mode, config=config)
-    
-    # Jalankan lifecycle di background asyncio
+    # Potong biaya addon terminal jika ada slot tambahan
+    if addon_fee > 0:
+        AuthManager.deduct_balance(
+            user_id=user["id"],
+            amount=addon_fee,
+            description=f"Biaya Addon {concurrent_terms} Sesi Terminal untuk '{novel_title[:30]}'",
+            reference_id=task_id
+        )
+
+    task = WebTask(
+        task_id=task_id,
+        user_id=user["id"],
+        novel_id=novel_id,
+        novel_title=novel_title,
+        author_id=author_id,
+        mode=mode,
+        target_readers=req.target_readers,
+        concurrent_terminals=concurrent_terms,
+        max_chapters=req.max_chapters,
+        reading_delay=req.reading_delay,
+        rate_per_reader=rate_per_reader,
+        addon_fee=addon_fee,
+        addon_guest_conversion=addon_conversion,
+    )
+
     asyncio.create_task(BotBridge.run_task_lifecycle(task))
 
     return {
         "ok": True,
         "task_id": task_id,
-        "message": "Tugas berhasil dimulai. Sambungkan ke stream log via SSE.",
+        "message": f"Tugas dimulai ({concurrent_terms} Sesi Terminal simultan, Mode: {mode}).",
+        "novel_title": novel_title,
+        "concurrent_terminals": concurrent_terms,
+        "addon_fee": addon_fee,
+        "rate_per_reader": rate_per_reader,
+        "addon_guest_conversion": addon_conversion,
     }
 
 
 @app.get("/api/tasks/stream/{task_id}")
-async def stream_task(task_id: str):
-    """Server-Sent Events (SSE) streaming endpoint untuk realtime log dan progress dengan replay history saat refresh."""
+async def api_stream_task(task_id: str):
     entry = ACTIVE_TASKS.get(task_id)
     if not entry:
-        raise HTTPException(status_code=404, detail="Tugas tidak ditemukan atau sudah selesai")
+        raise HTTPException(status_code=404, detail="Tugas tidak ditemukan atau sudah selesai.")
 
     task: WebTask = entry["task"]
     client_queue = task.subscribe()
 
     async def event_generator():
         try:
-            # Kirim event koneksi awal
             yield f"data: {json.dumps({'type': 'connected', 'task_id': task_id, 'is_running': task.is_running})}\n\n"
-
-            # Replay seluruh riwayat log agar saat browser di-refresh, log tidak hilang!
             for old_log in list(task.logs_history):
                 yield f"data: {json.dumps(old_log)}\n\n"
-
-            # Kirim metrik statistik terkini
             yield f"data: {json.dumps({'type': 'stats', 'stats': task.stats})}\n\n"
 
-            # Jika tugas sudah selesai sebelum klien terhubung, kirim done
             if not task.is_running:
-                yield f"data: {json.dumps({'type': 'done', 'stats': task.stats, 'wa_link': TokenManager.get_whatsapp_url(task.token_code, 20000)})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'stats': task.stats})}\n\n"
                 return
 
             while task.is_running or not client_queue.empty():
@@ -330,7 +348,6 @@ async def stream_task(task_id: str):
                     if event.get("type") == "done":
                         break
                 except asyncio.TimeoutError:
-                    # Ping keep-alive
                     yield f": keepalive {time.time()}\n\n"
         except asyncio.CancelledError:
             pass
@@ -340,833 +357,461 @@ async def stream_task(task_id: str):
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
+@app.post("/api/tasks/stop/{task_id}")
+async def api_stop_task(task_id: str, request: Request):
+    user = resolve_current_user(request)
+    entry = ACTIVE_TASKS.get(task_id)
+    if not entry:
+        return {"ok": False, "error": "Tugas tidak ditemukan atau sudah berhenti."}
+
+    task: WebTask = entry["task"]
+    # Validasi pemilik tugas
+    if user and task.user_id != user["id"] and user["role"] != "admin":
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Bukan pemilik tugas ini."})
+
+    task.cancel()
+    return {"ok": True, "message": "Tugas dihentikan dan semua proxy telah di-release."}
+
+
 @app.get("/api/tasks/active")
-async def get_active_task(token: Optional[str] = None):
-    """Mengecek apakah ada tugas yang sedang aktif berjalan di server untuk token ini."""
-    if not token:
+async def api_get_active_task(request: Request):
+    user = resolve_current_user(request)
+    if not user:
         return {"ok": True, "active": False}
-    token_clean = token.strip().upper()
+
     for tid, entry in list(ACTIVE_TASKS.items()):
         task: WebTask = entry.get("task")
-        if task and task.token_code.upper() == token_clean and task.is_running:
+        if task and task.user_id == user["id"] and task.is_running:
             return {
                 "ok": True,
                 "active": True,
                 "task_id": task.task_id,
                 "novel_id": task.novel_id,
+                "novel_title": task.novel_title,
+                "author_id": task.author_id,
                 "mode": task.mode,
+                "concurrent_terminals": task.concurrent_terminals,
+                "target_readers": task.target_readers,
+                "rate_per_reader": task.rate_per_reader,
+                "addon_guest_conversion": task.addon_guest_conversion,
                 "stats": task.stats,
-                "novel_info": task.novel_info,
             }
     return {"ok": True, "active": False}
 
 
-@app.get("/api/tasks/status/{task_id}")
-async def get_task_status(task_id: str):
-    """Mengecek status tugas bot tertentu."""
-    entry = ACTIVE_TASKS.get(task_id)
-    if not entry:
-        return {"ok": False, "error": "Tugas tidak ditemukan"}
-    task: WebTask = entry["task"]
+@app.get("/api/tasks/history")
+async def api_get_task_history(request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Belum login."})
+
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT task_id, novel_id, novel_title, target_readers, completed_readers,
+               concurrent_terminals, status, created_at, updated_at
+        FROM tasks
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 30;
+        """, (user["id"],))
+        rows = cursor.fetchall()
+        return {"ok": True, "tasks": [dict(r) for r in rows]}
+
+
+# =============================================================================
+# SYSTEM STATUS & POOL STATS
+# =============================================================================
+@app.get("/api/proxy-pool/status")
+async def api_proxy_pool_status():
     return {
         "ok": True,
-        "task_id": task.task_id,
-        "is_running": task.is_running,
-        "stats": task.stats,
-        "logs": task.logs_history[-30:],
-        "novel_info": {
-            "title": (task.novel_info or {}).get("title"),
-            "author": (task.novel_info or {}).get("author"),
-        },
+        "summary": ProxyPoolManager.get_summary(),
+        "proxies": ProxyPoolManager.list_proxies()[:20],
     }
 
 
-@app.post("/api/tasks/stop/{task_id}")
-async def stop_task(task_id: str):
-    """Menghentikan tugas bot yang sedang berjalan."""
-    entry = ACTIVE_TASKS.get(task_id)
-    if not entry:
-        return {"ok": False, "error": "Tugas tidak ditemukan atau sudah berhenti"}
-
-    task: WebTask = entry["task"]
-    task.cancel()
-    return {"ok": True, "message": "Perintah stop telah dikirim ke worker."}
-
-
-# =============================================================================
-# CLIENT ACCOUNT GENERATOR ENDPOINT (BERBAYAR DINAMIS)
-# =============================================================================
-@app.post("/api/accounts/generate")
-async def client_generate_accounts(req: ClientGenerateAccountsRequest):
-    """Pengguna men-generate akun baru menggunakan saldo token akses berbayar (tarif dinamis)."""
-    token_code = req.token.strip().upper()
-    is_valid, token_data, err_msg = TokenManager.verify_token(token_code)
-    if not is_valid or not token_data:
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "error": err_msg or "Token akses tidak valid atau tidak aktif."},
-        )
-
-    current_bal = token_data.get("current_balance", 0)
-    pricing = TokenManager.get_pricing_config()
-    rate_per_acc = pricing.get("rates", {}).get("account_generator", 50)
-
-    if current_bal < rate_per_acc:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": f"Saldo tidak mencukupi! Minimal saldo Rp {rate_per_acc:,} untuk generate 1 akun. Saldo Anda: Rp {current_bal:,}.",
-                "rate": rate_per_acc,
-                "current_balance": current_bal,
-            },
-        )
-
-    max_possible = current_bal // rate_per_acc
-    actual_count = min(req.count, max_possible)
-    if actual_count <= 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": f"Saldo tidak mencukupi untuk jumlah akun yang diminta (Dibutuhkan Rp {(req.count * rate_per_acc):,}, Saldo: Rp {current_bal:,}).",
-                "rate": rate_per_acc,
-                "current_balance": current_bal,
-            },
-        )
-
-    try:
-        from core.auto_signup import RegistrationRunner
-    except ImportError:
-        from auto_signup import RegistrationRunner
-
-    core_akun_file = BASE_DIR / "core" / "akun.txt"
-    root_akun_file = BASE_DIR.parent / "akun.txt"
-
-    def _run_registration():
-        runner = RegistrationRunner(accounts_file=str(core_akun_file))
-        created = []
-        errors = []
-        for idx in range(1, actual_count + 1):
-            try:
-                res = runner.register_account(country_code=req.country, ua_mode=req.ua_mode)
-                if res.get("status") == "success":
-                    acc = res.get("account", {})
-                    created.append(acc)
-                    try:
-                        line = json.dumps(acc, ensure_ascii=False)
-                        with open(root_akun_file, "a", encoding="utf-8") as rf:
-                            rf.write(line + "\n")
-                    except Exception:
-                        pass
-                else:
-                    errors.append(f"Akun #{idx}: {res.get('error', 'Gagal mendaftar')}")
-            except Exception as e:
-                errors.append(f"Akun #{idx}: {str(e)}")
-        return created, errors
-
-    created_accounts, errors = await asyncio.to_thread(_run_registration)
-    created_count = len(created_accounts)
-
-    # Potong saldo HANYA untuk akun yang berhasil dibuat!
-    total_cost = created_count * rate_per_acc
-    new_balance = current_bal
-    if created_count > 0:
-        ok_deduct, remaining, _ = TokenManager.deduct_balance(
-            token=token_code,
-            amount=total_cost,
-            description=f"Generate {created_count} Akun ({req.country})",
-            metadata={
-                "action": "account_generator",
-                "count": created_count,
-                "rate": rate_per_acc,
-                "country": req.country,
-                "ua_mode": req.ua_mode,
-            }
-        )
-        if ok_deduct:
-            new_balance = remaining
-
+@app.get("/api/stats/overview")
+async def api_stats_overview():
+    p_sum = ProxyPoolManager.get_summary()
+    a_sum = AccountPoolManager.get_summary()
+    active_tasks_count = len([t for t in ACTIVE_TASKS.values() if t["task"].is_running])
     return {
         "ok": True,
-        "requested": req.count,
-        "created_count": created_count,
-        "rate_per_account": rate_per_acc,
-        "total_cost": total_cost,
-        "remaining_balance": new_balance,
-        "accounts": created_accounts,
-        "errors": errors,
+        "proxies": p_sum,
+        "accounts": a_sum,
+        "active_tasks": active_tasks_count,
+        "rate_per_reader": RATE_PER_VALID_READER,
     }
 
 
 # =============================================================================
-# OWNER / ADMIN PORTAL ENDPOINTS
+# WIJAYAPAY QRIS PAYMENT GATEWAY
 # =============================================================================
-@app.post("/api/admin/login")
-async def admin_login(req: AdminLoginRequest):
-    """Verifikasi PIN Owner untuk mengakses dashboard admin."""
-    if req.pin.strip() == ADMIN_SECRET_PIN:
-        return {"ok": True, "token": secrets.token_hex(16)}
-    return JSONResponse(status_code=401, content={"ok": False, "error": "PIN Owner tidak valid!"})
-
-
-@app.get("/api/admin/tokens")
-async def admin_list_tokens(x_admin_pin: Optional[str] = Header(None)):
-    """Mengambil seluruh daftar token yang pernah di-generate beserta riwayat saldo."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    tokens = TokenManager.list_tokens()
-    return {"ok": True, "tokens": tokens, "total": len(tokens)}
-
-
-@app.post("/api/admin/tokens")
-async def admin_create_token(req: AdminCreateTokenRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Owner membuat token akses baru dengan saldo Rupiah tertentu (10rb, 20rb, 50rb, dll)."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    token_data = TokenManager.create_token(
-        initial_balance=req.amount,
-        label=req.label,
-        expiry_days=req.expiry_days,
-        notes=req.notes,
-    )
-    return {"ok": True, "token": token_data}
-
-
-@app.post("/api/admin/tokens/{token_code}/topup")
-async def admin_topup_token(token_code: str, req: AdminTopupRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Owner menambah saldo token client."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    ok, new_bal, msg = TokenManager.topup_balance(token_code, req.amount, req.note)
-    if not ok:
-        raise HTTPException(status_code=404, detail=msg)
-    return {"ok": True, "message": msg, "new_balance": new_bal}
-
-
-@app.patch("/api/admin/tokens/{token_code}/status")
-async def admin_update_status(token_code: str, req: AdminStatusRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Owner mengubah status token (active, suspended, revoked)."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    ok = TokenManager.update_token_status(token_code, req.status)
-    if not ok:
-        raise HTTPException(status_code=400, detail="Gagal memperbarui status token.")
-    return {"ok": True, "message": f"Status token {token_code} berhasil diubah ke '{req.status}'."}
-
-
-@app.get("/api/admin/stats")
-async def admin_stats(x_admin_pin: Optional[str] = Header(None)):
-    """Ringkasan statistik sistem untuk Owner."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    tokens = TokenManager.list_tokens()
-    total_balance = sum(t.get("current_balance", 0) for t in tokens)
-    total_spent = sum(t.get("total_spent", 0) for t in tokens)
-    accounts = BotBridge.load_accounts()
-    
-    from proxy_manager import default_proxy_manager
-    proxies_count = len(default_proxy_manager.parsed_proxies) if default_proxy_manager else 0
-
-    return {
-        "ok": True,
-        "total_tokens": len(tokens),
-        "total_active_balance": total_balance,
-        "total_spent": total_spent,
-        "total_accounts_available": len(accounts),
-        "total_proxies_active": proxies_count,
-        "active_running_tasks": len(ACTIVE_TASKS),
-    }
-
-
-@app.get("/api/admin/pricing")
-async def admin_get_pricing(x_admin_pin: Optional[str] = Header(None)):
-    """Mengambil konfigurasi tarif bot dan daftar paket harga untuk dikelola admin."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-    config = TokenManager.get_pricing_config()
-    return {"ok": True, "config": config}
-
-
-@app.post("/api/admin/pricing")
-async def admin_update_pricing(req: AdminUpdatePricingRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Admin memperbarui konfigurasi tarif bot, paket harga, atau nomor kontak WhatsApp, termasuk pengaturan free trial."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-    new_cfg = TokenManager.update_pricing_config(
-        rates=req.rates,
-        packages=req.packages,
-        owner_wa=req.owner_wa,
-        free_trial=req.free_trial,
-    )
-    return {"ok": True, "message": "Konfigurasi tarif dan paket harga berhasil diperbarui!", "config": new_cfg}
-
-
-# =============================================================================
-# FREE TRIAL ENDPOINT (Tanpa Token)
-# =============================================================================
-@app.post("/api/free-trial/start")
-async def start_free_trial(req: FreeTrialStartRequest, request: Request):
-    """
-    Menjalankan free trial terbatas tanpa token.
-    IP-based cooldown sesuai konfigurasi admin (default 24 jam).
-    Jumlah akun & fitur yang digunakan dikonfigurasi oleh admin.
-    """
-    cfg = TokenManager.get_pricing_config()
-    trial_cfg = cfg.get("free_trial", {})
-
-    # Cek apakah fitur free trial diaktifkan admin
-    if not trial_cfg.get("enabled", True):
-        return JSONResponse(
-            status_code=403,
-            content={"ok": False, "error": "Free trial sedang tidak tersedia. Silakan beli paket saldo untuk menggunakan layanan ini."},
-        )
-
-    # Deteksi IP pengguna
-    forwarded_for = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP")
-    client_ip = (forwarded_for.split(",")[0].strip() if forwarded_for else None) or str(request.client.host)
-
-    # Cooldown check berdasarkan IP
-    cooldown_hours = int(trial_cfg.get("cooldown_hours", 24))
-    cooldown_seconds = cooldown_hours * 3600
-    now_ts = time.time()
-
-    last_ts = TRIAL_IP_TIMESTAMPS.get(client_ip, 0)
-    elapsed = now_ts - last_ts
-    if elapsed < cooldown_seconds:
-        remaining_h = int((cooldown_seconds - elapsed) // 3600)
-        remaining_m = int(((cooldown_seconds - elapsed) % 3600) // 60)
-        return JSONResponse(
-            status_code=429,
-            content={
-                "ok": False,
-                "error": f"Free trial Anda sudah digunakan. Tunggu {remaining_h} jam {remaining_m} menit lagi, atau beli paket saldo untuk akses tanpa batas!",
-                "cooldown_remaining_seconds": int(cooldown_seconds - elapsed),
-                "can_buy": True,
-            },
-        )
-
-    # Resolusi novel ID
-    novel_url = req.novel_url.strip()
-    import re
-    novel_id = novel_url
-    query_hash = re.search(r"[?&]hashId=([a-zA-Z0-9]{16})", novel_id)
-    if query_hash:
-        novel_id = query_hash.group(1)
-    else:
-        match = re.search(r"([a-zA-Z0-9]{16})", novel_id)
-        if match:
-            novel_id = match.group(1)
-
-    # Catat timestamp IP sebelum tugas dimulai (agar tidak bisa double-click)
-    TRIAL_IP_TIMESTAMPS[client_ip] = now_ts
-
-    # Buat task ID khusus trial
-    task_id = f"trial_{int(time.time()*1000)}_{secrets.token_hex(3)}"
-
-    # Konfigurasi dari setting admin
-    accounts_count = int(trial_cfg.get("accounts_count", 5))
-    do_like = bool(trial_cfg.get("do_like", True))
-    do_follow = bool(trial_cfg.get("do_follow", True))
-
-    # Mode otomatis: jika like & follow aktif → full_auto, else guest_read
-    mode = "full_auto" if (do_like or do_follow) else "guest_read"
-
-    config = {
-        "accounts_count": accounts_count,
-        "guest_count": accounts_count,
-        "max_chapters": 3,
-        "reading_delay": 6.0,
-        "country": "RANDOM",
-        "is_free_trial": True,
-        "do_like": do_like,
-        "do_follow": do_follow,
-    }
-
-    task = WebTask(
-        task_id=task_id,
-        token_code="FREE_TRIAL",
-        novel_id=novel_id,
-        mode=mode,
-        config=config,
-    )
-
-    asyncio.create_task(BotBridge.run_task_lifecycle(task))
-
-    return {
-        "ok": True,
-        "task_id": task_id,
-        "is_trial": True,
-        "trial_accounts": accounts_count,
-        "cooldown_hours": cooldown_hours,
-        "message": f"Free trial dimulai! Menggunakan {accounts_count} akun tamu. Sambungkan ke SSE stream untuk melihat log.",
-    }
-
-
-
-@app.post("/api/admin/accounts/generate")
-async def admin_generate_accounts(req: AdminGenerateAccountsRequest, x_admin_pin: Optional[str] = Header(None)):
-    """Owner men-generate akun baru secara otomatis dengan targeting negara dan mode User-Agent."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    try:
-        from core.auto_signup import RegistrationRunner
-    except ImportError:
-        from auto_signup import RegistrationRunner
-
-    core_akun_file = BASE_DIR / "core" / "akun.txt"
-    root_akun_file = BASE_DIR.parent / "akun.txt"
-
-    def _execute_batch():
-        runner = RegistrationRunner(accounts_file=str(core_akun_file))
-        created_list = []
-        errors_list = []
-        for idx in range(1, req.count + 1):
-            try:
-                res = runner.register_account(country_code=req.country, ua_mode=req.ua_mode)
-                if res.get("status") == "success":
-                    acc = res.get("account", {})
-                    created_list.append(acc)
-                    # Sinkronkan ke akun.txt di root direktori jika berbeda
-                    try:
-                        line = json.dumps(acc, ensure_ascii=False)
-                        with open(root_akun_file, "a", encoding="utf-8") as rf:
-                            rf.write(line + "\n")
-                    except Exception:
-                        pass
-                else:
-                    errors_list.append(f"Akun #{idx}: " + str(res.get("error", "Gagal mendaftarkan akun")))
-            except Exception as exc:
-                errors_list.append(f"Akun #{idx}: " + str(exc))
-        return created_list, errors_list
-
-    created_accounts, errors = await asyncio.to_thread(_execute_batch)
-    total_avail = len(BotBridge.load_accounts())
-
-    return {
-        "ok": True,
-        "requested": req.count,
-        "created_count": len(created_accounts),
-        "accounts": created_accounts,
-        "errors": errors,
-        "total_accounts_available": total_avail,
-    }
-
-
-@app.get("/api/admin/accounts")
-async def admin_list_accounts(
-    search: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    x_admin_pin: Optional[str] = Header(None)
-):
-    """Mengambil daftar seluruh akun yang tersimpan beserta kredensial dan metadata."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    all_accounts = BotBridge.load_accounts()
-
-    if search:
-        s = search.strip().lower()
-        filtered = []
-        for acc in all_accounts:
-            email = str(acc.get("email", "")).lower()
-            uid = str(acc.get("user_id", ""))
-            country = str(acc.get("country", "")).lower()
-            nick = str(acc.get("nickname", "")).lower()
-            if s in email or s in uid or s in country or s in nick:
-                filtered.append(acc)
-        total = len(filtered)
-        accounts_slice = filtered[offset: offset + limit]
-    else:
-        total = len(all_accounts)
-        accounts_slice = all_accounts[offset: offset + limit]
-
-    sanitized = []
-    for acc in accounts_slice:
-        pwd = str(acc.get("password", ""))
-        sanitized.append({
-            "email": acc.get("email"),
-            "user_id": acc.get("user_id"),
-            "country": acc.get("country", "-"),
-            "nickname": acc.get("nickname", "-"),
-            "password": pwd,
-            "has_token": bool(acc.get("access_token")),
-            "created_at": acc.get("created_at", "-"),
-        })
-
-    return {
-        "ok": True,
-        "total": total,
-        "accounts": sanitized,
-    }
-
-
-@app.get("/api/admin/accounts/download")
-async def admin_download_accounts(pin: Optional[str] = None, x_admin_pin: Optional[str] = Header(None)):
-    """Mengunduh berkas cadangan akun.txt langsung dari server."""
-    auth_pin = x_admin_pin or pin
-    if auth_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    core_akun_file = BASE_DIR / "core" / "akun.txt"
-    if not core_akun_file.exists():
-        core_akun_file = BASE_DIR.parent / "akun.txt"
-
-    if not core_akun_file.exists():
-        raise HTTPException(status_code=404, detail="File akun.txt tidak ditemukan.")
-
-    return FileResponse(
-        path=str(core_akun_file),
-        filename="akun.txt",
-        media_type="text/plain",
-    )
-
-
-# =============================================================================
-# ADMIN PROXY MANAGEMENT & AUTO-SYNC
-# =============================================================================
-@app.post("/api/admin/proxies/sync")
-async def admin_sync_proxies(x_admin_pin: Optional[str] = Header(None)):
-    """Sinkronisasi proxy langsung dari HypeProxy API ke seluruh berkas proxies.txt dan reload ke memori."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    def _do_sync():
-        from proxy_manager import HypeProxyClient, default_proxy_manager
-        core_px = BASE_DIR / "core" / "proxies.txt"
-        root_px = BASE_DIR.parent / "proxies.txt"
-
-        urls = HypeProxyClient.sync_proxies_to_file(output_file=str(core_px), user_only=True)
-        if root_px.exists() or True:
-            try:
-                HypeProxyClient.sync_proxies_to_file(output_file=str(root_px), user_only=True)
-            except Exception:
-                pass
-
-        default_proxy_manager.load_proxies()
-        return len(urls), urls
-
-    try:
-        count, urls = await asyncio.to_thread(_do_sync)
-        return {
-            "ok": True,
-            "message": f"Berhasil menyinkronkan {count} node proxy aktif dari HypeProxy!",
-            "count": count,
-            "proxies_sample": [u.split("@")[-1] for u in urls[:5]] if urls else [],
-        }
-    except Exception as exc:
-        return {"ok": False, "error": f"Gagal sinkronisasi proxy: {exc}"}
-
-
-@app.get("/api/admin/proxies/status")
-async def admin_get_proxies_status(x_admin_pin: Optional[str] = Header(None)):
-    """Mengambil status koneksi proxy, daftar slot HypeProxy, dan saldo akun HypeProxy."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-
-    def _fetch_status():
-        from proxy_manager import HypeProxyClient, default_proxy_manager
-        default_proxy_manager.reload_if_modified()
-        profile = HypeProxyClient.get_profile()
-        proxies = HypeProxyClient.get_proxies(user_only=True)
-        local_count = len(default_proxy_manager.parsed_proxies) if default_proxy_manager else 0
-        return profile, proxies, local_count
-
-    try:
-        profile, proxies, local_count = await asyncio.to_thread(_fetch_status)
-        u_info = profile.get("user", {}) if isinstance(profile, dict) else {}
-        return {
-            "ok": True,
-            "hypeproxy_connected": bool(profile.get("ok")),
-            "username": u_info.get("username", "-"),
-            "email": u_info.get("email", "-"),
-            "balance": u_info.get("balance", 0),
-            "api_slots_count": len(proxies),
-            "local_proxies_count": local_count,
-            "slots": [
-                {
-                    "id": p.get("id"),
-                    "port": p.get("port"),
-                    "status": p.get("status"),
-                    "country": p.get("country"),
-                    "exitIp": p.get("exitIp"),
-                    "tierLabel": p.get("tierLabel"),
-                }
-                for p in proxies
-            ],
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-# =============================================================================
-# WIJAYAPAY PAYMENT GATEWAY & AUTOMATION ENDPOINTS
-# =============================================================================
-@app.get("/api/payment/channels")
-async def get_payment_channels():
-    """Mengambil daftar metode pembayaran yang aktif dari WijayaPay."""
-    try:
-        channels = await asyncio.to_thread(default_wijayapay_client.get_payment_methods)
-        return {"ok": True, "channels": channels}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "channels": []}
-
-
 @app.post("/api/payment/create")
-async def create_payment(req: PaymentCreateRequest):
-    """
-    Membuat transaksi pembayaran otomatis via WijayaPay (QRIS atau Virtual Account).
-    order_type: 'new_token' atau 'topup'.
-    """
-    order_type = (req.order_type or "new_token").lower().strip()
-    if order_type not in ("new_token", "topup"):
-        raise HTTPException(status_code=400, detail="Tipe pesanan harus 'new_token' atau 'topup'.")
+async def api_create_payment(req: PaymentCreateRequest, request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Silakan login untuk melakukan top-up."})
 
-    token_code = (req.token_code or "").strip().upper() if req.token_code else None
-    if order_type == "topup":
-        if not token_code:
-            raise HTTPException(status_code=400, detail="Kode token diperlukan untuk top up.")
-        t_data = TokenManager.get_token(token_code)
-        if not t_data:
-            raise HTTPException(status_code=404, detail=f"Token '{token_code}' tidak ditemukan.")
-
-    # Unique Reference ID
-    ref_id = f"ORD-{int(time.time())}-{secrets.token_hex(3).upper()}"
-    payment_code = (req.payment_code or "QRIS").upper().strip()
-
-    # Resolve dynamic package name
-    pkg_name = None
-    cfg = TokenManager.get_pricing_config()
-    for p in cfg.get("packages", []):
-        if int(p.get("price", 0)) == int(req.nominal):
-            pkg_name = str(p.get("name")).strip()
-            break
-
-    if order_type == "topup":
-        desc = f"Topup Saldo Token {token_code} - Rp {req.nominal:,}"
-    else:
-        pkg_label = pkg_name or "Token Akses Bot"
-        desc = f"Beli {pkg_label} - Rp {req.nominal:,}"
+    nominal = req.nominal
+    ref_id = f"TOPUP-{user['id']}-{int(time.time())}-{secrets.token_hex(2)}"
+    cust_name = user["username"]
+    cust_email = user["email"]
 
     try:
-        result = await asyncio.to_thread(
-            default_wijayapay_client.create_transaction,
+        res = default_wijayapay_client.create_transaction(
             ref_id=ref_id,
-            nominal=req.nominal,
-            payment_code=payment_code,
-            customer_name=req.customer_name or f"User-{ref_id[-6:]}",
-            customer_email=req.customer_email or f"user.{ref_id[-6:].lower()}@rinara.dev",
-            customer_phone=req.customer_phone or "081234567890",
-            keterangan=desc,
-        )
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"ok": False, "error": f"Gagal menghubungi gateway WijayaPay: {exc}"})
-
-    if not result.get("ok"):
-        raw_info = result.get("raw") or {}
-        err_msg = result.get("error") or result.get("message")
-        if not err_msg and isinstance(raw_info, dict):
-            err_msg = raw_info.get("message") or raw_info.get("error")
-        if not err_msg:
-            err_msg = "Gagal membuat transaksi di WijayaPay."
-
-        if "whitelist" in str(err_msg).lower():
-            err_msg = f"{err_msg}. Silakan tambahkan IP tersebut ke menu Whitelist IP di Dashboard WijayaPay."
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": str(err_msg),
-                "raw": raw_info,
-            }
+            nominal=nominal,
+            payment_code="QRIS",
+            customer_name=cust_name,
+            customer_email=cust_email,
         )
 
-    w_data = result.get("data") or {}
+        if not res.get("status"):
+            err_msg = res.get("message") or "Gagal membuat invoice QRIS ke WijayaPay."
+            return JSONResponse(status_code=400, content={"ok": False, "error": err_msg})
 
-    # Record payment to local database
-    payment_record = TokenManager.record_payment(
-        ref_id=ref_id,
-        order_type=order_type,
-        nominal=req.nominal,
-        payment_code=payment_code,
-        gateway_data=w_data,
-        token_code=token_code,
-    )
+        tx_data = res.get("data", {})
+        qr_url = tx_data.get("qr_url") or tx_data.get("checkout_url")
+        qr_image = tx_data.get("qr_image") or tx_data.get("qr_content")
+        expired_at = tx_data.get("expired_time")
 
-    return {
-        "ok": True,
-        "ref_id": ref_id,
-        "order_type": order_type,
-        "nominal": req.nominal,
-        "payment_code": payment_code,
-        "token_code": token_code,
-        "checkout": {
-            "trx_id": payment_record.get("trx_reference"),
-            "total_bayar": payment_record.get("total_bayar"),
-            "fee": w_data.get("fee", 0),
-            "qr_link": payment_record.get("qr_link"),
-            "qr_string": payment_record.get("qr_string"),
-            "nomor_va": payment_record.get("nomor_va"),
-            "expired": payment_record.get("expired"),
-            "status": payment_record.get("status", "pending"),
-            "tutorial": payment_record.get("tutorial") or [],
-        }
-    }
-
-
-@app.get("/api/payment/check/{ref_id}")
-async def check_payment(ref_id: str):
-    """
-    Cek status pembayaran ref_id.
-    Jika di gateway sudah lunas, langsung otomatis memicu fulfillment token (generate token baru / top-up saldo).
-    """
-    payment = TokenManager.get_payment(ref_id)
-    if not payment:
-        raise HTTPException(status_code=404, detail="Data transaksi tidak ditemukan.")
-
-    # Jika sudah lunas secara lokal
-    if payment.get("status") == "paid":
         return {
             "ok": True,
             "ref_id": ref_id,
-            "status": "paid",
-            "is_paid": True,
-            "generated_token": payment.get("generated_token"),
-            "target_token": payment.get("target_token"),
-            "order_type": payment.get("order_type"),
-            "nominal": payment.get("nominal"),
-            "message": "Pembayaran lunas! Token telah aktif.",
+            "nominal": nominal,
+            "qr_url": qr_url,
+            "qr_image": qr_image,
+            "expired_at": expired_at,
+        }
+    except Exception as e:
+        logger.error(f"Error invoice payment: {e}")
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"Kesalahan gateway pembayaran: {str(e)}"})
+
+
+@app.get("/api/payment/check/{ref_id}")
+async def api_check_payment(ref_id: str, request: Request):
+    user = resolve_current_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Belum login."})
+
+    try:
+        res = default_wijayapay_client.check_status(ref_id)
+        if not res.get("status"):
+            return {"ok": False, "payment_status": "PENDING", "message": res.get("message")}
+
+        data = res.get("data", {})
+        tx_status = (data.get("status") or "").upper().strip()
+
+        if tx_status in ("PAID", "SUCCESS", "BERHASIL"):
+            # Cek apakah transaksi sudah dikreditkan sebelumnya
+            with db_session() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM transactions WHERE reference_id = ? AND type = 'TOPUP';", (ref_id,))
+                already_credited = cursor.fetchone() is not None
+
+                if not already_credited:
+                    amount = int(data.get("nominal") or data.get("amount") or 0)
+                    if amount > 0:
+                        AuthManager.add_balance(
+                            user_id=user["id"],
+                            amount=amount,
+                            description=f"Top Up Saldo QRIS ({ref_id})",
+                            reference_id=ref_id
+                        )
+                        logger.info(f"Saldo Rp {amount:,} berhasil dikreditkan ke user {user['username']}")
+
+            # Refresh profil user
+            refreshed_user = AuthManager.get_user_by_session(request.headers.get("x-session-token", ""))
+            new_bal = refreshed_user["balance"] if refreshed_user else user["balance"]
+            return {"ok": True, "payment_status": "PAID", "message": "Pembayaran lunas!", "new_balance": new_bal}
+
+        return {"ok": True, "payment_status": tx_status or "PENDING", "message": "Menunggu konfirmasi pembayaran..."}
+    except Exception as e:
+        logger.error(f"Error checking payment {ref_id}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/payment/callback")
+async def api_payment_callback(request: Request):
+    """Webhook callback otomatis dari server WijayaPay."""
+    try:
+        body = await request.body()
+        data = json.loads(body.decode("utf-8"))
+        logger.info(f"Webhook WijayaPay diterima: {data}")
+
+        ref_id = data.get("ref_id") or data.get("reference_id")
+        tx_status = (data.get("status") or "").upper().strip()
+        amount = int(data.get("nominal") or data.get("amount") or 0)
+        signature = request.headers.get("x-callback-signature") or data.get("signature", "")
+
+        # Verifikasi signature
+        if signature and not default_wijayapay_client.verify_signature(ref_id, signature):
+            logger.warning(f"Signature callback tidak cocok untuk ref {ref_id}")
+            return JSONResponse(status_code=400, content={"status": False, "message": "Invalid signature"})
+
+        if tx_status in ("PAID", "SUCCESS", "BERHASIL") and ref_id and amount > 0:
+            # Ambil user_id dari ref_id "TOPUP-{user_id}-..."
+            parts = ref_id.split("-")
+            if len(parts) >= 2 and parts[1].isdigit():
+                user_id = int(parts[1])
+                with db_session() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id FROM transactions WHERE reference_id = ? AND type = 'TOPUP';", (ref_id,))
+                    if not cursor.fetchone():
+                        AuthManager.add_balance(
+                            user_id=user_id,
+                            amount=amount,
+                            description=f"Top Up Saldo Webhook QRIS ({ref_id})",
+                            reference_id=ref_id
+                        )
+                        logger.info(f"[Webhook] Top up Rp {amount:,} berhasil untuk User ID {user_id}")
+
+        return JSONResponse(status_code=200, content={"status": True, "message": "Callback processed"})
+    except Exception as e:
+        logger.error(f"Error webhook: {e}")
+        return JSONResponse(status_code=500, content={"status": False, "message": str(e)})
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def serve_admin():
+    admin_file = BASE_DIR / "templates" / "admin.html"
+    if not admin_file.exists():
+        return HTMLResponse("<h1>Error: templates/admin.html tidak ditemukan</h1>", status_code=404)
+    with open(admin_file, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+def verify_admin_session(request: Request) -> bool:
+    token = request.headers.get("x-admin-token") or ""
+    if not token:
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr[7:].strip()
+    if not token:
+        return False
+    exp = ADMIN_SESSIONS.get(token)
+    if not exp or exp < time.time():
+        ADMIN_SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+# =============================================================================
+# ADMIN PORTAL API
+# =============================================================================
+class AdminAddProxyRequest(BaseModel):
+    proxy_url: str
+
+
+class AdminProxyIdRequest(BaseModel):
+    proxy_id: int
+
+
+@app.post("/api/admin/login")
+async def api_admin_login(req: AdminLoginRequest):
+    if req.pin.strip() == get_admin_pin():
+        admin_token = secrets.token_hex(32)
+        ADMIN_SESSIONS[admin_token] = time.time() + 7200  # valid 2 jam
+        return {"ok": True, "admin_token": admin_token, "expires_in": 7200}
+    return JSONResponse(status_code=401, content={"ok": False, "error": "Master PIN Admin tidak valid!"})
+
+
+@app.get("/api/admin/overview")
+async def api_admin_overview(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS total_users, COALESCE(SUM(balance), 0) AS total_balance FROM users;")
+        u_data = dict(cursor.fetchone())
+
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) AS gross_topup FROM transactions WHERE type = 'TOPUP';")
+        gross_topup = cursor.fetchone()["gross_topup"]
+
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) AS total_spent FROM transactions WHERE type = 'USAGE';")
+        total_spent = cursor.fetchone()["total_spent"]
+
+        cursor.execute("SELECT COUNT(*) AS total_tasks, COALESCE(SUM(completed_readers), 0) AS total_readers FROM tasks;")
+        t_data = dict(cursor.fetchone())
+
+        cursor.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN status='IDLE' THEN 1 ELSE 0 END) AS idle, SUM(CASE WHEN status='BUSY' THEN 1 ELSE 0 END) AS busy, SUM(CASE WHEN status='DEAD' THEN 1 ELSE 0 END) AS dead FROM proxies;")
+        p_data = dict(cursor.fetchone())
+
+        cursor.execute("SELECT COUNT(*) AS total_acc, COALESCE(SUM(q_balance), 0) AS total_coins FROM bot_accounts;")
+        a_data = dict(cursor.fetchone())
+
+        return {
+            "ok": True,
+            "users": u_data,
+            "financial": {
+                "gross_topup": gross_topup,
+                "total_spent": total_spent,
+                "outstanding_balance": u_data["total_balance"]
+            },
+            "tasks": t_data,
+            "proxies": p_data,
+            "accounts": a_data,
+            "active_tasks_count": len(ACTIVE_TASKS)
         }
 
-    # Jika masih pending, query ke WijayaPay secara live
-    try:
-        w_status = await asyncio.to_thread(default_wijayapay_client.check_status, ref_id=ref_id)
-        if w_status.get("ok"):
-            status_str = str(w_status.get("status", "")).lower()
-            if status_str in ("paid", "success", "berhasil"):
-                trx_ref = w_status.get("data", {}).get("trx_id")
-                fulfilled, ful_data, msg = TokenManager.fulfill_payment(ref_id, trx_reference=trx_ref)
-                return {
-                    "ok": True,
-                    "ref_id": ref_id,
-                    "status": "paid",
-                    "is_paid": True,
-                    "generated_token": (ful_data or {}).get("generated_token"),
-                    "target_token": (ful_data or {}).get("target_token"),
-                    "order_type": (ful_data or {}).get("order_type"),
-                    "nominal": (ful_data or {}).get("nominal"),
-                    "message": msg or "Pembayaran lunas! Token telah aktif.",
-                }
-            elif status_str in ("expired", "kadaluarsa", "failed", "gagal"):
-                TokenManager.update_payment_status(ref_id, "expired")
-                return {
-                    "ok": True,
-                    "ref_id": ref_id,
-                    "status": status_str,
-                    "is_paid": False,
-                    "message": "Transaksi telah kadaluarsa.",
-                }
-    except Exception:
-        pass
 
+@app.get("/api/admin/users")
+async def api_admin_get_users(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email, balance, role, created_at, last_login_at FROM users ORDER BY id DESC;")
+        return {"ok": True, "users": [dict(r) for r in cursor.fetchall()]}
+
+
+@app.post("/api/admin/topup-user")
+async def api_admin_topup_user(req: AdminTopupRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+
+    if req.amount == 0 or abs(req.amount) > 50000000:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Nominal topup tidak valid (Rp 100 - Rp 50.000.000)."})
+
+    if req.amount > 0:
+        ok = AuthManager.add_balance(req.user_id, req.amount, req.note, reference_id="ADMIN_MANUAL")
+    else:
+        ok = AuthManager.deduct_balance(req.user_id, abs(req.amount), req.note, reference_id="ADMIN_DEDUCT")
+
+    if ok:
+        return {"ok": True, "message": f"Berhasil memproses saldo Rp {abs(req.amount):,} untuk User #{req.user_id}."}
+    return JSONResponse(status_code=400, content={"ok": False, "error": "Gagal memproses saldo. Pastikan User ID terdaftar dan saldo cukup."})
+
+
+@app.get("/api/admin/proxies")
+async def api_admin_get_proxies(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, proxy_url, status, current_worker_id, failed_count, last_checked_at FROM proxies ORDER BY id ASC;")
+        return {"ok": True, "proxies": [dict(r) for r in cursor.fetchall()]}
+
+
+@app.post("/api/admin/proxy/add")
+async def api_admin_add_proxy(req: AdminAddProxyRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    url = req.proxy_url.strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "URL proxy tidak boleh kosong."})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO proxies (proxy_url, status) VALUES (?, 'IDLE');", (url,))
+            return {"ok": True, "message": "Proxy berhasil ditambahkan ke pool."}
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"Gagal menambahkan proxy: {e}"})
+
+
+@app.post("/api/admin/proxy/reset")
+async def api_admin_reset_proxy(req: AdminProxyIdRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE proxies SET status = 'IDLE', failed_count = 0, current_worker_id = NULL, current_task_id = NULL WHERE id = ?;", (req.proxy_id,))
+        return {"ok": True, "message": "Status proxy berhasil di-reset ke IDLE."}
+
+
+@app.post("/api/admin/proxy/delete")
+async def api_admin_delete_proxy(req: AdminProxyIdRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM proxies WHERE id = ?;", (req.proxy_id,))
+        return {"ok": True, "message": "Proxy berhasil dihapus dari pool."}
+
+
+@app.get("/api/admin/accounts")
+async def api_admin_get_accounts(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT a.id, a.email, a.status, a.q_balance, a.daily_read_seconds, a.last_read_date,
+               (SELECT COUNT(*) FROM account_history h WHERE h.bot_email = a.email) as total_novels_read
+        FROM bot_accounts a
+        ORDER BY a.id ASC;
+        """)
+        return {"ok": True, "accounts": [dict(r) for r in cursor.fetchall()]}
+
+
+@app.get("/api/admin/tasks")
+async def api_admin_get_tasks(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid"})
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT t.task_id, t.novel_title, t.target_readers, t.completed_readers, t.concurrent_terminals, t.status, t.created_at,
+               u.username as user_name
+        FROM tasks t
+        LEFT JOIN users u ON t.user_id = u.id
+        ORDER BY t.created_at DESC LIMIT 50;
+        """)
+        return {"ok": True, "tasks": [dict(r) for r in cursor.fetchall()]}
+
+
+# =============================================================================
+# SYSTEM SETTINGS & DYNAMIC TARIFFS
+# =============================================================================
+@app.get("/api/settings")
+async def api_get_public_settings():
+    from database import get_all_settings
+    settings = get_all_settings()
     return {
         "ok": True,
-        "ref_id": ref_id,
-        "status": payment.get("status", "pending"),
-        "is_paid": False,
-        "total_bayar": payment.get("total_bayar", payment.get("nominal")),
-        "message": "Menunggu pembayaran oleh pengguna...",
+        "settings": settings,
+        "price_valid_reader": int(settings.get("price_valid_reader", 450)),
+        "price_guest_reader": int(settings.get("price_guest_reader", 50)),
+        "addon_price_per_terminal": int(settings.get("addon_price_per_terminal", 500)),
+        "addon_price_guest_conversion": int(settings.get("addon_price_guest_conversion", 150)),
+        "min_deposit": int(settings.get("min_deposit", 5000)),
+        "reading_delay_seconds": int(settings.get("reading_delay_seconds", 140)),
+        "max_concurrent_terminals": int(settings.get("max_concurrent_terminals", 5)),
     }
 
 
-@app.post("/api/payment/callback/wijayapay")
-async def wijayapay_webhook_callback(
-    request: Request,
-    x_callback_signature: Optional[str] = Header(None, alias="X-Callback-Signature"),
-):
-    """
-    Webhook Endpoint untuk menerima notifikasi pembayaran otomatis dari WijayaPay.
-    Memverifikasi X-Callback-Signature dan langsung melakukan automasi aktivasi/top-up token.
-    """
-    try:
-        raw_body = await request.body()
-        data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-    except Exception:
-        form = await request.form()
-        data = dict(form)
-
-    ref_id = data.get("ref_id") or data.get("order_id")
-    if not ref_id:
-        return JSONResponse(status_code=400, content={"ok": False, "message": "ref_id tidak ditemukan"})
-
-    # Validasi signature jika header disediakan
-    if x_callback_signature:
-        is_valid_sig = default_wijayapay_client.verify_callback_signature(ref_id, x_callback_signature)
-        if not is_valid_sig:
-            return JSONResponse(status_code=403, content={"ok": False, "message": "Invalid callback signature"})
-
-    status = str(data.get("status", "")).lower()
-    trx_ref = data.get("trx_id") or data.get("reference")
-
-    if status in ("paid", "success", "berhasil"):
-        ok, ful_data, msg = TokenManager.fulfill_payment(ref_id, trx_reference=trx_ref)
-        return {"success": True, "message": msg, "fulfillment": ful_data}
-    elif status in ("expired", "failed", "gagal"):
-        TokenManager.update_payment_status(ref_id, "expired")
-        return {"success": True, "message": f"Status updated to {status}"}
-
-    return {"success": True, "message": "Notification received"}
+@app.get("/api/admin/settings")
+async def api_admin_get_settings(request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+    from database import get_all_settings
+    return {"ok": True, "settings": get_all_settings()}
 
 
-@app.get("/api/admin/payments")
-async def admin_list_payments(x_admin_pin: Optional[str] = Header(None)):
-    """Owner melihat riwayat transaksi pembayaran WijayaPay."""
-    if x_admin_pin != ADMIN_SECRET_PIN:
-        raise HTTPException(status_code=401, detail="Unauthorized: PIN Owner dibutuhkan.")
-    payments = TokenManager.list_payments(limit=50)
-    return {"ok": True, "payments": payments}
+@app.post("/api/admin/settings")
+async def api_admin_update_settings(req: AdminSettingsUpdateRequest, request: Request):
+    if not verify_admin_session(request):
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Sesi Admin tidak valid atau telah kedaluwarsa."})
+    from database import update_setting, get_all_settings
+    data = req.dict(exclude_unset=True)
+    for k, v in data.items():
+        if v is not None:
+            update_setting(k, v)
+    return {
+        "ok": True,
+        "message": "Konfigurasi tarif dan parameter sistem berhasil disimpan!",
+        "settings": get_all_settings(),
+    }
 
 
-@app.on_event("startup")
-async def start_periodic_proxy_sync():
-    """Memeriksa secara otomatis setiap 3 menit apakah owner baru membeli proxy di HypeProxy."""
-    asyncio.create_task(_background_proxy_sync_loop())
-
-
-async def _background_proxy_sync_loop():
-    while True:
-        try:
-            await asyncio.sleep(180)  # Cek setiap 3 menit
-            def _check():
-                from proxy_manager import HypeProxyClient, default_proxy_manager
-                urls = HypeProxyClient.fetch_active_proxy_urls(user_only=True)
-                if urls and len(urls) != len(default_proxy_manager.parsed_proxies):
-                    logger.info(f"[Auto-Sync] Perubahan slot HypeProxy terdeteksi ({len(default_proxy_manager.parsed_proxies)} -> {len(urls)}). Menyinkronkan...")
-                    core_px = BASE_DIR / "core" / "proxies.txt"
-                    root_px = BASE_DIR.parent / "proxies.txt"
-                    HypeProxyClient.sync_proxies_to_file(output_file=str(core_px), user_only=True)
-                    if root_px.exists() or True:
-                        try:
-                            HypeProxyClient.sync_proxies_to_file(output_file=str(root_px), user_only=True)
-                        except Exception:
-                            pass
-                    default_proxy_manager.load_proxies()
-            await asyncio.to_thread(_check)
-        except Exception as exc:
-            logger.debug(f"Background proxy sync exception: {exc}")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

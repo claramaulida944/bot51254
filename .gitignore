@@ -7,4 +7,5 @@ __pycache__/
 gaaasss.har
 scratch/
 akun_backup_*.txt
-
+*.db
+*.sqlite*
