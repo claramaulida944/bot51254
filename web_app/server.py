@@ -466,6 +466,49 @@ async def api_stats_overview():
 # =============================================================================
 # WIJAYAPAY QRIS PAYMENT GATEWAY
 # =============================================================================
+@app.get("/api/payment/channels")
+async def api_get_payment_channels():
+    """Mengambil daftar saluran pembayaran aktif dari gateway WijayaPay."""
+    try:
+        raw_channels = default_wijayapay_client.get_payment_methods()
+        if not raw_channels:
+            raw_channels = [
+                {"code": "QRIS", "name": "QRIS (Semua Bank & e-Wallet)", "fee": 170},
+                {"code": "BCAVA", "name": "BCA Virtual Account", "fee": 4700},
+                {"code": "MANDIRIVA", "name": "Mandiri Virtual Account", "fee": 4700},
+                {"code": "BRIVA", "name": "BRI Virtual Account", "fee": 4700},
+                {"code": "BNIVA", "name": "BNI Virtual Account", "fee": 4700},
+                {"code": "BSIVA", "name": "BSI Virtual Account", "fee": 4700},
+                {"code": "CIMBVA", "name": "CIMB Niaga Virtual Account", "fee": 4700},
+                {"code": "PERMATAVA", "name": "Permata Virtual Account", "fee": 4700},
+                {"code": "ALFAMART", "name": "Alfamart / Alfamidi Retail", "fee": 3000},
+                {"code": "INDOMARET", "name": "Indomaret Retail", "fee": 3000},
+            ]
+        
+        channels = []
+        for ch in raw_channels:
+            code = (ch.get("code") or ch.get("payment_code") or "").upper().strip()
+            name = ch.get("name") or ch.get("payment_name") or code
+            fee = ch.get("fee") or ch.get("total_fee") or 0
+            
+            cat = "va"
+            if "QRIS" in code:
+                cat = "qris"
+            elif "ALFA" in code or "INDO" in code:
+                cat = "retail"
+            
+            channels.append({
+                "code": code,
+                "name": name,
+                "category": cat,
+                "fee": fee,
+            })
+        return {"ok": True, "channels": channels}
+    except Exception as e:
+        logger.error(f"Error fetching payment channels: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/payment/create")
 async def api_create_payment(req: PaymentCreateRequest, request: Request):
     user = resolve_current_user(request)
@@ -473,6 +516,7 @@ async def api_create_payment(req: PaymentCreateRequest, request: Request):
         return JSONResponse(status_code=401, content={"ok": False, "error": "Silakan login untuk melakukan top-up."})
 
     nominal = req.nominal
+    payment_method = (req.payment_method or "QRIS").strip().upper()
     ref_id = f"TOPUP-{user['id']}-{int(time.time())}-{secrets.token_hex(2)}"
     cust_name = user["username"]
     cust_email = user["email"]
@@ -481,28 +525,39 @@ async def api_create_payment(req: PaymentCreateRequest, request: Request):
         res = default_wijayapay_client.create_transaction(
             ref_id=ref_id,
             nominal=nominal,
-            payment_code="QRIS",
+            payment_code=payment_method,
             customer_name=cust_name,
             customer_email=cust_email,
         )
 
         if not res.get("ok"):
-            err_msg = res.get("error") or "Gagal membuat invoice QRIS ke WijayaPay."
+            err_msg = res.get("error") or f"Gagal membuat tagihan {payment_method} ke WijayaPay."
             return JSONResponse(status_code=400, content={"ok": False, "error": err_msg})
 
         tx_data = res.get("data", {})
         qr_image = tx_data.get("qr_image") or tx_data.get("qr_url") or tx_data.get("checkout_url")
         qr_string = tx_data.get("qr_string") or ""
+        nomor_va = tx_data.get("nomor_va") or ""
+        nomor_pembayaran = tx_data.get("nomor_pembayaran") or tx_data.get("kode_pembayaran") or ""
         total_bayar = int(tx_data.get("total_bayar") or nominal)
+        total_fee = int(tx_data.get("total_fee") or 0)
         expired_at = tx_data.get("expired") or tx_data.get("expired_time")
+        tutorial = tx_data.get("tutorial_pembayaran") or ""
+        payment_name = tx_data.get("payment_name") or tx_data.get("payment_method") or payment_method
 
         return {
             "ok": True,
             "ref_id": ref_id,
             "nominal": nominal,
             "total_bayar": total_bayar,
+            "total_fee": total_fee,
+            "payment_method": payment_method,
+            "payment_name": payment_name,
             "qr_image": qr_image,
             "qr_string": qr_string,
+            "nomor_va": nomor_va,
+            "nomor_pembayaran": nomor_pembayaran,
+            "tutorial": tutorial,
             "expired_at": expired_at,
         }
     except Exception as e:

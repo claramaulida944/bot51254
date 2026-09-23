@@ -11,6 +11,8 @@ let selectedTargetReaders = 10;
 let selectedMode = "valid"; // "valid" atau "guest"
 let isGuestConversionEnabled = false; // Addon konversi tamu ke member resmi
 let selectedTopupAmount = 25000;
+let selectedPayCategory = "qris"; // "qris", "va", "retail"
+let selectedPayChannel = "QRIS";
 let qrisPollingInterval = null;
 let currentQrisRefId = null;
 
@@ -1634,20 +1636,83 @@ function copyTerminalLogs() {
 }
 
 // =============================================================================
-// TOP UP SALDO & QRIS INTEGRATION
+// TOP UP SALDO & MULTI-CHANNEL PAYMENT GATEWAY (QRIS, VA, RETAIL)
 // =============================================================================
-function selectTopupPreset(nominal) {
-  selectedTopupAmount = parseInt(nominal) || 25000;
-  document.querySelectorAll(".nominal-card").forEach((c) => {
-    if (parseInt(c.getAttribute("data-nominal")) === selectedTopupAmount) {
-      c.classList.add("active");
-    } else {
-      c.classList.remove("active");
-    }
+function selectPaymentCategory(cat) {
+  selectedPayCategory = cat;
+  document.querySelectorAll(".pay-cat-btn").forEach((b) => {
+    b.classList.toggle("active", b.getAttribute("data-cat") === cat);
   });
+
+  const vaGrid = document.getElementById("channelGridVa");
+  const retailGrid = document.getElementById("channelGridRetail");
+  const qrisNotice = document.getElementById("qrisNoticeBox");
+
+  if (cat === "qris") {
+    if (vaGrid) vaGrid.style.display = "none";
+    if (retailGrid) retailGrid.style.display = "none";
+    if (qrisNotice) qrisNotice.style.display = "block";
+    selectedPayChannel = "QRIS";
+  } else if (cat === "va") {
+    if (vaGrid) vaGrid.style.display = "grid";
+    if (retailGrid) retailGrid.style.display = "none";
+    if (qrisNotice) qrisNotice.style.display = "none";
+    const activeVa = vaGrid ? vaGrid.querySelector(".channel-chip.active") : null;
+    selectedPayChannel = activeVa ? activeVa.getAttribute("data-code") : "BCAVA";
+  } else if (cat === "retail") {
+    if (vaGrid) vaGrid.style.display = "none";
+    if (retailGrid) retailGrid.style.display = "grid";
+    if (qrisNotice) qrisNotice.style.display = "none";
+    const activeRetail = retailGrid ? retailGrid.querySelector(".channel-chip.active") : null;
+    selectedPayChannel = activeRetail ? activeRetail.getAttribute("data-code") : "ALFAMART";
+  }
+  updatePayButtonText();
 }
 
-async function submitQrisPayment() {
+function selectPaymentChannel(code) {
+  selectedPayChannel = code;
+  const parentGrid = selectedPayCategory === "va" ? document.getElementById("channelGridVa") : document.getElementById("channelGridRetail");
+  if (parentGrid) {
+    parentGrid.querySelectorAll(".channel-chip").forEach((chip) => {
+      chip.classList.toggle("active", chip.getAttribute("data-code") === code);
+    });
+  }
+  updatePayButtonText();
+}
+
+function selectTopupPreset(nominal) {
+  selectedTopupAmount = parseInt(nominal) || 25000;
+  const customInput = document.getElementById("inputCustomTopup");
+  if (customInput) customInput.value = "";
+
+  document.querySelectorAll(".nominal-card").forEach((c) => {
+    c.classList.toggle("active", parseInt(c.getAttribute("data-nominal")) === selectedTopupAmount);
+  });
+  updatePayButtonText();
+}
+
+function onCustomTopupInput(val) {
+  const parsed = parseInt(val);
+  if (parsed && parsed > 0) {
+    selectedTopupAmount = parsed;
+    document.querySelectorAll(".nominal-card").forEach((c) => c.classList.remove("active"));
+  } else {
+    selectedTopupAmount = 0;
+  }
+  updatePayButtonText();
+}
+
+function updatePayButtonText() {
+  const span = document.getElementById("btnPayText");
+  if (!span) return;
+  const nominalStr = formatRupiah(selectedTopupAmount || 0);
+  let channelName = selectedPayChannel || "QRIS";
+  if (channelName === "QRIS") channelName = "QRIS Instan";
+  else if (channelName.endsWith("VA")) channelName = channelName.replace("VA", " VA");
+  span.textContent = `Bayar via ${channelName} (${nominalStr}) →`;
+}
+
+async function submitTopupPayment() {
   if (!currentUser) {
     openAuthModal("login");
     showToast("warning", "Harap masuk ke akun Anda terlebih dahulu untuk top up.");
@@ -1662,48 +1727,137 @@ async function submitQrisPayment() {
   }
 
   const btn = document.getElementById("btnCreateQris");
+  const span = document.getElementById("btnPayText");
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "Membuat QRIS...";
+    if (span) span.textContent = "Membuat Invoice Pembayaran...";
   }
 
   try {
     const resp = await fetch("/api/payment/create", {
       method: "POST",
       headers: getAuthHeaders(),
-      body: JSON.stringify({ nominal: amt, payment_method: "QRIS" }),
+      body: JSON.stringify({ nominal: amt, payment_method: selectedPayChannel || "QRIS" }),
     });
     const data = await resp.json();
 
     if (data.ok) {
       currentQrisRefId = data.ref_id;
-      showQrisModal(data);
+      showPaymentModal(data);
       startQrisPolling(data.ref_id);
     } else {
-      showToast("error", data.error || "Gagal membuat invoice QRIS.");
+      showToast("error", data.error || "Gagal membuat invoice transaksi.");
     }
   } catch (e) {
     showToast("error", "Kesalahan gateway pembayaran: " + e);
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "Buat Invoice QRIS";
+      updatePayButtonText();
     }
   }
 }
 
-function showQrisModal(data) {
+// Backward compatibility alias
+const submitQrisPayment = submitTopupPayment;
+
+function showPaymentModal(data) {
   const modal = document.getElementById("qrisModal");
+  const title = document.getElementById("payModalTitle");
+  const viewQris = document.getElementById("payViewQris");
+  const viewCode = document.getElementById("payViewCode");
   const img = document.getElementById("qrisImageDisplay");
-  const amtDisplay = document.getElementById("qrisAmountDisplay");
+  const baseDisplay = document.getElementById("payBaseAmountDisplay");
+  const feeDisplay = document.getElementById("payFeeDisplay");
+  const totalDisplay = document.getElementById("qrisAmountDisplay");
   const refDisplay = document.getElementById("qrisRefDisplay");
 
-  const qrSrc = data.qr_image || data.qr_image_url || `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.qr_string || "QRIS")}`;
-  if (img) img.src = qrSrc;
-  if (amtDisplay) amtDisplay.textContent = formatRupiah(data.total_bayar || data.nominal);
+  const isQris = !data.nomor_va && !data.nomor_pembayaran;
+
+  if (title) title.textContent = `Pembayaran ${data.payment_name || data.payment_method}`;
+  if (baseDisplay) baseDisplay.textContent = formatRupiah(data.nominal || selectedTopupAmount);
+  if (feeDisplay) feeDisplay.textContent = formatRupiah(data.total_fee || 0);
+  if (totalDisplay) totalDisplay.textContent = formatRupiah(data.total_bayar || (data.nominal + (data.total_fee || 0)));
   if (refDisplay) refDisplay.textContent = data.ref_id;
 
+  if (isQris) {
+    if (viewQris) viewQris.style.display = "block";
+    if (viewCode) viewCode.style.display = "none";
+    const qrSrc = data.qr_image || data.qr_image_url || `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.qr_string || "QRIS")}`;
+    if (img) img.src = qrSrc;
+  } else {
+    if (viewQris) viewQris.style.display = "none";
+    if (viewCode) viewCode.style.display = "block";
+
+    const codeVal = data.nomor_va || data.nomor_pembayaran || "";
+    const codeInput = document.getElementById("payCodeInput");
+    if (codeInput) codeInput.value = codeVal;
+
+    const label = document.getElementById("payCodeLabel");
+    if (label) {
+      label.textContent = data.nomor_va ? "Nomor Virtual Account" : "Kode Pembayaran Gerai";
+    }
+
+    const badge = document.getElementById("payChannelBadge");
+    if (badge) badge.textContent = data.payment_name || data.payment_method;
+
+    const instructions = document.getElementById("payCodeInstructions");
+    if (instructions) {
+      if (data.nomor_va) {
+        instructions.textContent = `Salin nomor VA di atas dan bayar via menu Transfer Virtual Account ${data.payment_name || "bank Anda"}.`;
+      } else {
+        instructions.textContent = `Tunjukkan kode pembayaran di atas ke kasir ${data.payment_name || "gerai retail"}.`;
+      }
+    }
+  }
+
+  // Tutorial / Panduan Pembayaran
+  const tutorialBody = document.getElementById("payTutorialBody");
+  if (tutorialBody) {
+    if (data.tutorial && Array.isArray(data.tutorial) && data.tutorial.length > 0) {
+      tutorialBody.innerHTML = data.tutorial.map((item, idx) => `
+        <div style="margin-bottom:10px;">
+          <strong style="color:#ffffff; font-size:11.5px;">${escapeHtml(item.name || `Metode ${idx+1}`)}</strong>
+          <ol style="margin:4px 0 0 16px; padding:0; font-size:11px;">
+            ${(item.steps || []).map(s => `<li style="margin-bottom:3px;">${escapeHtml(s)}</li>`).join("")}
+          </ol>
+        </div>
+      `).join("");
+    } else {
+      tutorialBody.innerHTML = `<p style="margin:0;">Lakukan pembayaran sesuai nominal total tagihan sebelum masa berlaku berakhir. Saldo Anda akan otomatis bertambah detik itu juga setelah verifikasi.</p>`;
+    }
+  }
+
   if (modal) modal.style.display = "flex";
+}
+
+function showQrisModal(data) {
+  showPaymentModal(data);
+}
+
+function copyPaymentCode() {
+  const codeInput = document.getElementById("payCodeInput");
+  if (!codeInput || !codeInput.value) return;
+  navigator.clipboard.writeText(codeInput.value).then(() => {
+    showToast("success", "Nomor / Kode pembayaran berhasil disalin!");
+  }).catch(() => {
+    codeInput.select();
+    document.execCommand("copy");
+    showToast("success", "Nomor / Kode pembayaran disalin!");
+  });
+}
+
+function togglePayTutorial() {
+  const body = document.getElementById("payTutorialBody");
+  const icon = document.getElementById("iconPayTutorial");
+  if (!body) return;
+  if (body.style.display === "none") {
+    body.style.display = "block";
+    if (icon) icon.textContent = "▲";
+  } else {
+    body.style.display = "none";
+    if (icon) icon.textContent = "▼";
+  }
 }
 
 function closeQrisModal() {
